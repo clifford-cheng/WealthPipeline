@@ -123,11 +123,31 @@ def main() -> None:
 
     sub.add_parser("export", help="Print leads as CSV to stdout")
 
+    srv = sub.add_parser(
+        "serve",
+        help="Open dashboard at http://127.0.0.1:8765 (run sync first for data)",
+    )
+    srv.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Port (default 8765 or WEALTH_LEADS_PORT)",
+    )
+    srv.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Do not open a browser tab automatically",
+    )
+
     args = p.parse_args()
     if args.cmd == "sync":
         sync(force_officers=args.force_officers)
     elif args.cmd == "export":
         export_leads_csv()
+    elif args.cmd == "serve":
+        from wealth_leads.serve import run_localhost
+
+        run_localhost(port=args.port, open_browser=not args.no_browser)
 
 
 if __name__ == "__main__":
