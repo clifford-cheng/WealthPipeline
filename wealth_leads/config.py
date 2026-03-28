@@ -2,6 +2,8 @@ import os
 
 # SEC requires a descriptive User-Agent with contact info.
 # https://www.sec.gov/os/webmaster-faq#code-support
+# Use an email you actually read; some addresses (e.g. *@users.noreply.github.com)
+# have triggered HTTP 403 from sec.gov in testing.
 DEFAULT_USER_AGENT = (
     "WealthLeadsMVP/0.1 (personal research; contact: you@example.com)"
 )

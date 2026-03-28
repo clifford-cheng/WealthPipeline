@@ -21,12 +21,14 @@ def _throttle() -> None:
 def get_text(url: str, session: Optional[requests.Session] = None) -> str:
     _throttle()
     sess = session or requests.Session()
+    # SEC returns 403 if User-Agent is generic; do not set Host manually.
     r = sess.get(
         url,
         headers={
             "User-Agent": user_agent(),
+            "Accept": "application/atom+xml,application/xml,text/xml,*/*;q=0.8",
             "Accept-Encoding": "gzip, deflate",
-            "Host": "www.sec.gov",
+            "Accept-Language": "en-US,en;q=0.9",
         },
         timeout=120,
     )
