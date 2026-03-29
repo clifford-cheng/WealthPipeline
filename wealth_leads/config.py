@@ -28,10 +28,22 @@ def rss_url_for_form(form_type: str) -> str:
 def sync_form_types() -> list[str]:
     """
     Form types to pull from the SEC 'current' RSS on each sync.
-    Override with env SEC_SYNC_FORMS=comma-separated list (default: S-1,10-K).
+    Default: S-1 only. Recent 10-Ks for the *same issuers* come from submissions API
+    follow (see follow_10k_for_s1_ciks). Add "10-K" here for a global 10-K firehose too.
     """
-    raw = os.environ.get("SEC_SYNC_FORMS", "S-1,10-K")
+    raw = os.environ.get("SEC_SYNC_FORMS", "S-1")
     return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def follow_10k_for_s1_ciks() -> bool:
+    """After RSS sync, fetch recent 10-Ks per CIK seen from S-1 filings (submissions API)."""
+    v = os.environ.get("SEC_FOLLOW_10K", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def submissions_10k_per_cik() -> int:
+    """Max recent 10-K / 10-K/A filings to pull per CIK from data.sec.gov submissions."""
+    return max(0, int(os.environ.get("SEC_10K_PER_CIK", "3")))
 
 # Stay under SEC fair-access guidance (~10 req/s); be conservative.
 REQUEST_DELAY_SEC = 0.15

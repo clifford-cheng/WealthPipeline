@@ -6,7 +6,12 @@ import sys
 
 import requests
 
-from wealth_leads.config import database_path, sync_form_types
+from wealth_leads.config import (
+    database_path,
+    follow_10k_for_s1_ciks,
+    submissions_10k_per_cik,
+    sync_form_types,
+)
 from wealth_leads.compensation import NeoCompRow, extract_neo_compensation_from_s1
 from wealth_leads.db import (
     connect,
@@ -22,6 +27,7 @@ from wealth_leads.parse_index import (
     primary_document_url_for_form,
 )
 from wealth_leads.rss import RssFiling, fetch_current_feed
+from wealth_leads.submissions import recent_10k_rss_filings_for_cik, s1_ciks_with_latest_name
 from wealth_leads.sec_client import get_text
 
 
@@ -221,6 +227,25 @@ def sync(*, force_reprocess: bool = False) -> None:
     with connect() as conn:
         for item in feed:
             _process_rss_item(conn, item, session, force_reprocess=force_reprocess)
+
+        n_follow = 0
+        per_10k = submissions_10k_per_cik()
+        if follow_10k_for_s1_ciks() and per_10k > 0:
+            cik_rows = s1_ciks_with_latest_name(conn)
+            for cik, cname in cik_rows:
+                for extra in recent_10k_rss_filings_for_cik(
+                    conn, cik, cname, session, limit=per_10k
+                ):
+                    _process_rss_item(
+                        conn, extra, session, force_reprocess=force_reprocess
+                    )
+                    n_follow += 1
+            print(
+                f"10-K follow (same CIKs as S-1): {n_follow} new filing(s) from "
+                f"{len(cik_rows)} issuer(s), up to {per_10k} recent 10-K/A each",
+                file=sys.stderr,
+            )
+
         backfill_compensation(conn=conn, session=session, force=False)
         print(
             f"Processed {len(feed)} RSS entr(y/ies) across {len(forms)} form type(s) "
@@ -331,7 +356,11 @@ def export_compensation_csv() -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="SEC filing lead pipeline (S-1 + 10-K RSS by default; see SEC_SYNC_FORMS)"
+        description=(
+            "SEC filing lead pipeline: S-1 RSS + 10-K cross-reference per CIK (submissions API); "
+            "optional global 10-K RSS via SEC_SYNC_FORMS."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -348,6 +377,10 @@ def main() -> None:
         "--force",
         action="store_true",
         help="Re-process filings even if officers + compensation already stored",
+    )
+    s.epilog = (
+        "Env: SEC_SYNC_FORMS (default S-1), SEC_FOLLOW_10K=1 (10-K per S-1 CIK via submissions), "
+        "SEC_10K_PER_CIK=3, SEC_RSS_COUNT. Set SEC_SYNC_FORMS=S-1,10-K for a global 10-K RSS feed too."
     )
 
     sub.add_parser("export", help="Print leads as CSV to stdout")

@@ -309,8 +309,8 @@ def _desk_table(profiles: list[dict]) -> str:
     return f"""
   <h2>Lead desk</h2>
   <p class="meta">
-    <b>Timing-first.</b> Each row is one executive at one issuer (CIK). <b>Latest total</b> = most recent fiscal year in your DB; <b>Σ SCT</b> = sum of disclosed yearly totals (not take-home cash).
-    <b>Click the name or row</b> for compensation detail, filings, and (soon) management bio. Raw rows: <b>Source rows</b> below.
+    <b>Timing-first.</b> Rows can combine <b>S-1</b> and <b>10-K</b> data for the <b>same company (CIK)</b> after sync (S-1 discovery + 10-K follow from SEC submissions). <b>Latest total</b> = most recent fiscal year in your DB; <b>Σ SCT</b> = sum of disclosed yearly totals (not take-home cash).
+    <b>Click the name or row</b> for detail. Optional: set <code>SEC_SYNC_FORMS=S-1,10-K</code> to also ingest a global 10-K RSS stream. Raw rows: <b>Source rows</b> below.
   </p>
   <div class="table-wrap">
   <table id="desk">
@@ -548,7 +548,7 @@ def _page_desk(
 <body class="wide">
   <h1>WealthPipeline <span class="tag">lead desk · local</span></h1>
   <p class="meta">
-    SEC filing–native lead timing (S-1 + 10-K from RSS by default). Data updates when you run <code>sync</code>.
+    SEC filing–native timing: <b>S-1</b> from RSS, then <b>10-K</b> for the <b>same CIKs</b> via SEC submissions (cross-reference). Data updates when you run <code>sync</code>.
     Database: <code>{html.escape(str(Path(database_path()).resolve()))}</code>
   </p>
   {banner}
