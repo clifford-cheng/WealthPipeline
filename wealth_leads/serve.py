@@ -4,6 +4,7 @@ import html
 import os
 import sqlite3
 import sys
+from datetime import datetime
 import threading
 import webbrowser
 from pathlib import Path
@@ -106,41 +107,92 @@ def _comp_table(rows: list[sqlite3.Row]) -> str:
   </table>"""
 
 
-def _page(leads: list[sqlite3.Row], comp: list[sqlite3.Row]) -> str:
+def _stats_banner(stats: dict) -> str:
+    if stats.get("missing_db"):
+        return """<div class="banner warn"><strong>No database file yet.</strong> Run sync once, then refresh this page.</div>"""
+    nf, no, nc = stats["filings"], stats["officers"], stats["comp_rows"]
+    latest = html.escape(str(stats.get("latest_filing_date") or "—"))
+    mtime = html.escape(str(stats.get("db_file_modified") or "—"))
+    return f"""<div class="banner">
+    <strong>Local snapshot</strong>
+    <span class="stats"><span>{nf} filings</span><span>{no} officer rows</span><span>{nc} comp rows</span></span>
+    <span class="sub">Newest filing date in DB: <b>{latest}</b> · DB file updated: <b>{mtime}</b></span>
+  </div>"""
+
+
+def _page(leads: list[sqlite3.Row], comp: list[sqlite3.Row], stats: dict) -> str:
+    banner = _stats_banner(stats)
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>WealthPipeline — S-1 leads</title>
+  <title>WealthPipeline — local dashboard</title>
   <style>
     :root {{ font-family: system-ui, sans-serif; background: #0f1419; color: #e7e9ea; }}
     body {{ margin: 0; padding: 1.25rem; max-width: 1280px; margin-inline: auto; }}
-    h1 {{ font-size: 1.25rem; font-weight: 600; margin-top: 0; }}
+    h1 {{ font-size: 1.35rem; font-weight: 600; margin-top: 0; }}
     h2 {{ font-size: 1.05rem; margin-top: 2rem; margin-bottom: 0.5rem; }}
-    p.meta {{ color: #8b98a5; font-size: 0.875rem; margin-bottom: 1rem; }}
+    p.meta {{ color: #8b98a5; font-size: 0.875rem; margin-bottom: 1rem; line-height: 1.45; }}
+    .banner {{ background: #1a2634; border: 1px solid #38444d; border-radius: 8px; padding: 0.85rem 1rem; margin-bottom: 1rem; }}
+    .banner.warn {{ border-color: #c44242; background: #2a1f1f; }}
+    .banner .stats {{ display: flex; flex-wrap: wrap; gap: 0.75rem 1.25rem; margin: 0.5rem 0; font-size: 0.9rem; }}
+    .banner .stats span {{ color: #8b98a5; }}
+    .banner .stats span::before {{ content: "· "; color: #38444d; }}
+    .banner .stats span:first-child::before {{ content: ""; }}
+    .banner .sub {{ display: block; font-size: 0.8rem; color: #8b98a5; margin-top: 0.35rem; }}
+    label.sr {{ display: block; font-size: 0.8rem; color: #8b98a5; margin-bottom: 0.35rem; }}
+    #filter {{
+      width: 100%; max-width: 28rem; padding: 0.45rem 0.6rem; border-radius: 6px;
+      border: 1px solid #38444d; background: #0f1419; color: #e7e9ea; font: inherit;
+    }}
     table {{ width: 100%; border-collapse: collapse; font-size: 0.8125rem; }}
     th, td {{ text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid #38444d; vertical-align: top; }}
     th {{ color: #8b98a5; font-weight: 600; }}
     td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
     a {{ color: #1d9bf0; }}
     tr:hover td {{ background: #1a2228; }}
+    tr.hidden {{ display: none; }}
     code {{ font-size: 0.8em; }}
   </style>
 </head>
 <body>
-  <h1>S-1 / S-1A pipeline</h1>
-  <p class="meta">Local SQLite: <code>{html.escape(database_path())}</code> — run <code>python -m wealth_leads sync</code> to refresh.</p>
+  <h1>WealthPipeline — local dashboard</h1>
+  <p class="meta">
+    This is <b>your copy</b> of the pipeline running on <b>your PC</b> (not a public website).
+    It reads the same SQLite file the <code>sync</code> command fills. After you sync, press
+    <b>F5</b> here to reload. GitHub only holds code; your leads live in the DB file below.
+  </p>
+  {banner}
+  <label class="sr" for="filter">Filter both tables</label>
+  <input type="search" id="filter" placeholder="Type company or person name…" autocomplete="off"/>
+  <p class="meta">Database: <code>{html.escape(database_path())}</code></p>
   {_leads_table(leads)}
   {_comp_table(comp)}
+  <script>
+  (function() {{
+    var input = document.getElementById('filter');
+    if (!input) return;
+    input.addEventListener('input', function() {{
+      var q = (input.value || '').toLowerCase().trim();
+      document.querySelectorAll('table tbody tr').forEach(function(tr) {{
+        if (!q) {{ tr.classList.remove('hidden'); return; }}
+        tr.classList.toggle('hidden', (tr.textContent || '').toLowerCase().indexOf(q) < 0);
+      }});
+    }});
+  }})();
+  </script>
 </body>
 </html>"""
 
 
-def _fetch_leads() -> list[sqlite3.Row]:
+def _load_page_data() -> tuple[list[sqlite3.Row], list[sqlite3.Row], dict]:
     dbp = database_path()
     if not Path(dbp).is_file():
-        return []
+        return [], [], {"missing_db": True}
+
+    mtime = datetime.fromtimestamp(Path(dbp).stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+
     with connect() as conn:
         cur = conn.execute(
             """
@@ -151,29 +203,45 @@ def _fetch_leads() -> list[sqlite3.Row]:
             ORDER BY f.filing_date DESC, f.company_name, o.name
             """
         )
-        return list(cur.fetchall())
+        leads = list(cur.fetchall())
 
-
-def _fetch_comp() -> list[sqlite3.Row]:
-    dbp = database_path()
-    if not Path(dbp).is_file():
-        return []
-    with connect() as conn:
-        if not conn.execute(
+        comp: list[sqlite3.Row] = []
+        if conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='neo_compensation'"
         ).fetchone():
-            return []
-        cur = conn.execute(
-            """
-            SELECT f.company_name, f.primary_doc_url, c.person_name, c.role_hint,
-                   c.fiscal_year, c.salary, c.bonus, c.stock_awards, c.option_awards,
-                   c.other_comp, c.total, c.equity_comp_disclosed
-            FROM neo_compensation c
-            JOIN filings f ON f.id = c.filing_id
-            ORDER BY f.filing_date DESC, f.company_name, c.person_name, c.fiscal_year DESC
-            """
-        )
-        return list(cur.fetchall())
+            cur = conn.execute(
+                """
+                SELECT f.company_name, f.primary_doc_url, c.person_name, c.role_hint,
+                       c.fiscal_year, c.salary, c.bonus, c.stock_awards, c.option_awards,
+                       c.other_comp, c.total, c.equity_comp_disclosed
+                FROM neo_compensation c
+                JOIN filings f ON f.id = c.filing_id
+                ORDER BY f.filing_date DESC, f.company_name, c.person_name, c.fiscal_year DESC
+                """
+            )
+            comp = list(cur.fetchall())
+
+        nf = int(conn.execute("SELECT COUNT(*) FROM filings").fetchone()[0])
+        no = int(conn.execute("SELECT COUNT(*) FROM officers").fetchone()[0])
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='neo_compensation'"
+        ).fetchone():
+            nc = int(conn.execute("SELECT COUNT(*) FROM neo_compensation").fetchone()[0])
+        else:
+            nc = 0
+        latest = conn.execute(
+            "SELECT MAX(filing_date) FROM filings"
+        ).fetchone()[0]
+
+    stats = {
+        "missing_db": False,
+        "filings": nf,
+        "officers": no,
+        "comp_rows": nc,
+        "latest_filing_date": latest,
+        "db_file_modified": mtime,
+    }
+    return leads, comp, stats
 
 
 def _app(environ, start_response):
@@ -181,7 +249,8 @@ def _app(environ, start_response):
         start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
         return [b"Not Found"]
 
-    body = _page(_fetch_leads(), _fetch_comp()).encode("utf-8")
+    leads, comp, stats = _load_page_data()
+    body = _page(leads, comp, stats).encode("utf-8")
     start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body)))])
     return [body]
 
