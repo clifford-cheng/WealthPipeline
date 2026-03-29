@@ -6,6 +6,7 @@ import sqlite3
 import sys
 from collections import defaultdict
 from datetime import datetime
+from typing import Optional
 import threading
 import webbrowser
 from pathlib import Path
@@ -37,7 +38,7 @@ def _money(v: object) -> str:
 
 
 def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
-    """One row per (CIK, person): headline = latest fiscal year; timeline = prior disclosed years."""
+    """One row per (CIK, person): headline = latest fiscal year; sums + per-year breakdown for drill-down."""
     if not conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='neo_compensation'"
     ).fetchone():
@@ -88,15 +89,58 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
         by_year: dict[int, dict] = {}
         for r in items:
             fy_raw = r["fiscal_year"]
-            fy = int(fy_raw) if fy_raw is not None else 0
-            if fy not in by_year:
+            if fy_raw is None:
+                continue
+            fy = int(fy_raw)
+            if fy <= 0:
+                continue
+            cur = by_year.get(fy)
+            if cur is None:
                 by_year[fy] = r
+            else:
+                fd = r["filing_date"] or ""
+                fd0 = cur["filing_date"] or ""
+                if fd > fd0 or (
+                    fd == fd0 and (r.get("filing_id") or 0) > (cur.get("filing_id") or 0)
+                ):
+                    by_year[fy] = r
+
         years_sorted = sorted(by_year.keys(), reverse=True)
         timeline_parts = []
         for y in years_sorted[:8]:
             t = by_year[y].get("total")
             timeline_parts.append(f"{y} {_money(t)}")
         timeline = " · ".join(timeline_parts) if timeline_parts else "—"
+
+        sum_year_totals: Optional[float] = None
+        if years_sorted:
+            acc = 0.0
+            any_tot = False
+            for y in years_sorted:
+                t = by_year[y].get("total")
+                if t is not None:
+                    acc += float(t)
+                    any_tot = True
+            if any_tot:
+                sum_year_totals = acc
+
+        year_breakdown: list[dict] = []
+        for y in years_sorted:
+            r = by_year[y]
+            year_breakdown.append(
+                {
+                    "fiscal_year": y,
+                    "salary": r.get("salary"),
+                    "bonus": r.get("bonus"),
+                    "stock_awards": r.get("stock_awards"),
+                    "option_awards": r.get("option_awards"),
+                    "other_comp": r.get("other_comp"),
+                    "total": r.get("total"),
+                    "equity_comp_disclosed": r.get("equity_comp_disclosed"),
+                    "filing_date": r.get("filing_date") or "",
+                    "primary_doc_url": r.get("primary_doc_url") or "",
+                }
+            )
 
         title_guess = (head.get("role_hint") or "").strip()
         if not title_guess:
@@ -115,6 +159,7 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
                 "salary": head["salary"],
                 "bonus": head["bonus"],
                 "stock_awards": head["stock_awards"],
+                "option_awards": head.get("option_awards"),
                 "total": head["total"],
                 "equity": head["equity_comp_disclosed"],
                 "filing_date": head["filing_date"] or "",
@@ -122,6 +167,8 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
                 "primary_doc_url": head["primary_doc_url"] or "",
                 "years_count": len(by_year),
                 "comp_timeline": timeline,
+                "sum_year_totals": sum_year_totals,
+                "year_breakdown": year_breakdown,
             }
         )
 
@@ -132,13 +179,48 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
     return profiles
 
 
+def _profile_breakdown_table(p: dict) -> str:
+    yb = p.get("year_breakdown") or []
+    if not yb:
+        return "<p class='bd-note'>No fiscal-year rows.</p>"
+    parts: list[str] = [
+        "<p class='bd-note'><strong>Year-by-year</strong> — from the filing summary compensation table. "
+        "Each FY uses the row from the <b>latest amendment</b> in your DB if duplicates exist. "
+        "Equity columns are usually grant-date fair value, not cash. <strong>Total</strong> is the issuer’s SCT total for that year.</p>",
+        "<table class='inner-comp'><thead><tr>",
+        "<th>FY</th><th>Salary</th><th>Bonus</th><th>Stock</th><th>Options</th><th>Other</th>",
+        "<th>Equity Σ</th><th>Total</th><th>Filing</th><th>Doc</th>",
+        "</tr></thead><tbody>",
+    ]
+    for y in yb:
+        doc = html.escape(y.get("primary_doc_url") or "")
+        doc_l = f'<a href="{doc}" target="_blank" rel="noopener">S-1</a>' if doc else "—"
+        parts.append(
+            "<tr>"
+            f"<td class='num'>{y['fiscal_year']}</td>"
+            f"<td class='num'>{_money(y.get('salary'))}</td>"
+            f"<td class='num'>{_money(y.get('bonus'))}</td>"
+            f"<td class='num'>{_money(y.get('stock_awards'))}</td>"
+            f"<td class='num'>{_money(y.get('option_awards'))}</td>"
+            f"<td class='num'>{_money(y.get('other_comp'))}</td>"
+            f"<td class='num'>{_money(y.get('equity_comp_disclosed'))}</td>"
+            f"<td class='num strong'>{_money(y.get('total'))}</td>"
+            f"<td>{html.escape(y.get('filing_date') or '')}</td>"
+            f"<td>{doc_l}</td>"
+            "</tr>"
+        )
+    parts.append("</tbody></table>")
+    return "".join(parts)
+
+
 def _profiles_table(profiles: list[dict]) -> str:
     if not profiles:
         return """
   <h2>Lead profiles</h2>
   <p class="meta">No NEO compensation rows yet — profiles are built from summary comp tables. Run sync / backfill-comp, or expand <b>Source rows</b> below for officer-level detail.</p>"""
 
-    body_rows = []
+    colspan = 16
+    body_chunks: list[str] = []
     for p in profiles:
         company = html.escape(p["company_name"] or "")
         nm = html.escape(p["display_name"] or "")
@@ -148,17 +230,22 @@ def _profiles_table(profiles: list[dict]) -> str:
         idx_link = f'<a href="{idx}" target="_blank" rel="noopener">EDGAR</a>' if idx else "—"
         doc_link = f'<a href="{doc}" target="_blank" rel="noopener">S-1</a>' if doc else "—"
         tl = html.escape(p["comp_timeline"] or "—")
-        body_rows.append(
-            "<tr>"
+        sum_sct = p.get("sum_year_totals")
+        sum_cell = _money(sum_sct) if sum_sct is not None else "—"
+        body_chunks.append("<tbody class='pgrp'>")
+        body_chunks.append(
+            "<tr class='profile-main' tabindex='0' aria-expanded='false' title='Click to expand year-by-year breakdown'>"
             f"<td class='profile-name'>{nm}</td>"
             f"<td>{title}</td>"
             f"<td>{company}</td>"
             f"<td class='cik'>{html.escape(str(p['cik'] or ''))}</td>"
             f"<td class='num'>{html.escape(str(p['headline_year'] or '—'))}</td>"
             f"<td class='num strong'>{_money(p['total'])}</td>"
+            f"<td class='num' title='Sum of SCT “Total” for each fiscal year in your DB (not lifetime cash)'>{sum_cell}</td>"
             f"<td class='num'>{_money(p['salary'])}</td>"
             f"<td class='num'>{_money(p['bonus'])}</td>"
             f"<td class='num'>{_money(p['stock_awards'])}</td>"
+            f"<td class='num'>{_money(p.get('option_awards'))}</td>"
             f"<td class='num'>{_money(p['equity'])}</td>"
             f"<td class='num dim'>{p['years_count']}</td>"
             f"<td class='timeline'>{tl}</td>"
@@ -166,24 +253,33 @@ def _profiles_table(profiles: list[dict]) -> str:
             f"<td>{html.escape(p['filing_date'] or '')}</td>"
             "</tr>"
         )
-    inner = "".join(body_rows)
+        body_chunks.append(
+            f"<tr class='profile-detail'><td colspan='{colspan}'>"
+            f"{_profile_breakdown_table(p)}"
+            "</td></tr>"
+        )
+        body_chunks.append("</tbody>")
+    inner = "".join(body_chunks)
     return f"""
   <h2>Lead profiles</h2>
   <p class="meta">
-    <b>One row per executive</b> (same person + same company). Headline pay is the <b>latest fiscal year</b> in your DB; the timeline column rolls prior disclosed years into one line.
-    Different companies can share a name — we keep them separate via CIK. Raw filing rows stay under <b>Source rows</b>.
+    <b>One row per executive</b> (person + company via CIK). <b>Latest total</b> is the most recent fiscal year in your snapshot.
+    <b>Σ SCT</b> sums each year’s disclosed <b>Total</b> column across years you have — useful for trajectory, but it is <b>not</b> “lifetime take-home” (equity is grant-value, years can overlap concepts).
+    <b>Click a row</b> (not the links) for the full column breakdown by year. Audit trail: <b>Source rows</b> below.
   </p>
   <div class="table-wrap">
   <table id="profiles">
     <thead>
       <tr>
         <th>Name</th><th>Role</th><th>Company</th><th>CIK</th><th>FY</th>
-        <th>Total</th><th>Salary</th><th>Bonus</th><th>Stock</th><th>Equity</th>
-        <th title="Distinct fiscal years with comp">Yrs</th>
-        <th>Pay timeline</th><th>Source</th><th>Filing</th>
+        <th>Latest total</th>
+        <th title='Sum of Summary Compensation Table Total for each FY in DB'>Σ SCT</th>
+        <th>Salary</th><th>Bonus</th><th>Stock</th><th>Opt</th><th>Equity</th>
+        <th title='Fiscal years with comp'>Yrs</th>
+        <th>Timeline</th><th>Source</th><th>Filing</th>
       </tr>
     </thead>
-    <tbody>{inner}</tbody>
+    {inner}
   </table>
   </div>"""
 
@@ -370,6 +466,18 @@ def _page(
     tbody tr:hover td {{ background: #121820; }}
     tr.hidden {{ display: none; }}
     code {{ font-size: 0.85em; }}
+    tr.profile-main {{ cursor: pointer; }}
+    tr.profile-main:focus {{ outline: 1px solid #5eb3e0; outline-offset: -1px; }}
+    tr.profile-main td.profile-name::after {{ content: " ▾"; color: #5c6570; font-size: 0.65rem; }}
+    tr.profile-main.open td.profile-name::after {{ content: " ▴"; }}
+    tr.profile-detail {{ display: none; }}
+    tr.profile-detail.open {{ display: table-row; }}
+    tr.profile-detail td {{ background: #070a0d; padding: 0.55rem 0.5rem 0.8rem; border-bottom: 1px solid #2a3340; vertical-align: top; }}
+    p.bd-note {{ margin: 0 0 0.5rem 0; font-size: 0.72rem; color: #6b7785; line-height: 1.45; max-width: 52rem; }}
+    table.inner-comp {{ width: 100%; font-size: 0.72rem; margin: 0; border-collapse: collapse; }}
+    table.inner-comp th {{ background: #0c1016; color: #8b96a3; font-weight: 600; padding: 0.35rem 0.45rem; border-bottom: 1px solid #2a3340; }}
+    table.inner-comp td {{ padding: 0.35rem 0.45rem; border-bottom: 1px solid #1a2228; }}
+    table.inner-comp tbody tr:hover td {{ background: #0f141a; }}
     details.audit {{ margin-top: 1.5rem; border-top: 1px solid #2a3340; padding-top: 1rem; }}
     details.audit summary {{
       cursor: pointer; color: #8b96a3; font-size: 0.8125rem; user-select: none;
@@ -397,14 +505,44 @@ def _page(
   <script>
   (function() {{
     var input = document.getElementById('filter');
-    if (!input) return;
-    input.addEventListener('input', function() {{
-      var q = (input.value || '').toLowerCase().trim();
-      document.querySelectorAll('table tbody tr').forEach(function(tr) {{
-        if (!q) {{ tr.classList.remove('hidden'); return; }}
-        tr.classList.toggle('hidden', (tr.textContent || '').toLowerCase().indexOf(q) < 0);
+    if (input) {{
+      input.addEventListener('input', function() {{
+        var q = (input.value || '').toLowerCase().trim();
+        document.querySelectorAll('#profiles tbody.pgrp').forEach(function(tb) {{
+          if (!q) {{ tb.style.display = ''; return; }}
+          var t = (tb.textContent || '').toLowerCase();
+          tb.style.display = t.indexOf(q) >= 0 ? '' : 'none';
+        }});
+        document.querySelectorAll('details.audit table tbody tr').forEach(function(tr) {{
+          if (!q) {{ tr.classList.remove('hidden'); return; }}
+          tr.classList.toggle('hidden', (tr.textContent || '').toLowerCase().indexOf(q) < 0);
+        }});
       }});
-    }});
+    }}
+    var prof = document.getElementById('profiles');
+    if (prof) {{
+      function toggleDetail(trMain) {{
+        var d = trMain.nextElementSibling;
+        if (!d || !d.classList.contains('profile-detail')) return;
+        var on = !d.classList.contains('open');
+        d.classList.toggle('open', on);
+        trMain.classList.toggle('open', on);
+        trMain.setAttribute('aria-expanded', on ? 'true' : 'false');
+      }}
+      prof.addEventListener('click', function(e) {{
+        if (e.target.closest('a')) return;
+        var tr = e.target.closest('tr.profile-main');
+        if (!tr || !prof.contains(tr)) return;
+        toggleDetail(tr);
+      }});
+      prof.addEventListener('keydown', function(e) {{
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        var tr = e.target.closest('tr.profile-main');
+        if (!tr || document.activeElement !== tr) return;
+        e.preventDefault();
+        toggleDetail(tr);
+      }});
+    }}
   }})();
   </script>
 </body>
