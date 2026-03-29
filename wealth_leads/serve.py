@@ -3,6 +3,8 @@ from __future__ import annotations
 import html
 import os
 import sqlite3
+import sys
+import threading
 import webbrowser
 from pathlib import Path
 from wsgiref.simple_server import make_server
@@ -184,14 +186,33 @@ def _app(environ, start_response):
     return [body]
 
 
+def _open_browser_when_ready(url: str, delay_sec: float = 0.8) -> None:
+    def _go() -> None:
+        if sys.platform == "win32":
+            try:
+                os.startfile(url)
+                return
+            except OSError:
+                pass
+        webbrowser.open(url)
+
+    threading.Timer(delay_sec, _go).start()
+
+
 def run_localhost(*, port: int | None = None, open_browser: bool = True) -> None:
     p = port or int(os.environ.get("WEALTH_LEADS_PORT", "8765"))
     url = f"http://127.0.0.1:{p}/"
-    httpd = make_server("127.0.0.1", p, _app)
+    try:
+        httpd = make_server("127.0.0.1", p, _app)
+    except OSError as e:
+        print(f"Could not listen on {url} (port {p}): {e}", file=sys.stderr)
+        print("Another copy may be running, or the port is in use.", file=sys.stderr)
+        raise SystemExit(1) from e
     print(f"WealthPipeline dashboard: {url}")
     print("Press Ctrl+C to stop.")
     if open_browser:
-        webbrowser.open(url)
+        print("Opening your browser in a moment…")
+        _open_browser_when_ready(url)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
