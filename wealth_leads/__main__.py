@@ -7,10 +7,12 @@ import sys
 import requests
 
 from wealth_leads.config import database_path
+from wealth_leads.compensation import NeoCompRow, extract_neo_compensation_from_s1
 from wealth_leads.db import (
     connect,
     get_filing_by_accession,
     insert_filing,
+    replace_neo_compensation,
     replace_officers,
     update_primary_doc_url,
 )
@@ -20,7 +22,41 @@ from wealth_leads.rss import fetch_current_s1_feed
 from wealth_leads.sec_client import get_text
 
 
-def sync(*, force_officers: bool = False) -> None:
+def _neo_comp_db_rows(
+    filing_id: int, comps: list[NeoCompRow]
+) -> list[tuple]:
+    out: list[tuple] = []
+    for c in comps:
+        if c.stock_awards is not None or c.option_awards is not None:
+            eq = 0.0
+            if c.stock_awards is not None:
+                eq += c.stock_awards
+            if c.option_awards is not None:
+                eq += c.option_awards
+        else:
+            eq = None
+        out.append(
+            (
+                filing_id,
+                c.person_name,
+                c.role_hint,
+                c.fiscal_year,
+                c.salary,
+                c.bonus,
+                c.stock_awards,
+                c.option_awards,
+                c.non_equity_incentive,
+                c.pension_change,
+                c.other_comp,
+                c.total,
+                eq,
+                "summary_compensation_table",
+            )
+        )
+    return out
+
+
+def sync(*, force_reprocess: bool = False) -> None:
     session = requests.Session()
     feed = fetch_current_s1_feed(session)
     with connect() as conn:
@@ -29,7 +65,8 @@ def sync(*, force_officers: bool = False) -> None:
             if (
                 existing
                 and existing["officers_extracted"]
-                and not force_officers
+                and existing["compensation_extracted"]
+                and not force_reprocess
             ):
                 continue
 
@@ -78,6 +115,17 @@ def sync(*, force_officers: bool = False) -> None:
                     file=sys.stderr,
                 )
             replace_officers(conn, filing_id, officers)
+
+            comps = extract_neo_compensation_from_s1(s1_html)
+            replace_neo_compensation(
+                conn, filing_id, _neo_comp_db_rows(filing_id, comps)
+            )
+            if not comps:
+                print(
+                    f"[warn] No NEO summary comp table: {item.company_name} "
+                    f"({item.accession})",
+                    file=sys.stderr,
+                )
         print(f"Processed {len(feed)} RSS entries (see {database_path()}).")
 
 
@@ -110,6 +158,46 @@ def export_leads_csv() -> None:
             writer.writerow(list(r))
 
 
+def export_compensation_csv() -> None:
+    writer = csv.writer(sys.stdout)
+    writer.writerow(
+        [
+            "company_name",
+            "cik",
+            "accession",
+            "filing_date",
+            "person_name",
+            "role_hint",
+            "fiscal_year",
+            "salary",
+            "bonus",
+            "stock_awards",
+            "option_awards",
+            "non_equity_incentive",
+            "pension_change",
+            "other_comp",
+            "total",
+            "equity_comp_disclosed",
+            "primary_doc_url",
+        ]
+    )
+    with connect() as conn:
+        cur = conn.execute(
+            """
+            SELECT f.company_name, f.cik, f.accession, f.filing_date,
+                   c.person_name, c.role_hint, c.fiscal_year,
+                   c.salary, c.bonus, c.stock_awards, c.option_awards,
+                   c.non_equity_incentive, c.pension_change, c.other_comp,
+                   c.total, c.equity_comp_disclosed, f.primary_doc_url
+            FROM neo_compensation c
+            JOIN filings f ON f.id = c.filing_id
+            ORDER BY f.filing_date DESC, f.company_name, c.person_name, c.fiscal_year DESC
+            """
+        )
+        for r in cur:
+            writer.writerow(list(r))
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="SEC S-1 lead pipeline (MVP)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -118,10 +206,19 @@ def main() -> None:
     s.add_argument(
         "--force-officers",
         action="store_true",
-        help="Re-parse officers even if already extracted",
+        help="(Deprecated alias for --force.)",
+    )
+    s.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-process filings even if officers + compensation already stored",
     )
 
     sub.add_parser("export", help="Print leads as CSV to stdout")
+    sub.add_parser(
+        "export-comp",
+        help="Print NEO compensation rows (from S-1 tables) as CSV",
+    )
 
     srv = sub.add_parser(
         "serve",
@@ -141,9 +238,15 @@ def main() -> None:
 
     args = p.parse_args()
     if args.cmd == "sync":
-        sync(force_officers=args.force_officers)
+        sync(
+            force_reprocess=bool(
+                getattr(args, "force", False) or getattr(args, "force_officers", False)
+            )
+        )
     elif args.cmd == "export":
         export_leads_csv()
+    elif args.cmd == "export-comp":
+        export_compensation_csv()
     elif args.cmd == "serve":
         from wealth_leads.serve import run_localhost
 

@@ -24,8 +24,8 @@ def primary_s1_document_url(index_html: str) -> Optional[str]:
             if len(cells) < 4:
                 continue
             # Seq, Description, Document, Type, Size
-            type_cell = cells[3].get_text(strip=True)
-            if type_cell not in ("S-1", "S-1/A"):
+            type_cell = cells[3].get_text(strip=True).upper().replace(" ", "")
+            if type_cell not in ("S-1", "S-1/A", "FORMS-1", "FORMS-1/A"):
                 continue
             link = cells[2].find("a", href=True)
             if not link:

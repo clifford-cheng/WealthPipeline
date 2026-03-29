@@ -35,7 +35,38 @@ CREATE TABLE IF NOT EXISTS officers (
 );
 
 CREATE INDEX IF NOT EXISTS idx_officers_filing ON officers(filing_id);
+
+CREATE TABLE IF NOT EXISTS neo_compensation (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    filing_id INTEGER NOT NULL,
+    person_name TEXT NOT NULL,
+    role_hint TEXT,
+    fiscal_year INTEGER NOT NULL,
+    salary REAL,
+    bonus REAL,
+    stock_awards REAL,
+    option_awards REAL,
+    non_equity_incentive REAL,
+    pension_change REAL,
+    other_comp REAL,
+    total REAL,
+    equity_comp_disclosed REAL,
+    source TEXT NOT NULL DEFAULT 'summary_compensation_table',
+    FOREIGN KEY (filing_id) REFERENCES filings(id),
+    UNIQUE(filing_id, person_name, fiscal_year)
+);
+
+CREATE INDEX IF NOT EXISTS idx_neo_comp_filing ON neo_compensation(filing_id);
 """
+
+
+def _migrate_filings_compensation_column(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(filings)").fetchall()}
+    if "compensation_extracted" not in cols:
+        conn.execute(
+            "ALTER TABLE filings ADD COLUMN compensation_extracted "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 @contextmanager
@@ -46,6 +77,7 @@ def connect(path: Optional[str] = None) -> Generator[sqlite3.Connection, None, N
     conn.row_factory = sqlite3.Row
     try:
         conn.executescript(SCHEMA)
+        _migrate_filings_compensation_column(conn)
         yield conn
         conn.commit()
     finally:
@@ -121,4 +153,28 @@ def replace_officers(
     # Mark attempt complete so sync does not re-fetch forever; use --force-officers to retry.
     conn.execute(
         "UPDATE filings SET officers_extracted = 1 WHERE id = ?", (filing_id,)
+    )
+
+
+def replace_neo_compensation(
+    conn: sqlite3.Connection,
+    filing_id: int,
+    rows: list[tuple],
+) -> None:
+    """rows: tuples matching insert order incl. equity_comp_disclosed."""
+    conn.execute("DELETE FROM neo_compensation WHERE filing_id = ?", (filing_id,))
+    if rows:
+        conn.executemany(
+            """
+            INSERT INTO neo_compensation (
+                filing_id, person_name, role_hint, fiscal_year,
+                salary, bonus, stock_awards, option_awards,
+                non_equity_incentive, pension_change, other_comp, total,
+                equity_comp_disclosed, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+    conn.execute(
+        "UPDATE filings SET compensation_extracted = 1 WHERE id = ?", (filing_id,)
     )
