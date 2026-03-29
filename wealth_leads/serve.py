@@ -13,7 +13,11 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlencode
 from wsgiref.simple_server import make_server
 
-from wealth_leads.config import database_path
+from wealth_leads.config import (
+    database_path,
+    lead_desk_min_equity_usd,
+    lead_desk_s1_only,
+)
 from wealth_leads.db import connect
 from wealth_leads.management import why_surfaced_line
 
@@ -21,6 +25,21 @@ from wealth_leads.management import why_surfaced_line
 def _norm_person_name(name: str) -> str:
     s = (name or "").lower().replace(".", " ")
     return " ".join(s.split())
+
+
+def _is_s1_form_type(form_type: str) -> bool:
+    ft = (form_type or "").strip().upper().replace(" ", "")
+    return ft.startswith("S-1")
+
+
+def _row_equity_usd(row: dict) -> float:
+    """Grant-style equity from SCT: stock + options, or stored equity sum if columns absent."""
+    s, o, ec = row.get("stock_awards"), row.get("option_awards"), row.get("equity_comp_disclosed")
+    if s is not None or o is not None:
+        return float(s or 0) + float(o or 0)
+    if ec is not None:
+        return float(ec)
+    return 0.0
 
 
 _NAME_SUFFIXES = frozenset({"jr", "sr", "ii", "iii", "iv", "v"})
@@ -250,6 +269,13 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
             head.get("filing_date"),
         )
 
+        equity_hwm = 0.0
+        for r in items:
+            equity_hwm = max(equity_hwm, _row_equity_usd(r))
+        has_s1_comp = any(
+            _is_s1_form_type(str(r.get("filing_form_type") or "")) for r in items
+        )
+
         profiles.append(
             {
                 "norm_name": key[1],
@@ -274,6 +300,8 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
                 "comp_timeline": timeline,
                 "sum_year_totals": sum_year_totals,
                 "year_breakdown": year_breakdown,
+                "equity_hwm": equity_hwm,
+                "has_s1_comp": has_s1_comp,
             }
         )
 
@@ -282,6 +310,29 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
         reverse=True,
     )
     return profiles
+
+
+def _lead_desk_filter_profiles(profiles: list[dict]) -> list[dict]:
+    """Narrow desk to S-1-linked NEO rows and a minimum max-year equity bar (configurable)."""
+    s1_only = lead_desk_s1_only()
+    min_eq = lead_desk_min_equity_usd()
+    out: list[dict] = []
+    for p in profiles:
+        if s1_only and not p.get("has_s1_comp"):
+            continue
+        if min_eq > 0 and float(p.get("equity_hwm") or 0) < min_eq:
+            continue
+        out.append(p)
+    out.sort(
+        key=lambda p: (
+            float(p.get("equity_hwm") or 0),
+            p.get("filing_date") or "",
+            p.get("headline_year") or 0,
+            p.get("total") or 0,
+        ),
+        reverse=True,
+    )
+    return out
 
 
 def _profile_breakdown_table(p: dict) -> str:
@@ -365,11 +416,26 @@ def _filings_for_profile(conn: sqlite3.Connection, cik: str, _norm_name: str) ->
     return out
 
 
-def _desk_table(profiles: list[dict]) -> str:
+def _desk_table(profiles: list[dict], stats: dict) -> str:
     if not profiles:
-        return """
+        n_all = int(stats.get("profile_count_all") or 0)
+        hidden = n_all > 0
+        extra = ""
+        if hidden:
+            min_e = float(stats.get("lead_desk_min_equity_usd") or 0)
+            s1 = bool(stats.get("lead_desk_s1_only"))
+            extra = (
+                f"<p class='meta'><b>{n_all}</b> NEO profile(s) are hidden by desk filters"
+                f" ({'S-1 only; ' if s1 else ''}min max-year stock+options <b>${min_e:,.0f}</b>). "
+                f"Open a saved <code>/lead?…</code> link to view anyone still in the DB. "
+                f"To show everyone: set <code>WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD=0</code>"
+                f" and/or <code>WEALTH_LEADS_LEAD_DESK_S1_ONLY=0</code>.</p>"
+            )
+        return f"""
   <h2>Lead desk</h2>
-  <p class="meta">No NEO compensation rows yet — run sync / backfill-comp, or open <b>Source rows</b> below.</p>"""
+  <p class="meta">No rows match the current desk filters — see note below.</p>
+  {extra}
+  <p class="meta">If the database is empty, run <code>sync</code> / <code>backfill-comp</code>, or open <b>Source rows</b> below.</p>"""
 
     rows: list[str] = []
     for p in profiles:
@@ -407,6 +473,7 @@ def _desk_table(profiles: list[dict]) -> str:
             f"<td><span class='badge'>{badge}</span></td>"
             f"<td class='num strong'>{_money(p['total'])}</td>"
             f"<td class='num'>{sum_cell}</td>"
+            f"<td class='num'>{_money(p.get('equity_hwm'))}</td>"
             f"<td class='num dim'>{html.escape(str(p['headline_year'] or '—'))}</td>"
             f"<td>{html.escape(p['filing_date'] or '')}</td>"
             f"<td class='cik'>{html.escape(str(p['cik'] or ''))}</td>"
@@ -417,15 +484,17 @@ def _desk_table(profiles: list[dict]) -> str:
     return f"""
   <h2>Lead desk</h2>
   <p class="meta">
-    <b>Person-first pre-IPO leads.</b> Each row is an executive tied to a <b>registration filing</b>; role/title is merged from the <b>Executive Officers</b> table and signature pages when we can parse them. The gray lines are <b>why it surfaced</b> (filing timing) and a short <b>issuer blurb</b> cut from the prospectus summary in the same HTML (no company-website scraping).
-    <b>Latest total</b> / <b>Σ SCT</b> come from summary compensation tables. <b>Click the row</b> for the full profile. Raw rows: <b>Source rows</b> below.
+    <b>Person-first pre-IPO leads.</b> The desk defaults to <b>S-1 / S-1/A NEO rows only</b> and people whose <b>largest single-year stock+option</b> total (from the summary comp table) is at least <b>$500k</b> — so small-cash / ex-officer lines drop off. Role/title merges from the <b>Executive Officers</b> table and signatures when parsed. Gray lines: <b>why surfaced</b> + filing <b>issuer blurb</b>. Tune via <code>WEALTH_LEADS_LEAD_DESK_S1_ONLY</code> and <code>WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD</code>.
+    <b>Click the row</b> for detail. Raw rows: <b>Source rows</b> below.
   </p>
   <div class="table-wrap">
   <table id="desk">
     <thead>
       <tr>
         <th>Person</th><th>Role</th><th>Company</th><th>Signal</th>
-        <th>Latest total</th><th title='Sum of SCT Total per FY in DB'>Σ SCT</th><th>FY</th><th>Filing</th><th>CIK</th><th>Quick source</th>
+        <th>Latest total</th><th title='Sum of SCT Total per FY in DB'>Σ SCT</th>
+        <th title='Max single-FY stock + options (SCT)'>Max equity</th>
+        <th>FY</th><th>Filing</th><th>CIK</th><th>Quick source</th>
       </tr>
     </thead>
     <tbody id="desk-body">{inner}</tbody>
@@ -545,12 +614,16 @@ def _stats_banner(stats: dict, rendered_at: str) -> str:
         return """<div class="banner warn"><strong>No database file yet.</strong> Run sync once, then refresh this page.</div>"""
     nf, no, nc = stats["filings"], stats["officers"], stats["comp_rows"]
     np = int(stats.get("profile_count", 0))
+    np_all = int(stats.get("profile_count_all", np))
     latest = html.escape(str(stats.get("latest_filing_date") or "—"))
     mtime = html.escape(str(stats.get("db_file_modified") or "—"))
     rat = html.escape(rendered_at)
+    desk_lbl = f"{np} desk leads"
+    if np_all != np:
+        desk_lbl = f"{np} desk leads <span style='color:#6b7785'>({np_all} NEO profiles before filters)</span>"
     return f"""<div class="banner">
     <strong>Local snapshot</strong>
-    <span class="stats"><span>{np} lead profiles</span><span>{nf} filings</span><span>{no} officer rows</span><span>{nc} comp rows</span></span>
+    <span class="stats"><span>{desk_lbl}</span><span>{nf} filings</span><span>{no} officer rows</span><span>{nc} comp rows</span></span>
     <span class="sub">Newest filing date in DB: <b>{latest}</b> · DB file updated: <b>{mtime}</b> · Page loaded: <b>{rat}</b></span>
   </div>"""
 
@@ -620,7 +693,8 @@ def _shared_css() -> str:
     table.inner-comp td { padding: 0.35rem 0.45rem; border-bottom: 1px solid #1a2228; }
     table.inner-comp tbody tr:hover td { background: #0f141a; }
     .hero { display: grid; gap: 0.75rem; margin-bottom: 1rem; }
-    @media (min-width: 640px) { .hero { grid-template-columns: 1fr 1fr 1fr; } }
+    @media (min-width: 640px) { .hero { grid-template-columns: 1fr 1fr; } }
+    @media (min-width: 960px) { .hero { grid-template-columns: repeat(4, 1fr); } }
     .stat-card {
       background: #121820; border: 1px solid #2a3340; border-radius: 6px; padding: 0.65rem 0.75rem;
     }
@@ -667,7 +741,7 @@ def _page_desk(
   {_comp_missing_callout(stats)}
   <label class="sr" for="filter">Filter desk + audit tables</label>
   <input type="search" id="filter" placeholder="Company, person, or CIK…" autocomplete="off"/>
-  {_desk_table(profiles)}
+  {_desk_table(profiles, stats)}
   <details class="audit">
     <summary>Source rows (audit) — officers × filings and raw NEO comp lines</summary>
     {_leads_table(leads)}
@@ -839,6 +913,7 @@ def _page_lead(
   <div class="hero">
     <div class="stat-card"><div class="lbl">Latest FY total</div><div class="val">{_money(p.get('total'))}</div></div>
     <div class="stat-card"><div class="lbl">Σ SCT (years in DB)</div><div class="val">{sum_disp}</div></div>
+    <div class="stat-card"><div class="lbl">Max equity (any FY)</div><div class="val">{_money(p.get('equity_hwm'))}</div></div>
     <div class="stat-card"><div class="lbl">Fiscal years w/ comp</div><div class="val">{int(p.get('years_count') or 0)}</div></div>
   </div>
   <h2>Headline compensation (latest fiscal year)</h2>
@@ -855,15 +930,17 @@ def _page_lead(
 </html>"""
 
 
-def _load_page_data() -> tuple[list[dict], list[sqlite3.Row], list[sqlite3.Row], dict]:
+def _load_page_data() -> tuple[list[dict], list[dict], list[sqlite3.Row], list[sqlite3.Row], dict]:
     dbp = database_path()
     if not Path(dbp).is_file():
-        return [], [], [], {"missing_db": True, "profile_count": 0}
+        empty = {"missing_db": True, "profile_count": 0, "profile_count_all": 0}
+        return [], [], [], [], empty
 
     mtime = datetime.fromtimestamp(Path(dbp).stat().st_mtime).strftime("%Y-%m-%d %H:%M")
 
     with connect() as conn:
-        profiles = _build_profiles(conn)
+        profiles_all = _build_profiles(conn)
+        profiles = _lead_desk_filter_profiles(profiles_all)
 
         if not conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='neo_compensation'"
@@ -939,10 +1016,13 @@ def _load_page_data() -> tuple[list[dict], list[sqlite3.Row], list[sqlite3.Row],
         "officers": no,
         "comp_rows": nc,
         "profile_count": len(profiles),
+        "profile_count_all": len(profiles_all),
+        "lead_desk_s1_only": lead_desk_s1_only(),
+        "lead_desk_min_equity_usd": lead_desk_min_equity_usd(),
         "latest_filing_date": latest,
         "db_file_modified": mtime,
     }
-    return profiles, leads, comp, stats
+    return profiles, profiles_all, leads, comp, stats
 
 
 def _app(environ, start_response):
@@ -951,7 +1031,7 @@ def _app(environ, start_response):
         start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
         return [b"Not Found"]
 
-    profiles, leads, comp, stats = _load_page_data()
+    profiles, profiles_all, leads, comp, stats = _load_page_data()
     rendered_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     if path.rstrip("/") == "/lead":
@@ -960,7 +1040,7 @@ def _app(environ, start_response):
         name_raw = (qs.get("name") or [""])[0]
         name_decoded = unquote(name_raw) if name_raw else ""
         norm = _norm_person_name(name_decoded)
-        prof = _find_profile(profiles, cik, norm) if not stats.get("missing_db") else None
+        prof = _find_profile(profiles_all, cik, norm) if not stats.get("missing_db") else None
         filings: list[dict] = []
         if prof is not None and not stats.get("missing_db"):
             with connect() as conn:

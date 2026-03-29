@@ -64,3 +64,21 @@ def database_path() -> str:
         return os.path.expanduser(explicit)
     root = Path(__file__).resolve().parent.parent
     return str(root / "wealth_leads.sqlite3")
+
+
+def lead_desk_s1_only() -> bool:
+    """If true, the lead desk lists only people with at least one NEO row from an S-1 or S-1/A."""
+    v = os.environ.get("WEALTH_LEADS_LEAD_DESK_S1_ONLY", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def lead_desk_min_equity_usd() -> float:
+    """
+    Minimum max yearly stock+option total (summary comp table) to appear on the lead desk.
+    Uses, per fiscal year, stock awards + option awards (or stored equity sum). Set to 0 to disable.
+    """
+    raw = os.environ.get("WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD", "500000").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 500_000.0

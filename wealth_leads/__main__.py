@@ -399,7 +399,9 @@ def main() -> None:
     )
     s.epilog = (
         "Env: SEC_SYNC_FORMS (default S-1), SEC_FOLLOW_10K=1 (10-K per S-1 CIK via submissions), "
-        "SEC_10K_PER_CIK=3, SEC_RSS_COUNT. Set SEC_SYNC_FORMS=S-1,10-K for a global 10-K RSS feed too."
+        "SEC_10K_PER_CIK=3, SEC_RSS_COUNT. Set SEC_SYNC_FORMS=S-1,10-K for a global 10-K RSS feed too. "
+        "Lead desk: WEALTH_LEADS_LEAD_DESK_S1_ONLY=1 (default), WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD=500000 "
+        "(max single-FY stock+options from SCT; 0 disables)."
     )
 
     sub.add_parser("export", help="Print leads as CSV to stdout")
