@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import csv
 import html
+import io
 import json
 import os
 import re
@@ -300,6 +302,7 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
                f.issuer_summary AS filing_issuer_summary,
                f.issuer_website AS filing_issuer_website,
                f.issuer_headquarters AS filing_issuer_headquarters,
+               f.issuer_industry AS filing_issuer_industry,
                f.director_term_summary AS filing_director_term_summary
         FROM neo_compensation c
         JOIN filings f ON f.id = c.filing_id
@@ -482,6 +485,19 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
             ).fetchone()
             issuer_hq = (rhq[0] or "").strip() if rhq else ""
 
+        issuer_ind = (head.get("filing_issuer_industry") or "").strip()
+        if not issuer_ind and cik_s:
+            rind = conn.execute(
+                """
+                SELECT issuer_industry FROM filings
+                WHERE cik = ? AND issuer_industry IS NOT NULL
+                  AND TRIM(issuer_industry) != ''
+                ORDER BY COALESCE(filing_date, '') DESC LIMIT 1
+                """,
+                (cik_s,),
+            ).fetchone()
+            issuer_ind = (rind[0] or "").strip() if rind else ""
+
         mgmt_nar = narr_map.get((int(head["filing_id"]), pn))
         if not mgmt_nar and cik_s:
             altn = conn.execute(
@@ -588,6 +604,7 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
                 "narrative_age": narrative_age,
                 "issuer_website": issuer_web,
                 "issuer_headquarters": issuer_hq,
+                "issuer_industry": issuer_ind,
                 "mgmt_bio_role": (mgmt_nar or {}).get("role_heading") or "",
                 "mgmt_bio_text": (mgmt_nar or {}).get("bio_text") or "",
                 "mgmt_bio_display_name": (mgmt_nar or {}).get("person_name") or "",
@@ -633,6 +650,109 @@ def _lead_desk_filter_profiles(profiles: list[dict]) -> list[dict]:
         reverse=True,
     )
     return out
+
+
+def filter_profiles_geo_industry_text(
+    profiles: list[dict],
+    *,
+    location_sub: str = "",
+    industry_sub: str = "",
+    text_sub: str = "",
+) -> list[dict]:
+    """
+    Server-side filters for RIA-style lookup: registrant HQ text, SIC/NAICS/summary keywords,
+    and free-text across person / company / CIK.
+    """
+    loc = (location_sub or "").lower().strip()
+    ind = (industry_sub or "").lower().strip()
+    q = (text_sub or "").lower().strip()
+    out: list[dict] = []
+    for p in profiles:
+        if loc:
+            blob_loc = " ".join(
+                [
+                    str(p.get("issuer_headquarters") or ""),
+                    str(p.get("company_name") or ""),
+                ]
+            ).lower()
+            if loc not in blob_loc:
+                continue
+        if ind:
+            blob_ind = " ".join(
+                [
+                    str(p.get("issuer_industry") or ""),
+                    str(p.get("issuer_summary") or ""),
+                ]
+            ).lower()
+            if ind not in blob_ind:
+                continue
+        if q:
+            blob_q = " ".join(
+                [
+                    str(p.get("display_name") or ""),
+                    str(p.get("company_name") or ""),
+                    str(p.get("cik") or ""),
+                    str(p.get("title") or ""),
+                ]
+            ).lower()
+            if q not in blob_q:
+                continue
+        out.append(p)
+    return out
+
+
+def finder_export_csv_bytes(
+    *,
+    profiles_all: list[dict],
+    profiles_desk: list[dict],
+    hq: str,
+    industry: str,
+    q: str,
+    all_neo: bool,
+) -> bytes:
+    base = profiles_all if all_neo else profiles_desk
+    filtered = filter_profiles_geo_industry_text(
+        base,
+        location_sub=hq,
+        industry_sub=industry,
+        text_sub=q,
+    )
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(
+        [
+            "display_name",
+            "company_name",
+            "cik",
+            "title",
+            "registrant_hq",
+            "industry_sic_naics",
+            "filing_date",
+            "latest_total_usd",
+            "max_equity_usd",
+            "profile_path",
+            "index_url",
+            "primary_doc_url",
+        ]
+    )
+    for p in filtered:
+        w.writerow(
+            [
+                p.get("display_name") or "",
+                p.get("company_name") or "",
+                p.get("cik") or "",
+                p.get("title") or "",
+                p.get("issuer_headquarters") or "",
+                p.get("issuer_industry") or "",
+                p.get("filing_date") or "",
+                p.get("total") if p.get("total") is not None else "",
+                p.get("equity_hwm") if p.get("equity_hwm") is not None else "",
+                _profile_lead_url(p),
+                p.get("index_url") or "",
+                p.get("primary_doc_url") or "",
+            ]
+        )
+    return buf.getvalue().encode("utf-8")
 
 
 def _profile_breakdown_table(p: dict) -> str:
@@ -843,6 +963,192 @@ def _desk_table(profiles: list[dict], stats: dict) -> str:
     <tbody id="desk-body">{inner}</tbody>
   </table>
   </div>"""
+
+
+def _finder_table(profiles: list[dict]) -> str:
+    if not profiles:
+        return """
+  <h2>Matching leads</h2>
+  <p class="meta">No rows match these filters. Widen the search, check <b>All NEO profiles</b>, or run
+  <code>python -m wealth_leads backfill-comp --force</code> to re-parse HQ and SIC/NAICS from filings.</p>"""
+
+    rows_html: list[str] = []
+    for p in profiles:
+        company = html.escape(p["company_name"] or "")
+        title = html.escape(p["title"] or "—")
+        href = html.escape(_profile_lead_url(p))
+        nm = html.escape(p["display_name"] or "")
+        idx = html.escape(p["index_url"] or "")
+        doc = html.escape(p["primary_doc_url"] or "")
+        idx_l = f'<a href="{idx}" target="_blank" rel="noopener" onclick="event.stopPropagation()">EDGAR</a>' if idx else "—"
+        doc_l = f'<a href="{doc}" target="_blank" rel="noopener" onclick="event.stopPropagation()">Doc</a>' if doc else "—"
+        hq_raw = (p.get("issuer_headquarters") or "").strip()
+        hq_disp = html.escape(hq_raw[:140] + ("…" if len(hq_raw) > 140 else ""))
+        ind_raw = (p.get("issuer_industry") or "").strip()
+        ind_disp = html.escape(ind_raw[:160] + ("…" if len(ind_raw) > 160 else ""))
+        if not hq_disp:
+            hq_disp = "<span class='dim'>—</span>"
+        if not ind_disp:
+            ind_disp = "<span class='dim'>—</span>"
+        oa_row = p.get("officer_age")
+        age_cell = "—"
+        if oa_row is not None:
+            try:
+                age_cell = str(int(oa_row))
+            except (TypeError, ValueError):
+                pass
+        rows_html.append(
+            "<tr class='desk-row' tabindex='0' role='link' "
+            f"data-href='{href}'>"
+            f"<td class='num'>{html.escape(age_cell)}</td>"
+            f"<td class='profile-name'><a href='{href}'>{nm}</a></td>"
+            f"<td>{title}</td>"
+            f"<td class='co-name'>{company}</td>"
+            f"<td class='hq-cell'>{hq_disp}</td>"
+            f"<td class='ind-cell'>{ind_disp}</td>"
+            f"<td class='num strong'>{_money(p['total'])}</td>"
+            f"<td>{html.escape(p['filing_date'] or '')}</td>"
+            f"<td class='cik'>{html.escape(str(p['cik'] or ''))}</td>"
+            f"<td>{idx_l} · {doc_l}</td>"
+            "</tr>"
+        )
+    inner = "".join(rows_html)
+    return f"""
+  <h2>Matching leads</h2>
+  <p class="meta"><b>{len(profiles)}</b> profile(s) match the current filters. Click a row for the full profile and filing links.</p>
+  <div class="table-wrap">
+  <table id="finder">
+    <thead>
+      <tr>
+        <th>Age</th><th>Person</th><th>Role</th><th>Company</th>
+        <th title="Registrant principal office / HQ from filing text">Registrant HQ</th>
+        <th title="SIC or NAICS line when parsed from the filing">Industry (SIC/NAICS)</th>
+        <th>Latest total</th><th>Filing</th><th>CIK</th><th>Sources</th>
+      </tr>
+    </thead>
+    <tbody id="finder-body">{inner}</tbody>
+  </table>
+  </div>"""
+
+
+def _finder_form(
+    *,
+    hq: str,
+    industry: str,
+    q: str,
+    all_neo: bool,
+    export_href: str,
+) -> str:
+    hq_e = html.escape(hq)
+    ind_e = html.escape(industry)
+    q_e = html.escape(q)
+    return f"""
+  <div class="card" style="margin-bottom:1rem">
+    <h2 style="margin-top:0">Search</h2>
+    <p class="meta" style="margin-top:0">Filter by <b>registrant location</b> (HQ address text) and <b>industry</b> (parsed SIC/NAICS or business summary keywords from the filing). All matching is substring, case-insensitive.</p>
+    <form method="get" action="/finder" style="max-width:40rem">
+      <label class="sr" for="hq">Registrant HQ contains</label>
+      <input type="search" id="hq" name="hq" placeholder="e.g. California, Austin, 94105" value="{hq_e}" style="width:100%;max-width:100%;margin-bottom:0.5rem"/>
+      <label class="sr" for="industry">Industry contains</label>
+      <input type="search" id="industry" name="industry" placeholder="e.g. software, NAICS, 7372, pharmaceutical" value="{ind_e}" style="width:100%;max-width:100%;margin-bottom:0.5rem"/>
+      <label class="sr" for="fq">Person or company contains</label>
+      <input type="search" id="fq" name="q" placeholder="Person name, company, or CIK…" value="{q_e}" style="width:100%;max-width:100%;margin-bottom:0.5rem"/>
+      <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.8125rem;color:#8b96a3;cursor:pointer;margin:0.5rem 0">
+        <input type="checkbox" name="all_neo" value="1"{' checked' if all_neo else ''}/>
+        All NEO profiles (ignore lead-desk S-1 / pay-bar filters)
+      </label>
+      <button type="submit" style="margin-top:0.35rem;padding:0.45rem 0.9rem;border-radius:4px;border:1px solid #238636;background:#238636;color:#fff;cursor:pointer;font:inherit">Apply filters</button>
+      <a href="{html.escape(export_href)}" style="margin-left:0.75rem;font-size:0.8125rem">Download CSV</a>
+    </form>
+  </div>"""
+
+
+def _page_finder(
+    profiles: list[dict],
+    *,
+    stats: dict,
+    rendered_at: str,
+    hq: str,
+    industry: str,
+    q: str,
+    all_neo: bool,
+    base_count: int,
+) -> str:
+    banner = _stats_banner(stats, rendered_at)
+    css = _shared_css()
+    extra_css = """
+    td.hq-cell, td.ind-cell { font-size: 0.72rem; color: #a8b0ba; max-width: 14rem; }
+    #filter-finder { width: 100%; max-width: 22rem; padding: 0.4rem 0.55rem; border-radius: 4px;
+      border: 1px solid #2a3340; background: #0a0e12; color: #d8dee4; font: inherit; margin-bottom: 0.75rem; }
+    """
+    exp_q = urlencode(
+        {
+            "hq": hq or "",
+            "industry": industry or "",
+            "q": q or "",
+            **({"all_neo": "1"} if all_neo else {}),
+        }
+    )
+    export_href = "/export/finder.csv?" + exp_q
+    form = _finder_form(
+        hq=hq, industry=industry, q=q, all_neo=all_neo, export_href=export_href
+    )
+    tbl = _finder_table(profiles)
+    scope = (
+        f"<p class='meta'>Universe: <b>{base_count}</b> NEO profile(s) "
+        f"({'all in database' if all_neo else 'after lead-desk filters'}), then location / industry / text filters.</p>"
+    )
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>WealthPipeline — lead finder</title>
+  <style>{css}{extra_css}</style>
+</head>
+<body class="wide">
+  <h1>WealthPipeline <span class="tag">lead finder · local</span></h1>
+  <p class="meta">
+    Search people tied to issuers in your snapshot. <b>HQ</b> is the registrant’s principal office line from filings (not a home address).
+    <b>Industry</b> uses parsed SIC/NAICS when available, and otherwise you can match keywords in the issuer business summary.
+    <a href="/">Lead desk</a>
+  </p>
+  {banner}
+  {form}
+  {scope}
+  {tbl}
+  <label class="sr" for="filter-finder">Narrow results in this table</label>
+  <input type="search" id="filter-finder" placeholder="Quick filter this table…" autocomplete="off"/>
+  <script>
+  (function() {{
+    var input = document.getElementById('filter-finder');
+    if (input) {{
+      input.addEventListener('input', function() {{
+        var q = (input.value || '').toLowerCase().trim();
+        document.querySelectorAll('#finder-body tr').forEach(function(tr) {{
+          if (!q) {{ tr.classList.remove('hidden'); return; }}
+          tr.classList.toggle('hidden', (tr.textContent || '').toLowerCase().indexOf(q) < 0);
+        }});
+      }});
+    }}
+    document.querySelectorAll('#finder-body tr.desk-row').forEach(function(tr) {{
+      function go() {{
+        var h = tr.getAttribute('data-href');
+        if (h) window.location = h;
+      }}
+      tr.addEventListener('click', function(e) {{
+        if (e.target.closest('a')) return;
+        go();
+      }});
+      tr.addEventListener('keydown', function(e) {{
+        if (e.key === 'Enter') {{ e.preventDefault(); go(); }}
+      }});
+    }});
+  }})();
+  </script>
+  {_live_reload_snippet()}
+</body>
+</html>"""
 
 
 def _leads_table(rows: list[sqlite3.Row]) -> str:
@@ -1079,6 +1385,7 @@ def _page_desk(
 <body class="wide">
   <h1>WealthPipeline <span class="tag">lead desk · local</span></h1>
   <p class="meta">
+    <a href="/finder">Lead finder</a> — filter by registrant HQ and industry.
     SEC filing–native timing: <b>S-1</b> from RSS, then <b>10-K</b> for the <b>same CIKs</b> via SEC submissions (cross-reference). Data updates when you run <code>sync</code>.
     Database: <code>{html.escape(str(Path(database_path()).resolve()))}</code>
   </p>
@@ -1176,7 +1483,7 @@ def _page_lead(
   <style>{css}</style>
 </head>
 <body>
-  <nav class="top"><a href="/">← Lead desk</a></nav>
+  <nav class="top"><a href="/">← Lead desk</a> · <a href="/finder">Lead finder</a></nav>
   <h1>Profile not found</h1>
   <p class="meta">No matching executive + CIK in your snapshot. Check <code>cik</code> and <code>name</code> query params, run <code>sync</code>, or return to the desk.</p>
   <p class="meta">Requested: CIK <code>{html.escape(query_cik)}</code>, name <code>{html.escape(query_name)}</code></p>
@@ -1325,6 +1632,9 @@ def _page_lead(
         company_bits.append(web_link)
     if hq_esc:
         company_bits.append(f"HQ: {hq_esc}")
+    ind_txt = (p.get("issuer_industry") or "").strip()
+    if ind_txt:
+        company_bits.append(f"SIC/NAICS: {html.escape(ind_txt)}")
     company_intro = " · ".join(company_bits)
 
     company_card = f"""
@@ -1344,7 +1654,7 @@ def _page_lead(
   <style>{css}</style>
 </head>
 <body class="detail-page">
-  <nav class="top"><a href="/">← Lead desk</a></nav>
+  <nav class="top"><a href="/">← Lead desk</a> · <a href="/finder">Lead finder</a></nav>
   <h1>{html.escape(p.get('display_name') or '—')}</h1>
   <p class="meta">
     <b>{html.escape(p.get('title') or '—')}</b> · {html.escape(p.get('company_name') or '')}
@@ -1479,6 +1789,33 @@ def _load_page_data() -> tuple[list[dict], list[dict], list[sqlite3.Row], list[s
     return profiles, profiles_all, leads, comp, stats
 
 
+def _is_advisor_only_path(pi: str) -> bool:
+    """Paths that exist on the FastAPI advisor app, not this legacy WSGI desk."""
+    if pi in ("/login", "/register", "/my-leads", "/watchlist", "/healthz"):
+        return True
+    if pi.startswith("/admin") or pi.startswith("/export/my-leads"):
+        return True
+    return False
+
+
+def _advisor_redirect_help_html() -> str:
+    return """<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Wrong server — WealthPipeline</title>
+<style>body{font-family:system-ui;background:#0d1117;color:#e8ecf0;max-width:36rem;margin:2rem auto;padding:1rem;line-height:1.5}
+a{color:#5eb3e0}code{background:#1a2634;padding:0.1rem 0.35rem;border-radius:4px}</style></head><body>
+<h1>This is the legacy lead desk server</h1>
+<p>It does not serve <strong>/login</strong> or the advisor UI. You are probably running
+<code>python -m wealth_leads serve</code> on the same port as the advisor app.</p>
+<p><strong>Fix:</strong> Close this server window, then start the advisor app:</p>
+<ul>
+<li>Double-click <code>Start WealthPipeline Dashboard.bat</code> in the project folder, or</li>
+<li>Run <code>py -3 serve_advisor.py</code> from the project root.</li>
+</ul>
+<p>Then open <a href="http://127.0.0.1:8765/login">http://127.0.0.1:8765/login</a></p>
+<p style="margin-top:1.5rem;font-size:0.85rem;color:#8b96a3">Tip: the legacy desk (no sign-in) defaults to port <strong>8766</strong> so it does not
+take over 8765. Run <code>python -m wealth_leads serve</code> or set <code>WEALTH_LEADS_PORT</code>.</p>
+</body></html>"""
+
+
 def _app(environ, start_response):
     path = environ.get("PATH_INFO") or "/"
     pi = path.rstrip("/") or "/"
@@ -1495,14 +1832,78 @@ def _app(environ, start_response):
         )
         return [body]
 
-    if pi not in ("/", "/lead"):
+    if pi == "/export/finder.csv":
+        qs = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
+        hq = (qs.get("hq") or [""])[0].strip()
+        industry = (qs.get("industry") or [""])[0].strip()
+        qtxt = (qs.get("q") or [""])[0].strip()
+        all_neo = (qs.get("all_neo") or [""])[0] in ("1", "on", "true", "True")
+        profiles, profiles_all, _leads, _comp, _stats = _load_page_data()
+        body = finder_export_csv_bytes(
+            profiles_all=profiles_all,
+            profiles_desk=profiles,
+            hq=hq,
+            industry=industry,
+            q=qtxt,
+            all_neo=all_neo,
+        )
+        start_response(
+            "200 OK",
+            [
+                ("Content-Type", "text/csv; charset=utf-8"),
+                ("Content-Length", str(len(body))),
+                (
+                    "Content-Disposition",
+                    'attachment; filename="wealthpipeline-finder.csv"',
+                ),
+                ("Cache-Control", "no-store"),
+            ],
+        )
+        return [body]
+
+    if _is_advisor_only_path(pi):
+        body = _advisor_redirect_help_html().encode("utf-8")
+        start_response(
+            "200 OK",
+            [
+                ("Content-Type", "text/html; charset=utf-8"),
+                ("Content-Length", str(len(body))),
+                ("Cache-Control", "no-store"),
+            ],
+        )
+        return [body]
+
+    if pi not in ("/", "/lead", "/finder"):
         start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
         return [b"Not Found"]
 
     profiles, profiles_all, leads, comp, stats = _load_page_data()
     rendered_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    if pi == "/lead":
+    if pi == "/finder":
+        qs = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
+        hq = (qs.get("hq") or [""])[0].strip()
+        industry = (qs.get("industry") or [""])[0].strip()
+        qtxt = (qs.get("q") or [""])[0].strip()
+        all_neo = (qs.get("all_neo") or [""])[0] in ("1", "on", "true", "True")
+        base = profiles_all if all_neo else profiles
+        filtered = filter_profiles_geo_industry_text(
+            base,
+            location_sub=hq,
+            industry_sub=industry,
+            text_sub=qtxt,
+        )
+        html_out = _page_finder(
+            filtered,
+            stats=stats,
+            rendered_at=rendered_at,
+            hq=hq,
+            industry=industry,
+            q=qtxt,
+            all_neo=all_neo,
+            base_count=len(base),
+        )
+    elif pi == "/lead":
         qs = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
         cik = (qs.get("cik") or [""])[0].strip()
         name_raw = (qs.get("name") or [""])[0]
@@ -1557,7 +1958,8 @@ def run_localhost(
     live: bool = True,
     reload: bool = False,
 ) -> None:
-    p = port or int(os.environ.get("WEALTH_LEADS_PORT", "8765"))
+    # Default 8766 so the FastAPI advisor can own 8765 (serve_advisor / Start … .bat).
+    p = port or int(os.environ.get("WEALTH_LEADS_PORT", "8766"))
     if live:
         os.environ["WEALTH_LEADS_LIVE_RELOAD"] = "1"
     else:
@@ -1574,7 +1976,11 @@ def run_localhost(
         print(f"Could not listen on {url} (port {p}): {e}", file=sys.stderr)
         print("Another copy may be running, or the port is in use.", file=sys.stderr)
         raise SystemExit(1) from e
-    print(f"WealthPipeline dashboard: {url}")
+    print(f"WealthPipeline legacy desk (/, /lead, /finder): {url}")
+    print(
+        "Advisor app with /login is separate — use serve_advisor.py or Start WealthPipeline Dashboard.bat (port 8765).",
+        file=sys.stderr,
+    )
     if _want_live_reload():
         print(
             "Live refresh: tab reloads when the database changes or the server restarts "

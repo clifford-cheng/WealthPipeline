@@ -21,6 +21,7 @@ from wealth_leads.db import (
     replace_officers,
     replace_person_management_narratives,
     update_filing_director_term_summary,
+    update_filing_issuer_industry,
     update_filing_issuer_meta,
     update_filing_issuer_summary,
     update_primary_doc_url,
@@ -28,6 +29,7 @@ from wealth_leads.db import (
 from wealth_leads.management import (
     extract_executive_officers_from_filing_html,
     extract_issuer_headquarters_from_filing_html,
+    extract_issuer_industry_from_filing_html,
     extract_issuer_summary_from_filing_html,
     extract_issuer_website_from_filing_html,
     merge_officer_rows,
@@ -140,6 +142,9 @@ def backfill_compensation(
                 update_filing_issuer_meta(
                     c, fid, website=web_b, headquarters=hq_b
                 )
+            ind_b = extract_issuer_industry_from_filing_html(s1_html)
+            if ind_b:
+                update_filing_issuer_industry(c, fid, ind_b)
             bios_b = extract_management_biographies_from_filing_html(s1_html)
             replace_person_management_narratives(c, fid, bios_b)
             dts_b = extract_director_term_summary_from_filing_html(s1_html)
@@ -239,6 +244,10 @@ def _process_rss_item(
         update_filing_issuer_meta(
             conn, filing_id, website=web, headquarters=hq
         )
+
+    ind = extract_issuer_industry_from_filing_html(body_html)
+    if ind:
+        update_filing_issuer_industry(conn, filing_id, ind)
 
     bios = extract_management_biographies_from_filing_html(body_html)
     replace_person_management_narratives(conn, filing_id, bios)
@@ -452,13 +461,13 @@ def main() -> None:
 
     srv = sub.add_parser(
         "serve",
-        help="Open dashboard at http://127.0.0.1:8765 (run sync first for data)",
+        help="Legacy lead desk at http://127.0.0.1:8766 (/, /lead, /finder; no /login — use serve_advisor for that)",
     )
     srv.add_argument(
         "--port",
         type=int,
         default=None,
-        help="Port (default 8765 or WEALTH_LEADS_PORT)",
+        help="Port (default 8766 or WEALTH_LEADS_PORT; advisor app uses 8765 by default)",
     )
     srv.add_argument(
         "--no-browser",
@@ -474,6 +483,38 @@ def main() -> None:
         "--reload",
         action="store_true",
         help="Dev: restart the server when wealth_leads Python files change (implies live refresh)",
+    )
+
+    app_cmd = sub.add_parser(
+        "serve-app",
+        help="Advisor app: sign-in, watchlist, CSV export (set WEALTH_LEADS_APP_SECRET)",
+    )
+    app_cmd.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind address (default 127.0.0.1; use 0.0.0.0 behind TLS reverse proxy)",
+    )
+    app_cmd.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Port (default WEALTH_LEADS_APP_PORT or 8080)",
+    )
+
+    alloc_cmd = sub.add_parser(
+        "allocate",
+        help="Run monthly territory lead assignment (writes lead_assignments; use after sync)",
+    )
+    alloc_cmd.add_argument(
+        "--cycle",
+        type=str,
+        default=None,
+        help="Billing cycle YYYYMM (default: current UTC month)",
+    )
+    alloc_cmd.add_argument(
+        "--no-replace",
+        action="store_true",
+        help="Do not delete existing assignments for the cycle before assigning",
     )
 
     args = p.parse_args()
@@ -499,6 +540,26 @@ def main() -> None:
             live=not bool(getattr(args, "no_live", False)),
             reload=bool(getattr(args, "reload", False)),
         )
+    elif args.cmd == "serve-app":
+        import uvicorn
+
+        from wealth_leads.config import app_listen_port
+
+        port = getattr(args, "port", None) or app_listen_port()
+        uvicorn.run(
+            "wealth_leads.web_app:app",
+            host=args.host,
+            port=port,
+            log_level="info",
+        )
+    elif args.cmd == "allocate":
+        from wealth_leads.allocation import run_allocation_from_db
+
+        stats = run_allocation_from_db(
+            cycle_yyyymm=getattr(args, "cycle", None),
+            replace=not bool(getattr(args, "no_replace", False)),
+        )
+        print(stats, file=sys.stderr)
 
 
 if __name__ == "__main__":

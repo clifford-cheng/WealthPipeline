@@ -94,3 +94,18 @@ def lead_desk_min_signal_usd() -> float:
 def lead_desk_equity_only_min_usd() -> bool:
     """True if legacy WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD is set (equity-only comparison)."""
     return "WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD" in os.environ
+
+
+def app_secret_key() -> str:
+    """Required for signed session cookies on serve-app (min 32 chars recommended)."""
+    return os.environ.get("WEALTH_LEADS_APP_SECRET", "").strip()
+
+
+def app_allow_public_signup() -> bool:
+    """After the first user exists, allow /register only if this is true (or zero users)."""
+    v = os.environ.get("WEALTH_LEADS_ALLOW_SIGNUP", "0").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def app_listen_port() -> int:
+    return int(os.environ.get("WEALTH_LEADS_APP_PORT", "8080"))

@@ -468,6 +468,59 @@ def extract_issuer_headquarters_from_filing_html(html: str) -> str:
     return ""
 
 
+_SIC_DESC_LINE = re.compile(
+    r"S\.?I\.?C\.?\s*(?:code)?\s*[:\.]?\s*(\d{3,4})\b\s*[-–—]?\s*([^\n\r<]{2,140})",
+    re.I,
+)
+_SIC_CODE = re.compile(
+    r"(?:Standard\s+Industrial\s+Classification|S\.?I\.?C\.?)\s*(?:\(?\s*SIC\s*\)?)?\s*"
+    r"(?:code|number)?\s*[:\.]?\s*(\d{3,4})\b",
+    re.I,
+)
+_NAICS_LINE = re.compile(
+    r"NAICS\s*(?:code)?\s*(?:is|:|\.|,)?\s*(\d{4,6})\b\s*(?:[-–—]?\s*([^\n\r<]{2,140}))?",
+    re.I,
+)
+
+
+def extract_issuer_industry_from_filing_html(html: str) -> str:
+    """
+    Best-effort SIC / NAICS line from filing body text (heuristic; many filers vary wording).
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    flat = re.sub(r"[\s\xa0]+", " ", soup.get_text(" ", strip=True))
+    if len(flat) < 24:
+        return ""
+
+    m = _NAICS_LINE.search(flat)
+    if m:
+        code = m.group(1)
+        desc = (m.group(2) or "").strip()
+        if desc:
+            desc = re.split(r"[.;]|\s{2,}", desc, maxsplit=1)[0].strip()
+        if desc.lower().startswith("code") or "sic code" in desc.lower():
+            desc = ""
+        line = f"NAICS {code}"
+        if desc and 3 < len(desc) < 100:
+            line += f" — {desc[:120]}"
+        return line[:300]
+
+    m2 = _SIC_DESC_LINE.search(flat)
+    if m2:
+        code, desc = m2.group(1), (m2.group(2) or "").strip()
+        if desc.lower().startswith("code"):
+            desc = ""
+        line = f"SIC {code}"
+        if desc and len(desc) > 3:
+            line += f" — {desc[:120]}"
+        return line[:300]
+
+    m3 = _SIC_CODE.search(flat)
+    if m3:
+        return f"SIC {m3.group(1)}"[:300]
+    return ""
+
+
 def why_surfaced_line(form_type: str, filing_date: Optional[str]) -> str:
     """Single-line, filing-based timing context (not investment advice)."""
     ft = (form_type or "Filing").strip()
