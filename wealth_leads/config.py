@@ -72,13 +72,25 @@ def lead_desk_s1_only() -> bool:
     return v not in ("0", "false", "no", "off")
 
 
-def lead_desk_min_equity_usd() -> float:
+def lead_desk_min_signal_usd() -> float:
     """
-    Minimum max yearly stock+option total (summary comp table) to appear on the lead desk.
-    Uses, per fiscal year, stock awards + option awards (or stored equity sum). Set to 0 to disable.
+    Minimum "best single fiscal year" pay signal for the desk: max(SCT total, stock+options)
+    for that person across FY rows (same DB rows as equity_hwm / per-year totals).
+    Set to 0 to disable the monetary gate (S-1-only may still apply).
+
+    Prefer WEALTH_LEADS_LEAD_DESK_MIN_SIGNAL_USD. If WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD is
+    set in the environment, it overrides (legacy: equity-only bar).
     """
-    raw = os.environ.get("WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD", "500000").strip()
+    if "WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD" in os.environ:
+        raw = os.environ["WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD"].strip()
+    else:
+        raw = os.environ.get("WEALTH_LEADS_LEAD_DESK_MIN_SIGNAL_USD", "300000").strip()
     try:
         return max(0.0, float(raw))
     except ValueError:
-        return 500_000.0
+        return 300_000.0
+
+
+def lead_desk_equity_only_min_usd() -> bool:
+    """True if legacy WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD is set (equity-only comparison)."""
+    return "WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD" in os.environ

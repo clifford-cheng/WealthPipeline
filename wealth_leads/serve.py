@@ -15,7 +15,8 @@ from wsgiref.simple_server import make_server
 
 from wealth_leads.config import (
     database_path,
-    lead_desk_min_equity_usd,
+    lead_desk_equity_only_min_usd,
+    lead_desk_min_signal_usd,
     lead_desk_s1_only,
 )
 from wealth_leads.db import connect
@@ -270,8 +271,16 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
         )
 
         equity_hwm = 0.0
+        total_hwm = 0.0
         for r in items:
             equity_hwm = max(equity_hwm, _row_equity_usd(r))
+            t = r.get("total")
+            if t is not None:
+                try:
+                    total_hwm = max(total_hwm, float(t))
+                except (TypeError, ValueError):
+                    pass
+        signal_hwm = max(total_hwm, equity_hwm)
         has_s1_comp = any(
             _is_s1_form_type(str(r.get("filing_form_type") or "")) for r in items
         )
@@ -301,6 +310,8 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
                 "sum_year_totals": sum_year_totals,
                 "year_breakdown": year_breakdown,
                 "equity_hwm": equity_hwm,
+                "total_hwm": total_hwm,
+                "signal_hwm": signal_hwm,
                 "has_s1_comp": has_s1_comp,
             }
         )
@@ -313,19 +324,29 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
 
 
 def _lead_desk_filter_profiles(profiles: list[dict]) -> list[dict]:
-    """Narrow desk to S-1-linked NEO rows and a minimum max-year equity bar (configurable)."""
+    """
+    Narrow desk to S-1-linked NEO rows and a minimum pay bar (configurable).
+    Default: best single FY max(SCT total, stock+options) >= threshold.
+    Legacy: if WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD is set, only stock+options are compared.
+    """
     s1_only = lead_desk_s1_only()
-    min_eq = lead_desk_min_equity_usd()
+    min_bar = lead_desk_min_signal_usd()
+    equity_only = lead_desk_equity_only_min_usd()
     out: list[dict] = []
     for p in profiles:
         if s1_only and not p.get("has_s1_comp"):
             continue
-        if min_eq > 0 and float(p.get("equity_hwm") or 0) < min_eq:
-            continue
+        if min_bar > 0:
+            if equity_only:
+                v = float(p.get("equity_hwm") or 0)
+            else:
+                v = float(p.get("signal_hwm") or 0)
+            if v < min_bar:
+                continue
         out.append(p)
     out.sort(
         key=lambda p: (
-            float(p.get("equity_hwm") or 0),
+            float(p.get("signal_hwm") or 0),
             p.get("filing_date") or "",
             p.get("headline_year") or 0,
             p.get("total") or 0,
@@ -422,14 +443,17 @@ def _desk_table(profiles: list[dict], stats: dict) -> str:
         hidden = n_all > 0
         extra = ""
         if hidden:
-            min_e = float(stats.get("lead_desk_min_equity_usd") or 0)
+            min_e = float(stats.get("lead_desk_min_signal_usd") or 0)
+            leg = bool(stats.get("lead_desk_equity_only_legacy"))
             s1 = bool(stats.get("lead_desk_s1_only"))
+            bar = "max-year stock+options only" if leg else "max(SCT total, stock+options) in a single FY"
             extra = (
                 f"<p class='meta'><b>{n_all}</b> NEO profile(s) are hidden by desk filters"
-                f" ({'S-1 only; ' if s1 else ''}min max-year stock+options <b>${min_e:,.0f}</b>). "
+                f" ({'S-1 only; ' if s1 else ''}{bar} <b>${min_e:,.0f}</b>). "
                 f"Open a saved <code>/lead?…</code> link to view anyone still in the DB. "
-                f"To show everyone: set <code>WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD=0</code>"
-                f" and/or <code>WEALTH_LEADS_LEAD_DESK_S1_ONLY=0</code>.</p>"
+                f"To widen: set <code>WEALTH_LEADS_LEAD_DESK_MIN_SIGNAL_USD=0</code> (or lower the number), "
+                f"and/or <code>WEALTH_LEADS_LEAD_DESK_S1_ONLY=0</code>. "
+                f"Legacy equity-only: <code>WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD</code>.</p>"
             )
         return f"""
   <h2>Lead desk</h2>
@@ -473,7 +497,9 @@ def _desk_table(profiles: list[dict], stats: dict) -> str:
             f"<td><span class='badge'>{badge}</span></td>"
             f"<td class='num strong'>{_money(p['total'])}</td>"
             f"<td class='num'>{sum_cell}</td>"
+            f"<td class='num'>{_money(p.get('total_hwm'))}</td>"
             f"<td class='num'>{_money(p.get('equity_hwm'))}</td>"
+            f"<td class='num strong'>{_money(p.get('signal_hwm'))}</td>"
             f"<td class='num dim'>{html.escape(str(p['headline_year'] or '—'))}</td>"
             f"<td>{html.escape(p['filing_date'] or '')}</td>"
             f"<td class='cik'>{html.escape(str(p['cik'] or ''))}</td>"
@@ -484,7 +510,7 @@ def _desk_table(profiles: list[dict], stats: dict) -> str:
     return f"""
   <h2>Lead desk</h2>
   <p class="meta">
-    <b>Person-first pre-IPO leads.</b> The desk defaults to <b>S-1 / S-1/A NEO rows only</b> and people whose <b>largest single-year stock+option</b> total (from the summary comp table) is at least <b>$500k</b> — so small-cash / ex-officer lines drop off. Role/title merges from the <b>Executive Officers</b> table and signatures when parsed. Gray lines: <b>why surfaced</b> + filing <b>issuer blurb</b>. Tune via <code>WEALTH_LEADS_LEAD_DESK_S1_ONLY</code> and <code>WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD</code>.
+    <b>Person-first pre-IPO leads.</b> The desk defaults to <b>S-1 / S-1/A NEO rows only</b> and people whose <b>best single fiscal year</b> hits at least <b>~$300k</b> on <b>max(SCT total, stock+options)</b> — so high cash <i>or</i> high grants count (not equity-only). Many RSS filings have <b>no parseable summary comp table</b> in your DB yet, so the desk can look sparse until parsing improves. Tune <code>WEALTH_LEADS_LEAD_DESK_MIN_SIGNAL_USD</code> (0 = all S-1 NEO profiles) and <code>WEALTH_LEADS_LEAD_DESK_S1_ONLY</code>. Legacy: <code>WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD</code> = equity-only bar.
     <b>Click the row</b> for detail. Raw rows: <b>Source rows</b> below.
   </p>
   <div class="table-wrap">
@@ -493,7 +519,9 @@ def _desk_table(profiles: list[dict], stats: dict) -> str:
       <tr>
         <th>Person</th><th>Role</th><th>Company</th><th>Signal</th>
         <th>Latest total</th><th title='Sum of SCT Total per FY in DB'>Σ SCT</th>
-        <th title='Max single-FY stock + options (SCT)'>Max equity</th>
+        <th title='Largest single-FY SCT Total'>Max FY total</th>
+        <th title='Max single-FY stock + options'>Max equity</th>
+        <th title='max(Max FY total, Max equity) — desk gate'>Signal</th>
         <th>FY</th><th>Filing</th><th>CIK</th><th>Quick source</th>
       </tr>
     </thead>
@@ -694,7 +722,8 @@ def _shared_css() -> str:
     table.inner-comp tbody tr:hover td { background: #0f141a; }
     .hero { display: grid; gap: 0.75rem; margin-bottom: 1rem; }
     @media (min-width: 640px) { .hero { grid-template-columns: 1fr 1fr; } }
-    @media (min-width: 960px) { .hero { grid-template-columns: repeat(4, 1fr); } }
+    @media (min-width: 900px) { .hero { grid-template-columns: repeat(3, 1fr); } }
+    @media (min-width: 1200px) { .hero { grid-template-columns: repeat(6, 1fr); } }
     .stat-card {
       background: #121820; border: 1px solid #2a3340; border-radius: 6px; padding: 0.65rem 0.75rem;
     }
@@ -913,7 +942,9 @@ def _page_lead(
   <div class="hero">
     <div class="stat-card"><div class="lbl">Latest FY total</div><div class="val">{_money(p.get('total'))}</div></div>
     <div class="stat-card"><div class="lbl">Σ SCT (years in DB)</div><div class="val">{sum_disp}</div></div>
+    <div class="stat-card"><div class="lbl">Max FY total (any year)</div><div class="val">{_money(p.get('total_hwm'))}</div></div>
     <div class="stat-card"><div class="lbl">Max equity (any FY)</div><div class="val">{_money(p.get('equity_hwm'))}</div></div>
+    <div class="stat-card"><div class="lbl">Desk signal</div><div class="val">{_money(p.get('signal_hwm'))}</div></div>
     <div class="stat-card"><div class="lbl">Fiscal years w/ comp</div><div class="val">{int(p.get('years_count') or 0)}</div></div>
   </div>
   <h2>Headline compensation (latest fiscal year)</h2>
@@ -1018,7 +1049,8 @@ def _load_page_data() -> tuple[list[dict], list[dict], list[sqlite3.Row], list[s
         "profile_count": len(profiles),
         "profile_count_all": len(profiles_all),
         "lead_desk_s1_only": lead_desk_s1_only(),
-        "lead_desk_min_equity_usd": lead_desk_min_equity_usd(),
+        "lead_desk_min_signal_usd": lead_desk_min_signal_usd(),
+        "lead_desk_equity_only_legacy": lead_desk_equity_only_min_usd(),
         "latest_filing_date": latest,
         "db_file_modified": mtime,
     }
