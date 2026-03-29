@@ -141,7 +141,8 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
                f.index_url, f.primary_doc_url, f.form_type AS filing_form_type,
                f.issuer_summary AS filing_issuer_summary,
                f.issuer_website AS filing_issuer_website,
-               f.issuer_headquarters AS filing_issuer_headquarters
+               f.issuer_headquarters AS filing_issuer_headquarters,
+               f.director_term_summary AS filing_director_term_summary
         FROM neo_compensation c
         JOIN filings f ON f.id = c.filing_id
         """
@@ -149,6 +150,23 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
     raw = [dict(r) for r in cur.fetchall()]
     if not raw:
         return []
+
+    narr_map: dict[tuple[int, str], dict] = {}
+    fids_neo = {int(r["filing_id"]) for r in raw}
+    if fids_neo and conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='person_management_narrative'"
+    ).fetchone():
+        qm = ",".join("?" * len(fids_neo))
+        ncur = conn.execute(
+            f"""
+            SELECT filing_id, person_name_norm, person_name, role_heading, bio_text
+            FROM person_management_narrative
+            WHERE filing_id IN ({qm})
+            """,
+            tuple(fids_neo),
+        )
+        for nr in ncur.fetchall():
+            narr_map[(int(nr["filing_id"]), nr["person_name_norm"] or "")] = dict(nr)
 
     groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for row in raw:
@@ -300,6 +318,43 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
             ).fetchone()
             issuer_hq = (rhq[0] or "").strip() if rhq else ""
 
+        mgmt_nar = narr_map.get((int(head["filing_id"]), pn))
+        if not mgmt_nar and cik_s:
+            altn = conn.execute(
+                """
+                SELECT m.person_name, m.role_heading, m.bio_text
+                FROM person_management_narrative m
+                JOIN filings f ON f.id = m.filing_id
+                WHERE f.cik = ? AND m.person_name_norm = ?
+                ORDER BY COALESCE(f.filing_date, '') DESC, f.id DESC
+                LIMIT 1
+                """,
+                (cik_s, pn),
+            ).fetchone()
+            mgmt_nar = (
+                {
+                    "person_name": altn["person_name"],
+                    "role_heading": altn["role_heading"],
+                    "bio_text": altn["bio_text"],
+                }
+                if altn
+                else None
+            )
+
+        dts = (head.get("filing_director_term_summary") or "").strip()
+        if not dts and cik_s:
+            rd = conn.execute(
+                """
+                SELECT director_term_summary FROM filings
+                WHERE cik = ? AND director_term_summary IS NOT NULL
+                  AND TRIM(director_term_summary) != ''
+                ORDER BY COALESCE(filing_date, '') DESC, id DESC
+                LIMIT 1
+                """,
+                (cik_s,),
+            ).fetchone()
+            dts = (rd[0] or "").strip() if rd else ""
+
         why = why_surfaced_line(
             str(head.get("filing_form_type") or ""),
             head.get("filing_date"),
@@ -351,6 +406,10 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
                 "officer_age": officer_age,
                 "issuer_website": issuer_web,
                 "issuer_headquarters": issuer_hq,
+                "mgmt_bio_role": (mgmt_nar or {}).get("role_heading") or "",
+                "mgmt_bio_text": (mgmt_nar or {}).get("bio_text") or "",
+                "mgmt_bio_display_name": (mgmt_nar or {}).get("person_name") or "",
+                "director_term_summary": dts,
             }
         )
 
@@ -934,12 +993,39 @@ def _page_lead(
       </tr></tbody>
     </table></div>"""
 
-    bio_block = f"""
+    dts_body = (p.get("director_term_summary") or "").strip()
+    director_card = f"""
+    <div class="card">
+      <h2 style="margin-top:0">Director and board terms</h2>
+      <p class="meta" style="margin-bottom:0">{html.escape(dts_body) if dts_body else "<span class='dim'>Not extracted yet — run <code>backfill-comp --force</code> after updating the parser.</span>"}</p>
+    </div>"""
+
+    mb = (p.get("mgmt_bio_text") or "").strip()
+    mb_role = (p.get("mgmt_bio_role") or "").strip()
+    mb_name = (p.get("mgmt_bio_display_name") or "").strip()
+    disp = (p.get("display_name") or "").strip()
+    if mb:
+        paras = [html.escape(x.strip()) for x in mb.split("\n\n") if x.strip()]
+        paras_html = "".join(
+            f"<p class='meta' style='margin-top:0.35rem; margin-bottom:0'>{x}</p>"
+            for x in paras
+        )
+        heading_line = mb_name or disp
+        role_suffix = f" — {html.escape(mb_role)}" if mb_role else ""
+        mgmt_narrative_card = f"""
+    <div class="card">
+      <h2 style="margin-top:0">Management biography (from filing)</h2>
+      <p class="meta" style="margin-bottom:0"><strong>{html.escape(heading_line)}</strong>{role_suffix}</p>
+      {paras_html}
+    </div>"""
+    else:
+        mgmt_narrative_card = f"""
     <div class="card bio-placeholder">
-      <h2 style="margin-top:0">Management biography</h2>
+      <h2 style="margin-top:0">Management biography (from filing)</h2>
       <p class="meta" style="margin-bottom:0">
-        <strong>Narrative bios — coming next.</strong> Role/title above is merged from the filing’s <b>Executive Officers and Directors</b>-style tables and signature pages when we can parse them.
-        For full prose bios, {doc_link or "open the issuer’s filing from EDGAR"} and search <b>Management</b> or the person’s name for prior roles, education, and board seats.
+        <span class='dim'>No narrative block stored for this executive yet.</span>
+        Re-sync or run <code>backfill-comp --force</code> to re-parse the <b>Executive Officers and Directors</b> prose (name, role, age context, prior positions in narrative form).
+        {(' ' + doc_link) if doc_link else ''}
       </p>
     </div>"""
 
@@ -1029,6 +1115,7 @@ def _page_lead(
   </p>
   {person_card}
   {company_card}
+  {director_card}
   <div class="card">
     <h2 style="margin-top:0">Why this lead</h2>
     <p class="meta" style="margin-bottom:0">{html.escape(p.get('why_surfaced') or '—')}</p>
@@ -1043,7 +1130,7 @@ def _page_lead(
   {headline_tbl}
   <h2>Year-by-year (summary comp table)</h2>
   {_profile_breakdown_table(p)}
-  {bio_block}
+  {mgmt_narrative_card}
   <h2>Issuer filings (S-1 / 10-K)</h2>
   <p class="meta">Same <b>CIK</b> as this lead — registration statements and annual reports we have in your DB (newest first, up to 50). Run <code>sync</code> to pull 10-Ks after S-1s (<code>SEC_FOLLOW_10K=1</code>, default).</p>
   {_filings_table_html(filings)}

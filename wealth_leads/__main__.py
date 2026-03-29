@@ -19,6 +19,8 @@ from wealth_leads.db import (
     insert_filing,
     replace_neo_compensation,
     replace_officers,
+    replace_person_management_narratives,
+    update_filing_director_term_summary,
     update_filing_issuer_meta,
     update_filing_issuer_summary,
     update_primary_doc_url,
@@ -29,6 +31,10 @@ from wealth_leads.management import (
     extract_issuer_summary_from_filing_html,
     extract_issuer_website_from_filing_html,
     merge_officer_rows,
+)
+from wealth_leads.management_bios import (
+    extract_director_term_summary_from_filing_html,
+    extract_management_biographies_from_filing_html,
 )
 from wealth_leads.officers import extract_officers_from_s1_html
 from wealth_leads.parse_index import (
@@ -135,6 +141,10 @@ def backfill_compensation(
                 update_filing_issuer_meta(
                     c, fid, website=web_b, headquarters=hq_b
                 )
+            bios_b = extract_management_biographies_from_filing_html(s1_html)
+            replace_person_management_narratives(c, fid, bios_b)
+            dts_b = extract_director_term_summary_from_filing_html(s1_html)
+            update_filing_director_term_summary(c, fid, dts_b)
             comps = extract_neo_compensation_from_s1(s1_html)
             replace_neo_compensation(c, fid, _neo_comp_db_rows(fid, comps))
             n_done += 1
@@ -230,6 +240,11 @@ def _process_rss_item(
         update_filing_issuer_meta(
             conn, filing_id, website=web, headquarters=hq
         )
+
+    bios = extract_management_biographies_from_filing_html(body_html)
+    replace_person_management_narratives(conn, filing_id, bios)
+    dts = extract_director_term_summary_from_filing_html(body_html)
+    update_filing_director_term_summary(conn, filing_id, dts)
 
     comps = extract_neo_compensation_from_s1(body_html)
     replace_neo_compensation(conn, filing_id, _neo_comp_db_rows(filing_id, comps))

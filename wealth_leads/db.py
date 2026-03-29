@@ -57,6 +57,20 @@ CREATE TABLE IF NOT EXISTS neo_compensation (
 );
 
 CREATE INDEX IF NOT EXISTS idx_neo_comp_filing ON neo_compensation(filing_id);
+
+CREATE TABLE IF NOT EXISTS person_management_narrative (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    filing_id INTEGER NOT NULL,
+    person_name TEXT NOT NULL,
+    person_name_norm TEXT NOT NULL,
+    role_heading TEXT,
+    bio_text TEXT NOT NULL,
+    FOREIGN KEY (filing_id) REFERENCES filings(id),
+    UNIQUE(filing_id, person_name_norm)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mgmt_narr_filing ON person_management_narrative(filing_id);
+CREATE INDEX IF NOT EXISTS idx_mgmt_narr_norm ON person_management_narrative(person_name_norm);
 """
 
 
@@ -89,6 +103,12 @@ def _migrate_officers_age(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE officers ADD COLUMN age INTEGER")
 
 
+def _migrate_filings_director_term(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(filings)").fetchall()}
+    if "director_term_summary" not in cols:
+        conn.execute("ALTER TABLE filings ADD COLUMN director_term_summary TEXT")
+
+
 @contextmanager
 def connect(path: Optional[str] = None) -> Generator[sqlite3.Connection, None, None]:
     dbp = path or database_path()
@@ -101,6 +121,7 @@ def connect(path: Optional[str] = None) -> Generator[sqlite3.Connection, None, N
         _migrate_filings_issuer_summary(conn)
         _migrate_filings_issuer_meta(conn)
         _migrate_officers_age(conn)
+        _migrate_filings_director_term(conn)
         yield conn
         conn.commit()
     finally:
@@ -185,6 +206,44 @@ def update_filing_issuer_meta(
         WHERE id = ?
         """,
         (website or "", headquarters or "", filing_id),
+    )
+
+
+def replace_person_management_narratives(
+    conn: sqlite3.Connection, filing_id: int, rows: list[dict]
+) -> None:
+    conn.execute(
+        "DELETE FROM person_management_narrative WHERE filing_id = ?", (filing_id,)
+    )
+    if not rows:
+        return
+    conn.executemany(
+        """
+        INSERT INTO person_management_narrative (
+            filing_id, person_name, person_name_norm, role_heading, bio_text
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                filing_id,
+                r["person_name"],
+                r["person_name_norm"],
+                r.get("role_heading") or "",
+                r["bio_text"],
+            )
+            for r in rows
+        ],
+    )
+
+
+def update_filing_director_term_summary(
+    conn: sqlite3.Connection, filing_id: int, text: str
+) -> None:
+    if not (text or "").strip():
+        return
+    conn.execute(
+        "UPDATE filings SET director_term_summary = ? WHERE id = ?",
+        (text.strip(), filing_id),
     )
 
 
