@@ -51,7 +51,7 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
                c.salary, c.bonus, c.stock_awards, c.option_awards, c.other_comp,
                c.total, c.equity_comp_disclosed,
                f.id AS filing_id, f.company_name, f.cik, f.filing_date,
-               f.index_url, f.primary_doc_url
+               f.index_url, f.primary_doc_url, f.form_type AS filing_form_type
         FROM neo_compensation c
         JOIN filings f ON f.id = c.filing_id
         """
@@ -167,6 +167,7 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
                 "filing_date": head["filing_date"] or "",
                 "index_url": head["index_url"] or "",
                 "primary_doc_url": head["primary_doc_url"] or "",
+                "filing_form_type": head.get("filing_form_type") or "",
                 "years_count": len(by_year),
                 "comp_timeline": timeline,
                 "sum_year_totals": sum_year_totals,
@@ -280,14 +281,22 @@ def _desk_table(profiles: list[dict]) -> str:
         idx = html.escape(p["index_url"] or "")
         doc = html.escape(p["primary_doc_url"] or "")
         idx_l = f'<a href="{idx}" target="_blank" rel="noopener" onclick="event.stopPropagation()">EDGAR</a>' if idx else "—"
-        doc_l = f'<a href="{doc}" target="_blank" rel="noopener" onclick="event.stopPropagation()">S-1</a>' if doc else "—"
+        doc_l = f'<a href="{doc}" target="_blank" rel="noopener" onclick="event.stopPropagation()">Doc</a>' if doc else "—"
+        ft_raw = (p.get("filing_form_type") or "EDGAR").strip()
+        ft_u = ft_raw.upper()
+        if "10-K" in ft_u:
+            badge = "10-K · NEO"
+        elif "S-1" in ft_u:
+            badge = "S-1 · NEO"
+        else:
+            badge = f"{html.escape(ft_raw[:14])} · NEO" if ft_raw else "EDGAR · NEO"
         rows.append(
             "<tr class='desk-row' tabindex='0' role='link' "
             f"data-href='{href}' title='Open profile'>"
             f"<td class='profile-name'><a href='{href}'>{nm}</a></td>"
             f"<td>{title}</td>"
             f"<td>{company}</td>"
-            f"<td><span class='badge'>S-1 · NEO</span></td>"
+            f"<td><span class='badge'>{badge}</span></td>"
             f"<td class='num strong'>{_money(p['total'])}</td>"
             f"<td class='num'>{sum_cell}</td>"
             f"<td class='num dim'>{html.escape(str(p['headline_year'] or '—'))}</td>"
@@ -539,7 +548,7 @@ def _page_desk(
 <body class="wide">
   <h1>WealthPipeline <span class="tag">lead desk · local</span></h1>
   <p class="meta">
-    SEC filing–native lead timing. Data updates when you run <code>sync</code>.
+    SEC filing–native lead timing (S-1 + 10-K from RSS by default). Data updates when you run <code>sync</code>.
     Database: <code>{html.escape(str(Path(database_path()).resolve()))}</code>
   </p>
   {banner}
@@ -649,7 +658,11 @@ def _page_lead(
     sum_disp = _money(sum_sct) if sum_sct is not None else "—"
     doc_u = p.get("primary_doc_url") or ""
     doc_e = html.escape(doc_u)
-    doc_link = f'<a href="{doc_e}" target="_blank" rel="noopener">Open primary S-1 doc</a>' if doc_u else ""
+    doc_link = (
+        f'<a href="{doc_e}" target="_blank" rel="noopener">Open primary filing doc</a>'
+        if doc_u
+        else ""
+    )
 
     headline_tbl = f"""
     <div class="table-wrap"><table class="comp-head">
@@ -672,7 +685,7 @@ def _page_lead(
       <h2 style="margin-top:0">Management biography</h2>
       <p class="meta" style="margin-bottom:0">
         <strong>Coming next.</strong> We have not extracted the narrative bio from the registration statement yet.
-        For now, {doc_link or "open the issuer’s S-1 from EDGAR"} and search for <b>Management</b>,
+        For now, {doc_link or "open the issuer’s filing from EDGAR"} and search for <b>Management</b>,
         <b>Directors and Executive Officers</b>, or the person’s name. That section usually lists prior roles, education, and board seats — ideal for professional rapport cues.
       </p>
     </div>"""

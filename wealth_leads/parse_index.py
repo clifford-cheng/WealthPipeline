@@ -51,3 +51,57 @@ def primary_s1_document_url(index_html: str) -> Optional[str]:
                 continue
             return canonical_filing_document_url(link["href"])
     return None
+
+
+# Normalized Type column values in EDGAR index tables for annual reports.
+_10K_TYPES = frozenset(
+    {
+        "10-K",
+        "10-K/A",
+        "FORM10-K",
+        "FORM10-K/A",
+    }
+)
+
+
+def primary_10k_document_url(index_html: str) -> Optional[str]:
+    """
+    From an EDGAR filing index.htm, return the main 10-K / 10-K/A document URL
+    (first matching row in the Document Format Files table).
+    """
+    soup = BeautifulSoup(index_html, "html.parser")
+    for table in soup.find_all("table", class_="tableFile"):
+        header_cells = table.find_all("th")
+        headers = [h.get_text(strip=True).lower() for h in header_cells]
+        if not headers or "type" not in " ".join(headers):
+            continue
+        rows = table.find_all("tr")
+        for tr in rows[1:]:
+            cells = tr.find_all("td")
+            if len(cells) < 4:
+                continue
+            type_cell = cells[3].get_text(strip=True).upper().replace(" ", "")
+            if type_cell not in _10K_TYPES:
+                continue
+            link = cells[2].find("a", href=True)
+            if not link:
+                continue
+            return canonical_filing_document_url(link["href"])
+    return None
+
+
+def primary_document_url_for_form(index_html: str, form_type: str) -> Optional[str]:
+    """Resolve primary HTML doc from index based on filing form (S-1 vs 10-K family)."""
+    ft = (form_type or "").upper().replace(" ", "")
+    if "10-K" in ft:
+        u = primary_10k_document_url(index_html)
+        if u:
+            return u
+    if "S-1" in ft:
+        u = primary_s1_document_url(index_html)
+        if u:
+            return u
+    u = primary_10k_document_url(index_html)
+    if u:
+        return u
+    return primary_s1_document_url(index_html)

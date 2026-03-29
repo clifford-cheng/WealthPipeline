@@ -6,7 +6,7 @@ import sys
 
 import requests
 
-from wealth_leads.config import database_path
+from wealth_leads.config import database_path, sync_form_types
 from wealth_leads.compensation import NeoCompRow, extract_neo_compensation_from_s1
 from wealth_leads.db import (
     connect,
@@ -17,8 +17,11 @@ from wealth_leads.db import (
     update_primary_doc_url,
 )
 from wealth_leads.officers import extract_officers_from_s1_html
-from wealth_leads.parse_index import canonical_filing_document_url, primary_s1_document_url
-from wealth_leads.rss import fetch_current_s1_feed
+from wealth_leads.parse_index import (
+    canonical_filing_document_url,
+    primary_document_url_for_form,
+)
+from wealth_leads.rss import RssFiling, fetch_current_feed
 from wealth_leads.sec_client import get_text
 
 
@@ -121,82 +124,108 @@ def backfill_compensation(
     return n_done
 
 
+def _process_rss_item(
+    conn,
+    item: RssFiling,
+    session,
+    *,
+    force_reprocess: bool,
+) -> None:
+    existing = get_filing_by_accession(conn, item.accession)
+    if (
+        existing
+        and existing["officers_extracted"]
+        and existing["compensation_extracted"]
+        and not force_reprocess
+    ):
+        return
+
+    filing_id = insert_filing(
+        conn,
+        accession=item.accession,
+        cik=item.cik,
+        company_name=item.company_name,
+        form_type=item.form_type,
+        filing_date=item.filing_date,
+        index_url=item.index_url,
+        primary_doc_url=existing["primary_doc_url"]
+        if existing and existing["primary_doc_url"]
+        else None,
+    )
+
+    row = get_filing_by_accession(conn, item.accession)
+    assert row is not None
+    doc_url = row["primary_doc_url"]
+    if doc_url:
+        doc_url = canonical_filing_document_url(doc_url)
+        if doc_url != row["primary_doc_url"]:
+            update_primary_doc_url(conn, filing_id, doc_url)
+    if not doc_url:
+        idx_html = get_text(item.index_url, session=session)
+        doc_url = primary_document_url_for_form(idx_html, item.form_type)
+        if doc_url:
+            update_primary_doc_url(conn, filing_id, doc_url)
+        else:
+            print(
+                f"[warn] No primary doc in index ({item.form_type}): {item.company_name} "
+                f"({item.accession})",
+                file=sys.stderr,
+            )
+            return
+
+    try:
+        body_html = get_text(doc_url, session=session)
+    except Exception as e:
+        print(
+            f"[warn] Could not fetch filing body {doc_url}: {e}",
+            file=sys.stderr,
+        )
+        return
+
+    officers = extract_officers_from_s1_html(body_html)
+    if not officers:
+        print(
+            f"[warn] No officers parsed: {item.company_name} ({item.accession})",
+            file=sys.stderr,
+        )
+    replace_officers(conn, filing_id, officers)
+
+    comps = extract_neo_compensation_from_s1(body_html)
+    replace_neo_compensation(conn, filing_id, _neo_comp_db_rows(filing_id, comps))
+    if not comps:
+        print(
+            f"[warn] No NEO summary comp table: {item.company_name} "
+            f"({item.accession})",
+            file=sys.stderr,
+        )
+
+
 def sync(*, force_reprocess: bool = False) -> None:
     session = requests.Session()
-    feed = fetch_current_s1_feed(session)
+    forms = sync_form_types()
+    feed: list = []
+    for ft in forms:
+        batch = fetch_current_feed(session, form_type=ft)
+        feed.extend(batch)
+        print(f"RSS {ft}: {len(batch)} entr(y/ies)", file=sys.stderr)
+
+    seen_acc: set[str] = set()
+    deduped: list = []
+    for it in feed:
+        if it.accession in seen_acc:
+            continue
+        seen_acc.add(it.accession)
+        deduped.append(it)
+    feed = deduped
+
     with connect() as conn:
         for item in feed:
-            existing = get_filing_by_accession(conn, item.accession)
-            if (
-                existing
-                and existing["officers_extracted"]
-                and existing["compensation_extracted"]
-                and not force_reprocess
-            ):
-                continue
-
-            filing_id = insert_filing(
-                conn,
-                accession=item.accession,
-                cik=item.cik,
-                company_name=item.company_name,
-                form_type=item.form_type,
-                filing_date=item.filing_date,
-                index_url=item.index_url,
-                primary_doc_url=existing["primary_doc_url"]
-                if existing and existing["primary_doc_url"]
-                else None,
-            )
-
-            row = get_filing_by_accession(conn, item.accession)
-            assert row is not None
-            doc_url = row["primary_doc_url"]
-            if doc_url:
-                doc_url = canonical_filing_document_url(doc_url)
-                if doc_url != row["primary_doc_url"]:
-                    update_primary_doc_url(conn, filing_id, doc_url)
-            if not doc_url:
-                idx_html = get_text(item.index_url, session=session)
-                doc_url = primary_s1_document_url(idx_html)
-                if doc_url:
-                    update_primary_doc_url(conn, filing_id, doc_url)
-                else:
-                    print(
-                        f"[warn] No primary S-1 doc in index: {item.company_name} "
-                        f"({item.accession})",
-                        file=sys.stderr,
-                    )
-                    continue
-
-            try:
-                s1_html = get_text(doc_url, session=session)
-            except Exception as e:
-                print(
-                    f"[warn] Could not fetch S-1 body {doc_url}: {e}",
-                    file=sys.stderr,
-                )
-                continue
-
-            officers = extract_officers_from_s1_html(s1_html)
-            if not officers:
-                print(
-                    f"[warn] No officers parsed: {item.company_name} ({item.accession})",
-                    file=sys.stderr,
-                )
-            replace_officers(conn, filing_id, officers)
-
-            comps = extract_neo_compensation_from_s1(s1_html)
-            replace_neo_compensation(
-                conn, filing_id, _neo_comp_db_rows(filing_id, comps)
-            )
-            if not comps:
-                print(
-                    f"[warn] No NEO summary comp table: {item.company_name} "
-                    f"({item.accession})",
-                    file=sys.stderr,
-                )
+            _process_rss_item(conn, item, session, force_reprocess=force_reprocess)
         backfill_compensation(conn=conn, session=session, force=False)
-        print(f"Processed {len(feed)} RSS entries (see {database_path()}).")
+        print(
+            f"Processed {len(feed)} RSS entr(y/ies) across {len(forms)} form type(s) "
+            f"(see {database_path()})."
+        )
 
 
 def export_leads_csv() -> None:
@@ -301,10 +330,15 @@ def export_compensation_csv() -> None:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="SEC S-1 lead pipeline (MVP)")
+    p = argparse.ArgumentParser(
+        description="SEC filing lead pipeline (S-1 + 10-K RSS by default; see SEC_SYNC_FORMS)"
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("sync", help="Pull EDGAR RSS, store filings + officers")
+    s = sub.add_parser(
+        "sync",
+        help="Pull EDGAR 'current' RSS (forms from SEC_SYNC_FORMS), store filings + officers + NEO comp",
+    )
     s.add_argument(
         "--force-officers",
         action="store_true",

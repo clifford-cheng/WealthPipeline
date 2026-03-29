@@ -6,7 +6,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Optional
 
-from wealth_leads.config import RSS_URL, rss_count
+from wealth_leads.config import RSS_URL, rss_count, rss_url_for_form
 from wealth_leads.sec_client import get_text
 
 ATOM = "{http://www.w3.org/2005/Atom}"
@@ -23,7 +23,7 @@ class RssFiling:
 
 
 _TITLE_RE = re.compile(
-    r"^(?P<form>S-1/A|S-1)\s+-\s+(?P<company>.+?)\s+\((?P<cik>\d+)\)\s+\(Filer\)\s*$"
+    r"^(?P<form>S-1/A|S-1|10-K/A|10-K)\s+-\s+(?P<company>.+?)\s+\((?P<cik>\d+)\)\s+\(Filer\)\s*$"
 )
 
 
@@ -89,6 +89,12 @@ def parse_atom_feed(xml_text: str) -> list[RssFiling]:
     return out
 
 
-def fetch_current_s1_feed(session=None) -> list[RssFiling]:
-    xml_text = get_text(RSS_URL.format(count=rss_count()), session=session)
+def fetch_current_feed(session=None, *, form_type: str = "S-1") -> list[RssFiling]:
+    """Fetch EDGAR 'current' Atom feed for one form type (S-1, 10-K, …)."""
+    url = rss_url_for_form(form_type).format(count=rss_count())
+    xml_text = get_text(url, session=session)
     return parse_atom_feed(xml_text)
+
+
+def fetch_current_s1_feed(session=None) -> list[RssFiling]:
+    return fetch_current_feed(session, form_type="S-1")

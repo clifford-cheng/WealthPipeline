@@ -48,7 +48,8 @@ def _clean_title(raw: str) -> Optional[str]:
 def extract_officers_from_s1_html(html: str) -> list[tuple[str, str, str]]:
     """
     Best-effort extraction of signers from the standard SEC signature table
-    (Signature / Title / Date). Returns (name, title, source).
+    (Signature / Title / Date). Works for S-1 registration statements and
+    many 10-K / Exchange Act certification pages. Returns (name, title, source).
     """
     soup = BeautifulSoup(html, "html.parser")
     found: list[tuple[str, str, str]] = []
@@ -62,7 +63,14 @@ def extract_officers_from_s1_html(html: str) -> list[tuple[str, str, str]]:
             continue
         table_text = table.get_text()
         tl = table_text.lower()
-        if "securities act" not in tl and "registration statement" not in tl and "/s/" not in table_text:
+        filing_context = (
+            "securities act" in tl
+            or "registration statement" in tl
+            or "exchange act" in tl
+            or "annual report" in tl
+            or "/s/" in table_text
+        )
+        if not filing_context:
             continue
 
         for tr in rows[1:]:
