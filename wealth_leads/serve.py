@@ -57,7 +57,7 @@ def _leads_table(rows: list[sqlite3.Row]) -> str:
   <table>
     <thead>
       <tr>
-        <th>Company</th><th>CIK</th><th>Filed</th><th>Name</th><th>Title</th><th>EDGAR</th><th>Doc</th>
+        <th>Company</th><th title="Central Index Key — SEC's company ID number, not dollars">CIK</th><th>Filed</th><th>Name</th><th>Title</th><th>EDGAR</th><th>Doc</th>
       </tr>
     </thead>
     <tbody>{inner}</tbody>
@@ -107,6 +107,22 @@ def _comp_table(rows: list[sqlite3.Row]) -> str:
   </table>"""
 
 
+def _comp_missing_callout(stats: dict) -> str:
+    if stats.get("missing_db"):
+        return ""
+    if stats.get("comp_rows", 0) > 0:
+        return ""
+    if stats.get("filings", 0) == 0:
+        return ""
+    return """<div class="callout">
+    <strong>No compensation rows in your database yet.</strong>
+    Pay data is <em>not</em> the CIK column (that is only SEC’s company ID).
+    Salary / stock / bonus appear in the second table — <b>NEO summary compensation</b> — after you backfill:
+    <code>python -m wealth_leads sync --force</code>
+    (or run <code>Sync SEC data then open dashboard.bat</code>), then refresh this page. Many small S-1s also have no parseable summary table.
+  </div>"""
+
+
 def _stats_banner(stats: dict) -> str:
     if stats.get("missing_db"):
         return """<div class="banner warn"><strong>No database file yet.</strong> Run sync once, then refresh this page.</div>"""
@@ -141,6 +157,8 @@ def _page(leads: list[sqlite3.Row], comp: list[sqlite3.Row], stats: dict) -> str
     .banner .stats span::before {{ content: "· "; color: #38444d; }}
     .banner .stats span:first-child::before {{ content: ""; }}
     .banner .sub {{ display: block; font-size: 0.8rem; color: #8b98a5; margin-top: 0.35rem; }}
+    .callout {{ background: #2a2518; border: 1px solid #6b5a2a; border-radius: 8px; padding: 0.85rem 1rem; margin: 0 0 1rem 0; font-size: 0.875rem; line-height: 1.45; }}
+    .callout strong {{ color: #f0d060; }}
     label.sr {{ display: block; font-size: 0.8rem; color: #8b98a5; margin-bottom: 0.35rem; }}
     #filter {{
       width: 100%; max-width: 28rem; padding: 0.45rem 0.6rem; border-radius: 6px;
@@ -164,6 +182,7 @@ def _page(leads: list[sqlite3.Row], comp: list[sqlite3.Row], stats: dict) -> str
     <b>F5</b> here to reload. GitHub only holds code; your leads live in the DB file below.
   </p>
   {banner}
+  {_comp_missing_callout(stats)}
   <label class="sr" for="filter">Filter both tables</label>
   <input type="search" id="filter" placeholder="Type company or person name…" autocomplete="off"/>
   <p class="meta">Database: <code>{html.escape(database_path())}</code></p>
