@@ -99,6 +99,8 @@ def connect(path: Optional[str] = None) -> Generator[sqlite3.Connection, None, N
         conn.executescript(SCHEMA)
         _migrate_filings_compensation_column(conn)
         _migrate_filings_issuer_summary(conn)
+        _migrate_filings_issuer_meta(conn)
+        _migrate_officers_age(conn)
         yield conn
         conn.commit()
     finally:
