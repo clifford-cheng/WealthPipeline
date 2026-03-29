@@ -15,11 +15,77 @@ from wsgiref.simple_server import make_server
 
 from wealth_leads.config import database_path
 from wealth_leads.db import connect
+from wealth_leads.management import why_surfaced_line
 
 
 def _norm_person_name(name: str) -> str:
     s = (name or "").lower().replace(".", " ")
     return " ".join(s.split())
+
+
+_NAME_SUFFIXES = frozenset({"jr", "sr", "ii", "iii", "iv", "v"})
+
+
+def _first_last_name_parts(norm: str) -> tuple[str, str]:
+    """First + last tokens for loose matching (handles middle initials vs roster without them)."""
+    parts = [p for p in (norm or "").split() if p]
+    while len(parts) >= 2 and parts[-1].rstrip(".").lower() in _NAME_SUFFIXES:
+        parts = parts[:-1]
+    if not parts:
+        return ("", "")
+    if len(parts) == 1:
+        return (parts[0], parts[0])
+    return (parts[0], parts[-1])
+
+
+def _officer_name_match_tier(person_norm: str, officer_norm: str) -> int:
+    """0 = exact normalized match, 1 = same first+last, -1 = no match."""
+    if not person_norm or not officer_norm:
+        return -1
+    if person_norm == officer_norm:
+        return 0
+    pf, pl = _first_last_name_parts(person_norm)
+    of_, ol = _first_last_name_parts(officer_norm)
+    if pf and pl and pf == of_ and pl == ol:
+        return 1
+    return -1
+
+
+def _filing_date_sort_key(fd: str) -> int:
+    try:
+        s = (fd or "").replace("-", "")[:8]
+        return int(s) if s.isdigit() else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _resolve_officer_title_for_person(
+    rows_for_cik: list[tuple[str, str, int, str]],
+    *,
+    pref_filing_id: int,
+    person_norm: str,
+) -> str:
+    """
+    Match NEO person_name to officers for the same CIK.
+    Exact normalized name preferred; then first+last; prefer same filing then newer filing.
+    """
+    if not person_norm or not rows_for_cik:
+        return ""
+    best: tuple[int, int, int, int, str] | None = None
+    # Sort key: minimize (tier, same_filing_flag, -date, -title_len); '' = missing date last
+    for onorm, tit, fid, fdate in rows_for_cik:
+        tier = _officer_name_match_tier(person_norm, onorm)
+        if tier < 0:
+            continue
+        t = (tit or "").strip()
+        if not t:
+            continue
+        same_f = 0 if fid == pref_filing_id else 1
+        dk = _filing_date_sort_key(fdate)
+        cand = (tier, same_f, -dk, -len(t), t)
+        if best is None or cand[:-1] < best[:-1]:
+            best = cand
+    return best[-1] if best else ""
 
 
 def _profile_key(cik: str, person_name: str) -> tuple[str, str]:
@@ -51,7 +117,8 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
                c.salary, c.bonus, c.stock_awards, c.option_awards, c.other_comp,
                c.total, c.equity_comp_disclosed,
                f.id AS filing_id, f.company_name, f.cik, f.filing_date,
-               f.index_url, f.primary_doc_url, f.form_type AS filing_form_type
+               f.index_url, f.primary_doc_url, f.form_type AS filing_form_type,
+               f.issuer_summary AS filing_issuer_summary
         FROM neo_compensation c
         JOIN filings f ON f.id = c.filing_id
         """
@@ -64,17 +131,29 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
     for row in raw:
         groups[_profile_key(row["cik"], row["person_name"])].append(row)
 
-    filing_ids = {r["filing_id"] for r in raw}
-    off_titles: dict[tuple[int, str], str] = {}
-    if filing_ids:
-        qmarks = ",".join("?" * len(filing_ids))
+    ciks = {str(r["cik"] or "").strip() for r in raw if str(r.get("cik") or "").strip()}
+    officer_rows_by_cik: dict[str, list[tuple[str, str, int, str]]] = defaultdict(list)
+    if ciks:
+        qmarks = ",".join("?" * len(ciks))
         ocur = conn.execute(
-            f"SELECT filing_id, name, title FROM officers WHERE filing_id IN ({qmarks})",
-            tuple(filing_ids),
+            f"""
+            SELECT o.name, o.title, o.filing_id, f.filing_date, f.cik
+            FROM officers o
+            JOIN filings f ON f.id = o.filing_id
+            WHERE f.cik IN ({qmarks})
+              AND TRIM(COALESCE(o.title, '')) != ''
+            """,
+            tuple(ciks),
         )
         for o in ocur.fetchall():
-            k = (int(o["filing_id"]), _norm_person_name(o["name"] or ""))
-            off_titles[k] = o["title"] or ""
+            onorm = _norm_person_name(o["name"] or "")
+            tit = (o["title"] or "").strip()
+            ck = str(o["cik"] or "").strip()
+            if not onorm or not tit or not ck:
+                continue
+            officer_rows_by_cik[ck].append(
+                (onorm, tit, int(o["filing_id"]), o["filing_date"] or "")
+            )
 
     profiles: list[dict] = []
     for key, items in groups.items():
@@ -143,12 +222,33 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
                 }
             )
 
-        title_guess = (head.get("role_hint") or "").strip()
-        if not title_guess:
-            title_guess = off_titles.get(
-                (int(head["filing_id"]), _norm_person_name(head["person_name"] or "")),
-                "",
-            )
+        pn = _norm_person_name(head["person_name"] or "")
+        off_t = _resolve_officer_title_for_person(
+            officer_rows_by_cik.get(str(head["cik"] or "").strip(), []),
+            pref_filing_id=int(head["filing_id"]),
+            person_norm=pn,
+        )
+        rh = (head.get("role_hint") or "").strip()
+        title_guess = off_t if len(off_t) >= len(rh) else (rh or off_t)
+
+        iss_raw = (head.get("filing_issuer_summary") or "").strip()
+        if not iss_raw:
+            alt = conn.execute(
+                """
+                SELECT issuer_summary FROM filings
+                WHERE cik = ? AND issuer_summary IS NOT NULL
+                  AND TRIM(issuer_summary) != ''
+                ORDER BY LENGTH(issuer_summary) DESC
+                LIMIT 1
+                """,
+                (str(head["cik"] or "").strip(),),
+            ).fetchone()
+            iss_raw = (alt[0] or "").strip() if alt else ""
+
+        why = why_surfaced_line(
+            str(head.get("filing_form_type") or ""),
+            head.get("filing_date"),
+        )
 
         profiles.append(
             {
@@ -168,6 +268,8 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
                 "index_url": head["index_url"] or "",
                 "primary_doc_url": head["primary_doc_url"] or "",
                 "filing_form_type": head.get("filing_form_type") or "",
+                "issuer_summary": iss_raw,
+                "why_surfaced": why,
                 "years_count": len(by_year),
                 "comp_timeline": timeline,
                 "sum_year_totals": sum_year_totals,
@@ -289,12 +391,19 @@ def _desk_table(profiles: list[dict]) -> str:
             badge = "S-1 · NEO"
         else:
             badge = f"{html.escape(ft_raw[:14])} · NEO" if ft_raw else "EDGAR · NEO"
+        why_s = html.escape((p.get("why_surfaced") or "")[:160])
+        iss = (p.get("issuer_summary") or "").strip()
+        blurb = html.escape(iss[:140] + ("…" if len(iss) > 140 else "")) if iss else ""
+        why_cell = (
+            f'<span class="lead-why">{why_s}</span>' if why_s else ""
+        )
+        co_extra = f'<span class="lead-blurb">{blurb}</span>' if blurb else ""
         rows.append(
             "<tr class='desk-row' tabindex='0' role='link' "
             f"data-href='{href}' title='Open profile'>"
-            f"<td class='profile-name'><a href='{href}'>{nm}</a></td>"
+            f"<td class='profile-name'><a href='{href}'>{nm}</a>{why_cell}</td>"
             f"<td>{title}</td>"
-            f"<td>{company}</td>"
+            f"<td>{company}{co_extra}</td>"
             f"<td><span class='badge'>{badge}</span></td>"
             f"<td class='num strong'>{_money(p['total'])}</td>"
             f"<td class='num'>{sum_cell}</td>"
@@ -308,8 +417,8 @@ def _desk_table(profiles: list[dict]) -> str:
     return f"""
   <h2>Lead desk</h2>
   <p class="meta">
-    <b>Timing-first.</b> Rows can combine <b>S-1</b> and <b>10-K</b> data for the <b>same company (CIK)</b> after sync (S-1 discovery + 10-K follow from SEC submissions). <b>Latest total</b> = most recent fiscal year in your DB; <b>Σ SCT</b> = sum of disclosed yearly totals (not take-home cash).
-    <b>Click the name or row</b> for detail. Optional: set <code>SEC_SYNC_FORMS=S-1,10-K</code> to also ingest a global 10-K RSS stream. Raw rows: <b>Source rows</b> below.
+    <b>Person-first pre-IPO leads.</b> Each row is an executive tied to a <b>registration filing</b>; role/title is merged from the <b>Executive Officers</b> table and signature pages when we can parse them. The gray lines are <b>why it surfaced</b> (filing timing) and a short <b>issuer blurb</b> cut from the prospectus summary in the same HTML (no company-website scraping).
+    <b>Latest total</b> / <b>Σ SCT</b> come from summary compensation tables. <b>Click the row</b> for the full profile. Raw rows: <b>Source rows</b> below.
   </p>
   <div class="table-wrap">
   <table id="desk">
@@ -497,6 +606,10 @@ def _shared_css() -> str:
       display: inline-block; font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.04em;
       padding: 0.15rem 0.4rem; border-radius: 4px; background: #1a2634; color: #8b96a3; border: 1px solid #2a3340;
     }
+    .lead-why, .lead-blurb {
+      display: block; font-size: 0.68rem; color: #7a8796; line-height: 1.35;
+      margin-top: 0.28rem; max-width: 24rem; font-weight: 400;
+    }
     a { color: #5eb3e0; text-decoration: none; }
     a:hover { text-decoration: underline; }
     tr.hidden { display: none; }
@@ -683,9 +796,8 @@ def _page_lead(
     <div class="card bio-placeholder">
       <h2 style="margin-top:0">Management biography</h2>
       <p class="meta" style="margin-bottom:0">
-        <strong>Coming next.</strong> We have not extracted the narrative bio from the registration statement yet.
-        For now, {doc_link or "open the issuer’s filing from EDGAR"} and search for <b>Management</b>,
-        <b>Directors and Executive Officers</b>, or the person’s name. That section usually lists prior roles, education, and board seats — ideal for professional rapport cues.
+        <strong>Narrative bios — coming next.</strong> Role/title above is merged from the filing’s <b>Executive Officers and Directors</b>-style tables and signature pages when we can parse them.
+        For full prose bios, {doc_link or "open the issuer’s filing from EDGAR"} and search <b>Management</b> or the person’s name for prior roles, education, and board seats.
       </p>
     </div>"""
 
@@ -713,6 +825,17 @@ def _page_lead(
     <a href="{html.escape(p.get('index_url') or '')}" target="_blank" rel="noopener">EDGAR index</a>
     {(' · ' + doc_link) if doc_link else ''}
   </p>
+  <div class="card">
+    <h2 style="margin-top:0">Why this lead</h2>
+    <p class="meta" style="margin-bottom:0">{html.escape(p.get('why_surfaced') or '—')}</p>
+  </div>
+  <div class="card">
+    <h2 style="margin-top:0">Issuer snapshot (from filing text)</h2>
+    <p class="meta" style="margin-bottom:0">{
+      html.escape((p.get('issuer_summary') or '').strip()) if (p.get('issuer_summary') or '').strip()
+      else 'Not extracted yet — run <code>python -m wealth_leads sync</code> or <code>backfill-comp --force</code> to refresh HTML parsing.'
+    }</p>
+  </div>
   <div class="hero">
     <div class="stat-card"><div class="lbl">Latest FY total</div><div class="val">{_money(p.get('total'))}</div></div>
     <div class="stat-card"><div class="lbl">Σ SCT (years in DB)</div><div class="val">{sum_disp}</div></div>

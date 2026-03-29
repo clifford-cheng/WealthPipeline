@@ -19,7 +19,13 @@ from wealth_leads.db import (
     insert_filing,
     replace_neo_compensation,
     replace_officers,
+    update_filing_issuer_summary,
     update_primary_doc_url,
+)
+from wealth_leads.management import (
+    extract_executive_officers_from_filing_html,
+    extract_issuer_summary_from_filing_html,
+    merge_officer_rows,
 )
 from wealth_leads.officers import extract_officers_from_s1_html
 from wealth_leads.parse_index import (
@@ -113,6 +119,13 @@ def backfill_compensation(
                     file=sys.stderr,
                 )
                 continue
+            if force:
+                mgmt_b = extract_executive_officers_from_filing_html(s1_html)
+                sig_b = extract_officers_from_s1_html(s1_html)
+                replace_officers(c, fid, merge_officer_rows(mgmt_b, sig_b))
+                summ_b = extract_issuer_summary_from_filing_html(s1_html)
+                if summ_b:
+                    update_filing_issuer_summary(c, fid, summ_b)
             comps = extract_neo_compensation_from_s1(s1_html)
             replace_neo_compensation(c, fid, _neo_comp_db_rows(fid, comps))
             n_done += 1
@@ -188,13 +201,19 @@ def _process_rss_item(
         )
         return
 
-    officers = extract_officers_from_s1_html(body_html)
+    mgmt_off = extract_executive_officers_from_filing_html(body_html)
+    sig_off = extract_officers_from_s1_html(body_html)
+    officers = merge_officer_rows(mgmt_off, sig_off)
     if not officers:
         print(
             f"[warn] No officers parsed: {item.company_name} ({item.accession})",
             file=sys.stderr,
         )
     replace_officers(conn, filing_id, officers)
+
+    summ = extract_issuer_summary_from_filing_html(body_html)
+    if summ:
+        update_filing_issuer_summary(conn, filing_id, summ)
 
     comps = extract_neo_compensation_from_s1(body_html)
     replace_neo_compensation(conn, filing_id, _neo_comp_db_rows(filing_id, comps))

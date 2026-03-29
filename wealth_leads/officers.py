@@ -10,7 +10,8 @@ _TITLE_HINT = re.compile(
     r"\b("
     r"chief|president|officer|director|chairman|chairperson|"
     r"treasurer|secretary|evp|svp|vp\b|vice president|"
-    r"general counsel|counsel|controller|partner"
+    r"general counsel|counsel|controller|partner|"
+    r"ceo|cfo|coo|cto|cio|cmo|cpo"
     r")\b",
     re.I,
 )

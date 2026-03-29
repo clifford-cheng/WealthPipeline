@@ -69,6 +69,12 @@ def _migrate_filings_compensation_column(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_filings_issuer_summary(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(filings)").fetchall()}
+    if "issuer_summary" not in cols:
+        conn.execute("ALTER TABLE filings ADD COLUMN issuer_summary TEXT")
+
+
 @contextmanager
 def connect(path: Optional[str] = None) -> Generator[sqlite3.Connection, None, None]:
     dbp = path or database_path()
@@ -78,6 +84,7 @@ def connect(path: Optional[str] = None) -> Generator[sqlite3.Connection, None, N
     try:
         conn.executescript(SCHEMA)
         _migrate_filings_compensation_column(conn)
+        _migrate_filings_issuer_summary(conn)
         yield conn
         conn.commit()
     finally:
@@ -135,6 +142,15 @@ def update_primary_doc_url(
 ) -> None:
     conn.execute(
         "UPDATE filings SET primary_doc_url = ? WHERE id = ?", (url, filing_id)
+    )
+
+
+def update_filing_issuer_summary(
+    conn: sqlite3.Connection, filing_id: int, text: str
+) -> None:
+    conn.execute(
+        "UPDATE filings SET issuer_summary = ? WHERE id = ?",
+        (text, filing_id),
     )
 
 
