@@ -133,21 +133,22 @@ def _comp_missing_callout(stats: dict) -> str:
   </div>"""
 
 
-def _stats_banner(stats: dict) -> str:
+def _stats_banner(stats: dict, rendered_at: str) -> str:
     if stats.get("missing_db"):
         return """<div class="banner warn"><strong>No database file yet.</strong> Run sync once, then refresh this page.</div>"""
     nf, no, nc = stats["filings"], stats["officers"], stats["comp_rows"]
     latest = html.escape(str(stats.get("latest_filing_date") or "—"))
     mtime = html.escape(str(stats.get("db_file_modified") or "—"))
+    rat = html.escape(rendered_at)
     return f"""<div class="banner">
     <strong>Local snapshot</strong>
     <span class="stats"><span>{nf} filings</span><span>{no} officer rows</span><span>{nc} comp rows</span></span>
-    <span class="sub">Newest filing date in DB: <b>{latest}</b> · DB file updated: <b>{mtime}</b></span>
+    <span class="sub">Newest filing date in DB: <b>{latest}</b> · DB file updated: <b>{mtime}</b> · Page loaded: <b>{rat}</b></span>
   </div>"""
 
 
-def _page(leads: list[sqlite3.Row], comp: list[sqlite3.Row], stats: dict) -> str:
-    banner = _stats_banner(stats)
+def _page(leads: list[sqlite3.Row], comp: list[sqlite3.Row], stats: dict, rendered_at: str) -> str:
+    banner = _stats_banner(stats, rendered_at)
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -188,14 +189,15 @@ def _page(leads: list[sqlite3.Row], comp: list[sqlite3.Row], stats: dict) -> str
   <h1>WealthPipeline — local dashboard</h1>
   <p class="meta">
     This is <b>your copy</b> of the pipeline running on <b>your PC</b> (not a public website).
-    It reads the same SQLite file the <code>sync</code> command fills. After you sync, press
-    <b>F5</b> here to reload. GitHub only holds code; your leads live in the DB file below.
+    It reads the same SQLite file the <code>sync</code> command fills. The tables only change after
+    <code>sync</code> (or <code>backfill-comp</code>) — refreshing alone does not fetch new SEC data.
+    GitHub only holds code; your leads live in the DB file below.
   </p>
   {banner}
   {_comp_missing_callout(stats)}
   <label class="sr" for="filter">Filter both tables</label>
   <input type="search" id="filter" placeholder="Type company or person name…" autocomplete="off"/>
-  <p class="meta">Database: <code>{html.escape(database_path())}</code></p>
+  <p class="meta">Database: <code>{html.escape(str(Path(database_path()).resolve()))}</code></p>
   {_leads_table(leads)}
   {_comp_table(comp)}
   <script>
@@ -308,8 +310,17 @@ def _app(environ, start_response):
         return [b"Not Found"]
 
     leads, comp, stats = _load_page_data()
-    body = _page(leads, comp, stats).encode("utf-8")
-    start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body)))])
+    rendered_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    body = _page(leads, comp, stats, rendered_at).encode("utf-8")
+    start_response(
+        "200 OK",
+        [
+            ("Content-Type", "text/html; charset=utf-8"),
+            ("Content-Length", str(len(body))),
+            ("Cache-Control", "no-store, no-cache, must-revalidate"),
+            ("Pragma", "no-cache"),
+        ],
+    )
     return [body]
 
 

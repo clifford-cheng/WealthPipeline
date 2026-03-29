@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 # SEC requires a descriptive User-Agent with contact info.
 # https://www.sec.gov/os/webmaster-faq#code-support
@@ -27,4 +28,9 @@ def rss_count() -> int:
 
 
 def database_path() -> str:
-    return os.environ.get("WEALTH_LEADS_DB", "wealth_leads.sqlite3")
+    """Default DB is always next to the project root (this repo), not the shell cwd."""
+    explicit = os.environ.get("WEALTH_LEADS_DB")
+    if explicit:
+        return os.path.expanduser(explicit)
+    root = Path(__file__).resolve().parent.parent
+    return str(root / "wealth_leads.sqlite3")
