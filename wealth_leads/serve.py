@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import html
+import json
 import os
+import re
 import sqlite3
+import subprocess
 import sys
-from collections import defaultdict
-from datetime import datetime
-from typing import Optional
 import threading
+import time
 import webbrowser
+from collections import defaultdict
+from datetime import date, datetime
 from pathlib import Path
+from typing import Optional
 from urllib.parse import parse_qs, unquote, urlencode
 from wsgiref.simple_server import make_server
 
@@ -20,7 +24,118 @@ from wealth_leads.config import (
     lead_desk_s1_only,
 )
 from wealth_leads.db import connect
-from wealth_leads.management import why_surfaced_line
+from wealth_leads.management import issuer_summary_looks_spammy, why_surfaced_line
+from wealth_leads.management_bios import extract_age_from_bio_text
+
+_SERVE_CHILD_ENV = "WEALTH_LEADS_SERVE_CHILD"
+# New value each process start so the tab reloads after you restart the server (picks up code changes).
+_DEV_BOOT = f"{time.time_ns()}-{os.getpid()}"
+
+
+def _want_live_reload() -> bool:
+    return os.environ.get("WEALTH_LEADS_LIVE_RELOAD", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _live_reload_snippet() -> str:
+    if not _want_live_reload():
+        return ""
+    return """
+<script>
+(function(){
+  var u='/__dev/state';
+  function tick(){
+    fetch(u,{cache:'no-store'}).then(function(r){return r.json()}).then(function(j){
+      var x=String(j.db)+'|'+String(j.boot);
+      if(window.__wlPulse===undefined){window.__wlPulse=x;return;}
+      if(window.__wlPulse!==x)location.reload();
+    }).catch(function(){});
+  }
+  setInterval(tick,1200);
+  tick();
+})();
+</script>"""
+
+
+def _dev_state_body() -> bytes:
+    db_m = 0.0
+    dbp = database_path()
+    try:
+        p = Path(dbp)
+        if p.is_file():
+            db_m = p.stat().st_mtime
+    except OSError:
+        pass
+    payload = json.dumps({"db": db_m, "boot": _DEV_BOOT}, separators=(",", ":"))
+    return payload.encode("utf-8")
+
+
+def _package_py_snapshot(pkg: Path) -> dict[str, float]:
+    out: dict[str, float] = {}
+    if not pkg.is_dir():
+        return out
+    for p in pkg.rglob("*.py"):
+        if p.is_file():
+            try:
+                out[str(p.resolve())] = p.stat().st_mtime
+            except OSError:
+                continue
+    return out
+
+
+def _spawn_reload_watch_loop(*, port: int, open_browser: bool, live: bool) -> None:
+    pkg = Path(__file__).resolve().parent
+    first_child = True
+    print(
+        "Dev reload: watching wealth_leads/*.py — server restarts on save; "
+        "browser auto-refreshes when the DB or process changes.",
+        file=sys.stderr,
+    )
+    try:
+        while True:
+            snap = _package_py_snapshot(pkg)
+            env = os.environ.copy()
+            env[_SERVE_CHILD_ENV] = "1"
+            env["WEALTH_LEADS_LIVE_RELOAD"] = "1" if live else "0"
+            cmd = [
+                sys.executable,
+                "-m",
+                "wealth_leads",
+                "serve",
+                "--port",
+                str(port),
+            ]
+            if not open_browser or not first_child:
+                cmd.append("--no-browser")
+            if not live:
+                cmd.append("--no-live")
+            proc = subprocess.Popen(cmd, env=env)
+            first_child = False
+            while proc.poll() is None:
+                time.sleep(0.45)
+                if _package_py_snapshot(pkg) != snap:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    time.sleep(0.15)
+                    break
+            else:
+                code = proc.returncode or 0
+                if code == 0:
+                    return
+                print(
+                    f"[serve] server process exited ({code}); restarting…",
+                    file=sys.stderr,
+                )
+                time.sleep(0.5)
+                continue
+    except KeyboardInterrupt:
+        print("\nStopped (reload watcher).", file=sys.stderr)
 
 
 def _norm_person_name(name: str) -> str:
@@ -79,19 +194,56 @@ def _filing_date_sort_key(fd: str) -> int:
         return 0
 
 
+def _parse_filing_date(s: str) -> Optional[date]:
+    if not (s or "").strip():
+        return None
+    raw = s.strip()[:10]
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _whole_calendar_years_elapsed(since: date, until: date) -> int:
+    """Birthday-unknown approximation: count full calendar years between dates."""
+    y = until.year - since.year
+    if (until.month, until.day) < (since.month, since.day):
+        y -= 1
+    return max(0, y)
+
+
+def _age_estimated_for_today(
+    age_stated: Optional[int], anchor_date_str: str
+) -> tuple[Optional[int], bool]:
+    """
+    Returns (age to display today, whether we applied a calendar-year adjustment).
+    Without a parseable anchor date, returns (age_stated, False).
+    """
+    if age_stated is None:
+        return None, False
+    anchor = _parse_filing_date(anchor_date_str)
+    if anchor is None:
+        return age_stated, False
+    extra = _whole_calendar_years_elapsed(anchor, date.today())
+    return age_stated + extra, extra > 0
+
+
 def _resolve_officer_extras_for_person(
     rows_for_cik: list[tuple[str, str, Optional[int], int, str]],
     *,
     pref_filing_id: int,
     person_norm: str,
-) -> tuple[str, Optional[int]]:
+) -> tuple[str, Optional[int], str]:
     """
     Match NEO person_name to officers for the same CIK.
-    Returns (title, age) from management/signature tables when we can match a row.
+    Returns (title, age as in filing, filing_date of that officer row).
     """
     if not person_norm or not rows_for_cik:
-        return "", None
-    best: tuple[int, int, int, int, str, Optional[int]] | None = None
+        return "", None, ""
+    best_key: tuple[int, int, int, int, int] | None = None
+    best_title = ""
+    best_age: Optional[int] = None
+    best_fdate = ""
     for onorm, tit, oage, fid, fdate in rows_for_cik:
         tier = _officer_name_match_tier(person_norm, onorm)
         if tier < 0:
@@ -101,12 +253,18 @@ def _resolve_officer_extras_for_person(
             continue
         same_f = 0 if fid == pref_filing_id else 1
         dk = _filing_date_sort_key(fdate)
-        cand = (tier, same_f, -dk, -len(t), t, oage)
-        if best is None or cand[:-2] < best[:-2]:
-            best = cand
-    if not best:
-        return "", None
-    return best[-2], best[-1]
+        # Prefer a row with a parsed age over the headline filing row with no age
+        # (common when an amended S-1 omits the age column but the prior filing had it).
+        age_pref = 0 if oage is not None else 1
+        cand_key = (tier, age_pref, same_f, -dk, -len(t))
+        if best_key is None or cand_key < best_key:
+            best_key = cand_key
+            best_title = t
+            best_age = oage
+            best_fdate = (fdate or "").strip()
+    if best_key is None:
+        return "", None, ""
+    return best_title, best_age, best_fdate
 
 
 def _profile_key(cik: str, person_name: str) -> tuple[str, str]:
@@ -270,7 +428,7 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
             )
 
         pn = _norm_person_name(head["person_name"] or "")
-        off_t, officer_age = _resolve_officer_extras_for_person(
+        off_t, officer_age, officer_age_filing_date = _resolve_officer_extras_for_person(
             officer_rows_by_cik.get(str(head["cik"] or "").strip(), []),
             pref_filing_id=int(head["filing_id"]),
             person_norm=pn,
@@ -279,18 +437,24 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
         title_guess = off_t if len(off_t) >= len(rh) else (rh or off_t)
 
         iss_raw = (head.get("filing_issuer_summary") or "").strip()
+        if iss_raw and issuer_summary_looks_spammy(iss_raw):
+            iss_raw = ""
         if not iss_raw:
-            alt = conn.execute(
+            alt_rows = conn.execute(
                 """
                 SELECT issuer_summary FROM filings
                 WHERE cik = ? AND issuer_summary IS NOT NULL
                   AND TRIM(issuer_summary) != ''
-                ORDER BY LENGTH(issuer_summary) DESC
-                LIMIT 1
+                ORDER BY COALESCE(filing_date, '') DESC, id DESC
+                LIMIT 25
                 """,
                 (str(head["cik"] or "").strip(),),
-            ).fetchone()
-            iss_raw = (alt[0] or "").strip() if alt else ""
+            ).fetchall()
+            for row in alt_rows:
+                cand = (row[0] or "").strip()
+                if cand and not issuer_summary_looks_spammy(cand):
+                    iss_raw = cand
+                    break
 
         cik_s = str(head["cik"] or "").strip()
         issuer_web = (head.get("filing_issuer_website") or "").strip()
@@ -375,6 +539,20 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
             _is_s1_form_type(str(r.get("filing_form_type") or "")) for r in items
         )
 
+        bio_text_for_age = (mgmt_nar or {}).get("bio_text") or ""
+        narrative_age = (
+            extract_age_from_bio_text(bio_text_for_age) if bio_text_for_age else None
+        )
+        age_stated = (
+            officer_age if officer_age is not None else narrative_age
+        )
+        age_anchor = (
+            (officer_age_filing_date or (head["filing_date"] or "")).strip()
+            if officer_age is not None
+            else (head["filing_date"] or "").strip()
+        )
+        display_age, _ = _age_estimated_for_today(age_stated, age_anchor)
+
         profiles.append(
             {
                 "norm_name": key[1],
@@ -403,7 +581,11 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
                 "total_hwm": total_hwm,
                 "signal_hwm": signal_hwm,
                 "has_s1_comp": has_s1_comp,
-                "officer_age": officer_age,
+                "officer_age": display_age,
+                "age_stated_in_filing": age_stated,
+                "age_anchor_date": age_anchor,
+                "officer_age_from_table": officer_age,
+                "narrative_age": narrative_age,
                 "issuer_website": issuer_web,
                 "issuer_headquarters": issuer_hq,
                 "mgmt_bio_role": (mgmt_nar or {}).get("role_heading") or "",
@@ -578,6 +760,39 @@ def _desk_table(profiles: list[dict], stats: dict) -> str:
             badge = f"{html.escape(ft_raw[:14])} · NEO" if ft_raw else "EDGAR · NEO"
         why_s = html.escape((p.get("why_surfaced") or "")[:160])
         why_cell = f'<span class="lead-why">{why_s}</span>' if why_s else ""
+        oa_row = p.get("officer_age")
+        age_cell = "—"
+        if oa_row is not None:
+            try:
+                age_cell = str(int(oa_row))
+            except (TypeError, ValueError):
+                pass
+        bio_full = (p.get("mgmt_bio_text") or "").strip()
+        bio_one = re.sub(r"\s+", " ", bio_full)[:220]
+        age_tip = ""
+        st = p.get("age_stated_in_filing")
+        anch = (p.get("age_anchor_date") or "").strip()
+        if st is not None and anch:
+            try:
+                st_i = int(st)
+                disp_i = int(oa_row) if oa_row is not None else st_i
+                if disp_i != st_i:
+                    age_tip = (
+                        f"Age ~{disp_i} est. (stated {st_i} as of filing {anch}; "
+                        "calendar years to today; birthday not in filing)."
+                    )
+                else:
+                    age_tip = f"Age {st_i} (anchor filing date {anch})."
+            except (TypeError, ValueError):
+                pass
+        tip_parts = []
+        if bio_one:
+            tip_parts.append(bio_one + ("…" if len(bio_full) > 220 else ""))
+        if age_tip:
+            tip_parts.append(age_tip)
+        combined_tip = " \u00b7 ".join(tip_parts) if tip_parts else "Open profile"
+        row_tip = html.escape(combined_tip, quote=True)
+        tip_attr = f' title="{row_tip}"'
         web_u = (p.get("issuer_website") or "").strip()
         co_link = web_u if web_u.startswith(("http://", "https://")) else ""
         if not co_link and p.get("primary_doc_url"):
@@ -593,7 +808,8 @@ def _desk_table(profiles: list[dict], stats: dict) -> str:
             co_cell = company
         rows.append(
             "<tr class='desk-row' tabindex='0' role='link' "
-            f"data-href='{href}' title='Open profile'>"
+            f"data-href='{href}'{tip_attr}>"
+            f"<td class='num'>{html.escape(age_cell)}</td>"
             f"<td class='profile-name'><a href='{href}'>{nm}</a>{why_cell}</td>"
             f"<td>{title}</td>"
             f"<td class='co-name'>{co_cell}</td>"
@@ -610,14 +826,16 @@ def _desk_table(profiles: list[dict], stats: dict) -> str:
     return f"""
   <h2>Lead desk</h2>
   <p class="meta">
-    <b>Person-first pre-IPO leads.</b> Desk = <b>S-1 / S-1/A NEO</b> plus a configurable pay bar (<code>WEALTH_LEADS_LEAD_DESK_MIN_SIGNAL_USD</code>). <b>Company</b> links to the issuer website when we parsed one from the filing, otherwise the primary EDGAR doc. <b>Latest total</b> = headline fiscal year SCT; <b>Max equity</b> = best single-year stock+options. Full numbers + company HQ on the profile page.
+    <b>Person-first pre-IPO leads.</b> Desk = <b>S-1 / S-1/A NEO</b> plus a configurable pay bar (<code>WEALTH_LEADS_LEAD_DESK_MIN_SIGNAL_USD</code>). <b>Company</b> links to the issuer website when we parsed one from the filing, otherwise the primary EDGAR doc.     <b>Latest total</b> = headline fiscal year SCT; <b>Max equity</b> = best single-year stock+options.
+    <b>Age</b> = stated in the filing, then + full calendar years to today (no birthday in EDGAR text); hover a row for <b>bio + age detail</b>.
+    Full narrative + HQ on the profile page.
     <b>Click the row</b> for detail. Raw rows: <b>Source rows</b> below.
   </p>
   <div class="table-wrap">
   <table id="desk">
     <thead>
       <tr>
-        <th>Person</th><th>Role</th><th>Company</th><th>Form</th>
+        <th title="Stated age in the filing, plus full calendar years to today (birthday not disclosed)">Age</th><th>Person</th><th>Role</th><th>Company</th><th>Form</th>
         <th>Latest total</th><th title='Max single-FY stock + options (SCT)'>Max equity</th>
         <th>FY</th><th>Filing</th><th>CIK</th><th>Quick source</th>
       </tr>
@@ -903,8 +1121,9 @@ def _page_desk(
         if (e.key === 'Enter') {{ e.preventDefault(); go(); }}
       }});
     }});
-  }})();
+    }})();
   </script>
+  {_live_reload_snippet()}
 </body>
 </html>"""
 
@@ -1034,20 +1253,43 @@ def _page_lead(
     )
 
     oa = p.get("officer_age")
+    stated = p.get("age_stated_in_filing")
+    anchor = (p.get("age_anchor_date") or "").strip()
+    oat = p.get("officer_age_from_table")
+    nar = p.get("narrative_age")
     if oa is not None:
         try:
-            age_line = (
-                f"<strong>Age:</strong> {int(oa)} "
-                f"<span class='dim'>(executive officers table in the filing)</span><br/>"
-            )
+            age_n = int(oa)
+            if oat is not None:
+                src = "executive officers table"
+            elif nar is not None:
+                src = "Management narrative (prose)"
+            else:
+                src = "filing-derived"
+            esc_a = html.escape(anchor) if anchor else ""
+            bits = [src]
+            if stated is not None and anchor:
+                try:
+                    st_i = int(stated)
+                    if age_n != st_i:
+                        bits.append(
+                            f"filing stated <b>{st_i}</b> as of <b>{esc_a}</b>; "
+                            f"<b>{age_n}</b> adds full calendar years to today (birthday not in filing)"
+                        )
+                    else:
+                        bits.append(f"as of filing date <b>{esc_a}</b>")
+                except (TypeError, ValueError):
+                    pass
+            detail = "<span class='dim'>(" + "; ".join(bits) + ")</span>"
+            age_line = f"<strong>Age:</strong> {age_n} {detail}<br/>"
         except (TypeError, ValueError):
             age_line = (
                 "<strong>Age:</strong> <span class='dim'>—</span><br/>"
             )
     else:
         age_line = (
-            "<strong>Age:</strong> <span class='dim'>Not in DB yet — "
-            "run <code>backfill-comp --force</code> to re-parse officer rosters.</span><br/>"
+            "<strong>Age:</strong> <span class='dim'>Not found in roster table or narrative — "
+            "run <code>backfill-comp --force</code> after parser updates.</span><br/>"
         )
     hq_txt = (p.get("issuer_headquarters") or "").strip()
     hq_esc = html.escape(hq_txt) if hq_txt else ""
@@ -1136,6 +1378,7 @@ def _page_lead(
   {_filings_table_html(filings)}
   <p class="meta">Bookmark this page: <code>/lead?{html.escape(bookmark_q)}</code></p>
   {banner}
+  {_live_reload_snippet()}
 </body>
 </html>"""
 
@@ -1238,14 +1481,28 @@ def _load_page_data() -> tuple[list[dict], list[dict], list[sqlite3.Row], list[s
 
 def _app(environ, start_response):
     path = environ.get("PATH_INFO") or "/"
-    if path != "/" and path.rstrip("/") != "/lead":
+    pi = path.rstrip("/") or "/"
+
+    if pi == "/__dev/state":
+        body = _dev_state_body()
+        start_response(
+            "200 OK",
+            [
+                ("Content-Type", "application/json; charset=utf-8"),
+                ("Content-Length", str(len(body))),
+                ("Cache-Control", "no-store"),
+            ],
+        )
+        return [body]
+
+    if pi not in ("/", "/lead"):
         start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
         return [b"Not Found"]
 
     profiles, profiles_all, leads, comp, stats = _load_page_data()
     rendered_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    if path.rstrip("/") == "/lead":
+    if pi == "/lead":
         qs = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
         cik = (qs.get("cik") or [""])[0].strip()
         name_raw = (qs.get("name") or [""])[0]
@@ -1293,8 +1550,23 @@ def _open_browser_when_ready(url: str, delay_sec: float = 0.8) -> None:
     threading.Timer(delay_sec, _go).start()
 
 
-def run_localhost(*, port: int | None = None, open_browser: bool = True) -> None:
+def run_localhost(
+    *,
+    port: int | None = None,
+    open_browser: bool = True,
+    live: bool = True,
+    reload: bool = False,
+) -> None:
     p = port or int(os.environ.get("WEALTH_LEADS_PORT", "8765"))
+    if live:
+        os.environ["WEALTH_LEADS_LIVE_RELOAD"] = "1"
+    else:
+        os.environ["WEALTH_LEADS_LIVE_RELOAD"] = "0"
+
+    if reload and os.environ.get(_SERVE_CHILD_ENV) != "1":
+        _spawn_reload_watch_loop(port=p, open_browser=open_browser, live=live)
+        return
+
     url = f"http://127.0.0.1:{p}/"
     try:
         httpd = make_server("127.0.0.1", p, _app)
@@ -1303,6 +1575,12 @@ def run_localhost(*, port: int | None = None, open_browser: bool = True) -> None
         print("Another copy may be running, or the port is in use.", file=sys.stderr)
         raise SystemExit(1) from e
     print(f"WealthPipeline dashboard: {url}")
+    if _want_live_reload():
+        print(
+            "Live refresh: tab reloads when the database changes or the server restarts "
+            "(disable with --no-live or WEALTH_LEADS_LIVE_RELOAD=0).",
+            file=sys.stderr,
+        )
     print("Press Ctrl+C to stop.")
     if open_browser:
         print("Opening your browser in a moment…")

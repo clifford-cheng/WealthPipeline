@@ -128,13 +128,12 @@ def backfill_compensation(
                     file=sys.stderr,
                 )
                 continue
-            if force:
-                mgmt_b = extract_executive_officers_from_filing_html(s1_html)
-                sig_b = extract_officers_from_s1_html(s1_html)
-                replace_officers(c, fid, merge_officer_rows(mgmt_b, sig_b))
-                summ_b = extract_issuer_summary_from_filing_html(s1_html)
-                if summ_b:
-                    update_filing_issuer_summary(c, fid, summ_b)
+            mgmt_b = extract_executive_officers_from_filing_html(s1_html)
+            sig_b = extract_officers_from_s1_html(s1_html)
+            replace_officers(c, fid, merge_officer_rows(mgmt_b, sig_b))
+            summ_b = extract_issuer_summary_from_filing_html(s1_html)
+            if summ_b:
+                update_filing_issuer_summary(c, fid, summ_b)
             web_b = extract_issuer_website_from_filing_html(s1_html)
             hq_b = extract_issuer_headquarters_from_filing_html(s1_html)
             if web_b or hq_b:
@@ -466,6 +465,16 @@ def main() -> None:
         action="store_true",
         help="Do not open a browser tab automatically",
     )
+    srv.add_argument(
+        "--no-live",
+        action="store_true",
+        help="Disable automatic browser refresh when the DB file or server process changes",
+    )
+    srv.add_argument(
+        "--reload",
+        action="store_true",
+        help="Dev: restart the server when wealth_leads Python files change (implies live refresh)",
+    )
 
     args = p.parse_args()
     if args.cmd == "sync":
@@ -484,7 +493,12 @@ def main() -> None:
     elif args.cmd == "serve":
         from wealth_leads.serve import run_localhost
 
-        run_localhost(port=args.port, open_browser=not args.no_browser)
+        run_localhost(
+            port=args.port,
+            open_browser=not args.no_browser,
+            live=not bool(getattr(args, "no_live", False)),
+            reload=bool(getattr(args, "reload", False)),
+        )
 
 
 if __name__ == "__main__":

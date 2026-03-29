@@ -34,7 +34,8 @@ echo If the browser says it can't connect, wait 2 seconds and refresh.
 echo If tables are empty, run "Sync SEC data then open dashboard.bat" once.
 echo.
 
-%_PY% -m wealth_leads serve
+REM --reload restarts the server when you save code; pages auto-refresh when DB/sync changes.
+%_PY% -m wealth_leads serve --reload
 set "_ERR=%ERRORLEVEL%"
 
 echo.
