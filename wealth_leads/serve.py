@@ -230,30 +230,29 @@ def _find_profile(profiles: list[dict], cik: str, norm_name: str) -> Optional[di
     return None
 
 
-def _filings_for_profile(conn: sqlite3.Connection, cik: str, norm_name: str) -> list[dict]:
+def _filings_for_profile(conn: sqlite3.Connection, cik: str, _norm_name: str) -> list[dict]:
+    """
+    Issuer filing timeline for cross-reference: every S-1 and 10-K (incl. /A) we have for
+    this CIK, newest first — not only filings where this person has a comp row (10-K often
+    parses officers without hitting NEO comp).
+    """
+    cik_s = str(cik or "").strip()
     cur = conn.execute(
         """
-        SELECT f.id, f.accession, f.form_type, f.filing_date, f.index_url, f.primary_doc_url,
-               c.person_name
+        SELECT f.id, f.accession, f.form_type, f.filing_date, f.index_url, f.primary_doc_url
         FROM filings f
-        JOIN neo_compensation c ON c.filing_id = f.id
         WHERE f.cik = ?
-        ORDER BY f.filing_date DESC, f.id DESC
+          AND (form_type LIKE '%S-1%' OR form_type LIKE '%10-K%')
+        ORDER BY COALESCE(f.filing_date, '') DESC, f.id DESC
+        LIMIT 50
         """,
-        (str(cik or "").strip(),),
+        (cik_s,),
     )
-    seen: set[int] = set()
     out: list[dict] = []
     for r in cur.fetchall():
-        if _norm_person_name(r["person_name"] or "") != norm_name:
-            continue
-        fid = int(r["id"])
-        if fid in seen:
-            continue
-        seen.add(fid)
         out.append(
             {
-                "id": fid,
+                "id": int(r["id"]),
                 "accession": r["accession"] or "",
                 "form_type": r["form_type"] or "",
                 "filing_date": r["filing_date"] or "",
@@ -724,7 +723,8 @@ def _page_lead(
   <h2>Year-by-year (summary comp table)</h2>
   {_profile_breakdown_table(p)}
   {bio_block}
-  <h2>Filings (this person + issuer)</h2>
+  <h2>Issuer filings (S-1 / 10-K)</h2>
+  <p class="meta">Same <b>CIK</b> as this lead — registration statements and annual reports we have in your DB (newest first, up to 50). Run <code>sync</code> to pull 10-Ks after S-1s (<code>SEC_FOLLOW_10K=1</code>, default).</p>
   {_filings_table_html(filings)}
   <p class="meta">Bookmark this page: <code>/lead?{html.escape(bookmark_q)}</code></p>
   {banner}
