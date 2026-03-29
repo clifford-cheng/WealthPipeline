@@ -46,14 +46,16 @@ def _clean_title(raw: str) -> Optional[str]:
     return s
 
 
-def extract_officers_from_s1_html(html: str) -> list[tuple[str, str, str]]:
+def extract_officers_from_s1_html(
+    html: str,
+) -> list[tuple[str, str, str, Optional[int]]]:
     """
     Best-effort extraction of signers from the standard SEC signature table
     (Signature / Title / Date). Works for S-1 registration statements and
-    many 10-K / Exchange Act certification pages. Returns (name, title, source).
+    many 10-K / Exchange Act certification pages. Returns (name, title, source, age).
     """
     soup = BeautifulSoup(html, "html.parser")
-    found: list[tuple[str, str, str]] = []
+    found: list[tuple[str, str, str, None]] = []
 
     for table in soup.find_all("table"):
         rows = table.find_all("tr")
@@ -84,12 +86,12 @@ def extract_officers_from_s1_html(html: str) -> list[tuple[str, str, str]]:
                 continue
             name = _clean_name(name_raw)
             if name:
-                found.append((name, title, "signature_table"))
+                found.append((name, title, "signature_table", None))
 
     # De-dupe by name, prefer longer / more specific titles
-    by_name: dict[str, tuple[str, str, str]] = {}
-    for name, title, src in found:
+    by_name: dict[str, tuple[str, str, str, Optional[int]]] = {}
+    for name, title, src, age in found:
         prev = by_name.get(name)
         if prev is None or len(title) > len(prev[1]):
-            by_name[name] = (name, title, src)
+            by_name[name] = (name, title, src, age)
     return sorted(by_name.values(), key=lambda x: (x[1], x[0]))

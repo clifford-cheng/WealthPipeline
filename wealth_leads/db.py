@@ -75,6 +75,20 @@ def _migrate_filings_issuer_summary(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE filings ADD COLUMN issuer_summary TEXT")
 
 
+def _migrate_filings_issuer_meta(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(filings)").fetchall()}
+    if "issuer_website" not in cols:
+        conn.execute("ALTER TABLE filings ADD COLUMN issuer_website TEXT")
+    if "issuer_headquarters" not in cols:
+        conn.execute("ALTER TABLE filings ADD COLUMN issuer_headquarters TEXT")
+
+
+def _migrate_officers_age(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(officers)").fetchall()}
+    if "age" not in cols:
+        conn.execute("ALTER TABLE officers ADD COLUMN age INTEGER")
+
+
 @contextmanager
 def connect(path: Optional[str] = None) -> Generator[sqlite3.Connection, None, None]:
     dbp = path or database_path()
@@ -154,17 +168,43 @@ def update_filing_issuer_summary(
     )
 
 
+def update_filing_issuer_meta(
+    conn: sqlite3.Connection,
+    filing_id: int,
+    *,
+    website: str = "",
+    headquarters: str = "",
+) -> None:
+    conn.execute(
+        """
+        UPDATE filings SET
+            issuer_website = COALESCE(NULLIF(TRIM(?), ''), issuer_website),
+            issuer_headquarters = COALESCE(NULLIF(TRIM(?), ''), issuer_headquarters)
+        WHERE id = ?
+        """,
+        (website or "", headquarters or "", filing_id),
+    )
+
+
 def replace_officers(
-    conn: sqlite3.Connection, filing_id: int, rows: list[tuple[str, str, str]]
+    conn: sqlite3.Connection, filing_id: int, rows: list[tuple]
 ) -> None:
     conn.execute("DELETE FROM officers WHERE filing_id = ?", (filing_id,))
     if rows:
+        out: list[tuple] = []
+        for row in rows:
+            if len(row) == 3:
+                n, t, s = row[0], row[1], row[2]
+                out.append((filing_id, n, t, s, None))
+            else:
+                n, t, s, a = row[0], row[1], row[2], row[3]
+                out.append((filing_id, n, t, s, a))
         conn.executemany(
             """
-            INSERT INTO officers (filing_id, name, title, source)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO officers (filing_id, name, title, source, age)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            [(filing_id, n, t, s) for n, t, s in rows],
+            out,
         )
     # Mark attempt complete so sync does not re-fetch forever; use --force-officers to retry.
     conn.execute(

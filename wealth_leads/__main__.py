@@ -19,12 +19,15 @@ from wealth_leads.db import (
     insert_filing,
     replace_neo_compensation,
     replace_officers,
+    update_filing_issuer_meta,
     update_filing_issuer_summary,
     update_primary_doc_url,
 )
 from wealth_leads.management import (
     extract_executive_officers_from_filing_html,
+    extract_issuer_headquarters_from_filing_html,
     extract_issuer_summary_from_filing_html,
+    extract_issuer_website_from_filing_html,
     merge_officer_rows,
 )
 from wealth_leads.officers import extract_officers_from_s1_html
@@ -126,6 +129,12 @@ def backfill_compensation(
                 summ_b = extract_issuer_summary_from_filing_html(s1_html)
                 if summ_b:
                     update_filing_issuer_summary(c, fid, summ_b)
+            web_b = extract_issuer_website_from_filing_html(s1_html)
+            hq_b = extract_issuer_headquarters_from_filing_html(s1_html)
+            if web_b or hq_b:
+                update_filing_issuer_meta(
+                    c, fid, website=web_b, headquarters=hq_b
+                )
             comps = extract_neo_compensation_from_s1(s1_html)
             replace_neo_compensation(c, fid, _neo_comp_db_rows(fid, comps))
             n_done += 1
@@ -214,6 +223,13 @@ def _process_rss_item(
     summ = extract_issuer_summary_from_filing_html(body_html)
     if summ:
         update_filing_issuer_summary(conn, filing_id, summ)
+
+    web = extract_issuer_website_from_filing_html(body_html)
+    hq = extract_issuer_headquarters_from_filing_html(body_html)
+    if web or hq:
+        update_filing_issuer_meta(
+            conn, filing_id, website=web, headquarters=hq
+        )
 
     comps = extract_neo_compensation_from_s1(body_html)
     replace_neo_compensation(conn, filing_id, _neo_comp_db_rows(filing_id, comps))

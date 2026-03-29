@@ -79,21 +79,20 @@ def _filing_date_sort_key(fd: str) -> int:
         return 0
 
 
-def _resolve_officer_title_for_person(
-    rows_for_cik: list[tuple[str, str, int, str]],
+def _resolve_officer_extras_for_person(
+    rows_for_cik: list[tuple[str, str, Optional[int], int, str]],
     *,
     pref_filing_id: int,
     person_norm: str,
-) -> str:
+) -> tuple[str, Optional[int]]:
     """
     Match NEO person_name to officers for the same CIK.
-    Exact normalized name preferred; then first+last; prefer same filing then newer filing.
+    Returns (title, age) from management/signature tables when we can match a row.
     """
     if not person_norm or not rows_for_cik:
-        return ""
-    best: tuple[int, int, int, int, str] | None = None
-    # Sort key: minimize (tier, same_filing_flag, -date, -title_len); '' = missing date last
-    for onorm, tit, fid, fdate in rows_for_cik:
+        return "", None
+    best: tuple[int, int, int, int, str, Optional[int]] | None = None
+    for onorm, tit, oage, fid, fdate in rows_for_cik:
         tier = _officer_name_match_tier(person_norm, onorm)
         if tier < 0:
             continue
@@ -102,10 +101,12 @@ def _resolve_officer_title_for_person(
             continue
         same_f = 0 if fid == pref_filing_id else 1
         dk = _filing_date_sort_key(fdate)
-        cand = (tier, same_f, -dk, -len(t), t)
-        if best is None or cand[:-1] < best[:-1]:
+        cand = (tier, same_f, -dk, -len(t), t, oage)
+        if best is None or cand[:-2] < best[:-2]:
             best = cand
-    return best[-1] if best else ""
+    if not best:
+        return "", None
+    return best[-2], best[-1]
 
 
 def _profile_key(cik: str, person_name: str) -> tuple[str, str]:
@@ -138,7 +139,9 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
                c.total, c.equity_comp_disclosed,
                f.id AS filing_id, f.company_name, f.cik, f.filing_date,
                f.index_url, f.primary_doc_url, f.form_type AS filing_form_type,
-               f.issuer_summary AS filing_issuer_summary
+               f.issuer_summary AS filing_issuer_summary,
+               f.issuer_website AS filing_issuer_website,
+               f.issuer_headquarters AS filing_issuer_headquarters
         FROM neo_compensation c
         JOIN filings f ON f.id = c.filing_id
         """
@@ -152,12 +155,14 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
         groups[_profile_key(row["cik"], row["person_name"])].append(row)
 
     ciks = {str(r["cik"] or "").strip() for r in raw if str(r.get("cik") or "").strip()}
-    officer_rows_by_cik: dict[str, list[tuple[str, str, int, str]]] = defaultdict(list)
+    officer_rows_by_cik: dict[str, list[tuple[str, str, Optional[int], int, str]]] = (
+        defaultdict(list)
+    )
     if ciks:
         qmarks = ",".join("?" * len(ciks))
         ocur = conn.execute(
             f"""
-            SELECT o.name, o.title, o.filing_id, f.filing_date, f.cik
+            SELECT o.name, o.title, o.age, o.filing_id, f.filing_date, f.cik
             FROM officers o
             JOIN filings f ON f.id = o.filing_id
             WHERE f.cik IN ({qmarks})
@@ -171,8 +176,12 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
             ck = str(o["cik"] or "").strip()
             if not onorm or not tit or not ck:
                 continue
+            try:
+                oage = int(o["age"]) if o["age"] is not None else None
+            except (TypeError, ValueError):
+                oage = None
             officer_rows_by_cik[ck].append(
-                (onorm, tit, int(o["filing_id"]), o["filing_date"] or "")
+                (onorm, tit, oage, int(o["filing_id"]), o["filing_date"] or "")
             )
 
     profiles: list[dict] = []
@@ -243,7 +252,7 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
             )
 
         pn = _norm_person_name(head["person_name"] or "")
-        off_t = _resolve_officer_title_for_person(
+        off_t, officer_age = _resolve_officer_extras_for_person(
             officer_rows_by_cik.get(str(head["cik"] or "").strip(), []),
             pref_filing_id=int(head["filing_id"]),
             person_norm=pn,
@@ -264,6 +273,32 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
                 (str(head["cik"] or "").strip(),),
             ).fetchone()
             iss_raw = (alt[0] or "").strip() if alt else ""
+
+        cik_s = str(head["cik"] or "").strip()
+        issuer_web = (head.get("filing_issuer_website") or "").strip()
+        issuer_hq = (head.get("filing_issuer_headquarters") or "").strip()
+        if not issuer_web and cik_s:
+            rw = conn.execute(
+                """
+                SELECT issuer_website FROM filings
+                WHERE cik = ? AND issuer_website IS NOT NULL
+                  AND TRIM(issuer_website) != ''
+                ORDER BY COALESCE(filing_date, '') DESC LIMIT 1
+                """,
+                (cik_s,),
+            ).fetchone()
+            issuer_web = (rw[0] or "").strip() if rw else ""
+        if not issuer_hq and cik_s:
+            rhq = conn.execute(
+                """
+                SELECT issuer_headquarters FROM filings
+                WHERE cik = ? AND issuer_headquarters IS NOT NULL
+                  AND TRIM(issuer_headquarters) != ''
+                ORDER BY COALESCE(filing_date, '') DESC LIMIT 1
+                """,
+                (cik_s,),
+            ).fetchone()
+            issuer_hq = (rhq[0] or "").strip() if rhq else ""
 
         why = why_surfaced_line(
             str(head.get("filing_form_type") or ""),
@@ -313,6 +348,9 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
                 "total_hwm": total_hwm,
                 "signal_hwm": signal_hwm,
                 "has_s1_comp": has_s1_comp,
+                "officer_age": officer_age,
+                "issuer_website": issuer_web,
+                "issuer_headquarters": issuer_hq,
             }
         )
 
@@ -467,8 +505,6 @@ def _desk_table(profiles: list[dict], stats: dict) -> str:
         title = html.escape(p["title"] or "—")
         href = html.escape(_profile_lead_url(p))
         nm = html.escape(p["display_name"] or "")
-        sum_sct = p.get("sum_year_totals")
-        sum_cell = _money(sum_sct) if sum_sct is not None else "—"
         idx = html.escape(p["index_url"] or "")
         doc = html.escape(p["primary_doc_url"] or "")
         idx_l = f'<a href="{idx}" target="_blank" rel="noopener" onclick="event.stopPropagation()">EDGAR</a>' if idx else "—"
@@ -482,24 +518,29 @@ def _desk_table(profiles: list[dict], stats: dict) -> str:
         else:
             badge = f"{html.escape(ft_raw[:14])} · NEO" if ft_raw else "EDGAR · NEO"
         why_s = html.escape((p.get("why_surfaced") or "")[:160])
-        iss = (p.get("issuer_summary") or "").strip()
-        blurb = html.escape(iss[:140] + ("…" if len(iss) > 140 else "")) if iss else ""
-        why_cell = (
-            f'<span class="lead-why">{why_s}</span>' if why_s else ""
-        )
-        co_extra = f'<span class="lead-blurb">{blurb}</span>' if blurb else ""
+        why_cell = f'<span class="lead-why">{why_s}</span>' if why_s else ""
+        web_u = (p.get("issuer_website") or "").strip()
+        co_link = web_u if web_u.startswith(("http://", "https://")) else ""
+        if not co_link and p.get("primary_doc_url"):
+            co_link = (p.get("primary_doc_url") or "").strip()
+        co_href = html.escape(co_link)
+        if co_link:
+            co_cell = (
+                f'<a href="{co_href}" target="_blank" rel="noopener" '
+                f'onclick="event.stopPropagation()" title="Issuer site or filing">'
+                f"{company}</a>"
+            )
+        else:
+            co_cell = company
         rows.append(
             "<tr class='desk-row' tabindex='0' role='link' "
             f"data-href='{href}' title='Open profile'>"
             f"<td class='profile-name'><a href='{href}'>{nm}</a>{why_cell}</td>"
             f"<td>{title}</td>"
-            f"<td>{company}{co_extra}</td>"
+            f"<td class='co-name'>{co_cell}</td>"
             f"<td><span class='badge'>{badge}</span></td>"
             f"<td class='num strong'>{_money(p['total'])}</td>"
-            f"<td class='num'>{sum_cell}</td>"
-            f"<td class='num'>{_money(p.get('total_hwm'))}</td>"
             f"<td class='num'>{_money(p.get('equity_hwm'))}</td>"
-            f"<td class='num strong'>{_money(p.get('signal_hwm'))}</td>"
             f"<td class='num dim'>{html.escape(str(p['headline_year'] or '—'))}</td>"
             f"<td>{html.escape(p['filing_date'] or '')}</td>"
             f"<td class='cik'>{html.escape(str(p['cik'] or ''))}</td>"
@@ -510,18 +551,15 @@ def _desk_table(profiles: list[dict], stats: dict) -> str:
     return f"""
   <h2>Lead desk</h2>
   <p class="meta">
-    <b>Person-first pre-IPO leads.</b> The desk defaults to <b>S-1 / S-1/A NEO rows only</b> and people whose <b>best single fiscal year</b> hits at least <b>~$300k</b> on <b>max(SCT total, stock+options)</b> — so high cash <i>or</i> high grants count (not equity-only). Many RSS filings have <b>no parseable summary comp table</b> in your DB yet, so the desk can look sparse until parsing improves. Tune <code>WEALTH_LEADS_LEAD_DESK_MIN_SIGNAL_USD</code> (0 = all S-1 NEO profiles) and <code>WEALTH_LEADS_LEAD_DESK_S1_ONLY</code>. Legacy: <code>WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD</code> = equity-only bar.
+    <b>Person-first pre-IPO leads.</b> Desk = <b>S-1 / S-1/A NEO</b> plus a configurable pay bar (<code>WEALTH_LEADS_LEAD_DESK_MIN_SIGNAL_USD</code>). <b>Company</b> links to the issuer website when we parsed one from the filing, otherwise the primary EDGAR doc. <b>Latest total</b> = headline fiscal year SCT; <b>Max equity</b> = best single-year stock+options. Full numbers + company HQ on the profile page.
     <b>Click the row</b> for detail. Raw rows: <b>Source rows</b> below.
   </p>
   <div class="table-wrap">
   <table id="desk">
     <thead>
       <tr>
-        <th>Person</th><th>Role</th><th>Company</th><th>Signal</th>
-        <th>Latest total</th><th title='Sum of SCT Total per FY in DB'>Σ SCT</th>
-        <th title='Largest single-FY SCT Total'>Max FY total</th>
-        <th title='Max single-FY stock + options'>Max equity</th>
-        <th title='max(Max FY total, Max equity) — desk gate'>Signal</th>
+        <th>Person</th><th>Role</th><th>Company</th><th>Form</th>
+        <th>Latest total</th><th title='Max single-FY stock + options (SCT)'>Max equity</th>
         <th>FY</th><th>Filing</th><th>CIK</th><th>Quick source</th>
       </tr>
     </thead>
@@ -700,6 +738,7 @@ def _shared_css() -> str:
     td.cik { color: #6b7785; font-size: 0.72rem; }
     td.profile-name { font-weight: 600; color: #e8ecf0; }
     td.profile-name a { color: #e8ecf0; }
+    td.co-name a { color: #8ecfff; font-weight: 600; }
     tr.desk-row { cursor: pointer; }
     tr.desk-row:focus { outline: 1px solid #5eb3e0; outline-offset: -1px; }
     tr.desk-row:hover td { background: #121820; }
@@ -707,10 +746,11 @@ def _shared_css() -> str:
       display: inline-block; font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.04em;
       padding: 0.15rem 0.4rem; border-radius: 4px; background: #1a2634; color: #8b96a3; border: 1px solid #2a3340;
     }
-    .lead-why, .lead-blurb {
+    .lead-why {
       display: block; font-size: 0.68rem; color: #7a8796; line-height: 1.35;
       margin-top: 0.28rem; max-width: 24rem; font-weight: 400;
     }
+    span.dim, .dim { color: #6b7785; font-weight: 400; }
     a { color: #5eb3e0; text-decoration: none; }
     a:hover { text-decoration: underline; }
     tr.hidden { display: none; }
@@ -722,8 +762,7 @@ def _shared_css() -> str:
     table.inner-comp tbody tr:hover td { background: #0f141a; }
     .hero { display: grid; gap: 0.75rem; margin-bottom: 1rem; }
     @media (min-width: 640px) { .hero { grid-template-columns: 1fr 1fr; } }
-    @media (min-width: 900px) { .hero { grid-template-columns: repeat(3, 1fr); } }
-    @media (min-width: 1200px) { .hero { grid-template-columns: repeat(6, 1fr); } }
+    @media (min-width: 900px) { .hero { grid-template-columns: repeat(4, 1fr); } }
     .stat-card {
       background: #121820; border: 1px solid #2a3340; border-radius: 6px; padding: 0.65rem 0.75rem;
     }
@@ -908,6 +947,66 @@ def _page_lead(
         {"cik": str(p.get("cik") or ""), "name": p.get("display_name") or ""}
     )
 
+    oa = p.get("officer_age")
+    if oa is not None:
+        try:
+            age_line = (
+                f"<strong>Age:</strong> {int(oa)} "
+                f"<span class='dim'>(executive officers table in the filing)</span><br/>"
+            )
+        except (TypeError, ValueError):
+            age_line = (
+                "<strong>Age:</strong> <span class='dim'>—</span><br/>"
+            )
+    else:
+        age_line = (
+            "<strong>Age:</strong> <span class='dim'>Not in DB yet — "
+            "run <code>backfill-comp --force</code> to re-parse officer rosters.</span><br/>"
+        )
+    hq_txt = (p.get("issuer_headquarters") or "").strip()
+    hq_esc = html.escape(hq_txt) if hq_txt else ""
+    web_raw = (p.get("issuer_website") or "").strip()
+    web_esc = html.escape(web_raw)
+    web_link = (
+        f'<a href="{web_esc}" target="_blank" rel="noopener">Company website</a>'
+        if web_raw.startswith(("http://", "https://"))
+        else ""
+    )
+    summ_body = (p.get("issuer_summary") or "").strip()
+    summ_html = (
+        html.escape(summ_body)
+        if summ_body
+        else "<span class='dim'>Not extracted — run <code>sync</code> or <code>backfill-comp --force</code>.</span>"
+    )
+
+    person_card = f"""
+    <div class="card">
+      <h2 style="margin-top:0">Person</h2>
+      <p class="meta" style="margin-bottom:0">
+        {age_line}
+        <strong>Location (proxy):</strong> {hq_esc or "—"}
+        <span class='dim'> — usually registrant HQ from the filing, not a home address.</span>
+      </p>
+    </div>"""
+
+    company_bits = [
+        f"<strong>{html.escape(p.get('company_name') or '—')}</strong>",
+        f"CIK <span class='cik'>{html.escape(str(p.get('cik') or ''))}</span>",
+    ]
+    if web_link:
+        company_bits.append(web_link)
+    if hq_esc:
+        company_bits.append(f"HQ: {hq_esc}")
+    company_intro = " · ".join(company_bits)
+
+    company_card = f"""
+    <div class="card">
+      <h2 style="margin-top:0">Company</h2>
+      <p class="meta" style="margin-bottom:0">{company_intro}</p>
+      <p class="meta" style="margin-top:0.65rem; margin-bottom:0"><strong>From the filing (summary)</strong></p>
+      <p class="meta" style="margin-top:0.35rem; margin-bottom:0">{summ_html}</p>
+    </div>"""
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -928,23 +1027,16 @@ def _page_lead(
     <a href="{html.escape(p.get('index_url') or '')}" target="_blank" rel="noopener">EDGAR index</a>
     {(' · ' + doc_link) if doc_link else ''}
   </p>
+  {person_card}
+  {company_card}
   <div class="card">
     <h2 style="margin-top:0">Why this lead</h2>
     <p class="meta" style="margin-bottom:0">{html.escape(p.get('why_surfaced') or '—')}</p>
   </div>
-  <div class="card">
-    <h2 style="margin-top:0">Issuer snapshot (from filing text)</h2>
-    <p class="meta" style="margin-bottom:0">{
-      html.escape((p.get('issuer_summary') or '').strip()) if (p.get('issuer_summary') or '').strip()
-      else 'Not extracted yet — run <code>python -m wealth_leads sync</code> or <code>backfill-comp --force</code> to refresh HTML parsing.'
-    }</p>
-  </div>
   <div class="hero">
     <div class="stat-card"><div class="lbl">Latest FY total</div><div class="val">{_money(p.get('total'))}</div></div>
-    <div class="stat-card"><div class="lbl">Σ SCT (years in DB)</div><div class="val">{sum_disp}</div></div>
-    <div class="stat-card"><div class="lbl">Max FY total (any year)</div><div class="val">{_money(p.get('total_hwm'))}</div></div>
     <div class="stat-card"><div class="lbl">Max equity (any FY)</div><div class="val">{_money(p.get('equity_hwm'))}</div></div>
-    <div class="stat-card"><div class="lbl">Desk signal</div><div class="val">{_money(p.get('signal_hwm'))}</div></div>
+    <div class="stat-card"><div class="lbl">Σ SCT (years in DB)</div><div class="val">{sum_disp}</div></div>
     <div class="stat-card"><div class="lbl">Fiscal years w/ comp</div><div class="val">{int(p.get('years_count') or 0)}</div></div>
   </div>
   <h2>Headline compensation (latest fiscal year)</h2>

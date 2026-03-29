@@ -7,7 +7,7 @@ from bs4 import BeautifulSoup
 
 from wealth_leads.officers import _clean_name, _clean_title
 
-OfficerRow = tuple[str, str, str]  # name, title, source
+OfficerRow = tuple[str, str, str, Optional[int]]  # name, title, source, age (management tables)
 
 
 def _strip_honorific(raw: str) -> str:
@@ -91,21 +91,25 @@ def _is_executive_roster_table(headers: list[str]) -> bool:
     return False
 
 
-def _column_map(headers: list[str]) -> tuple[Optional[int], Optional[int]]:
-    name_i = pos_i = None
+def _column_map(headers: list[str]) -> tuple[Optional[int], Optional[int], Optional[int]]:
+    name_i = pos_i = age_i = None
     for i, h in enumerate(headers):
-        hl = h.lower()
+        hl = h.lower().strip()
         if name_i is None and "name" in hl and "company" not in hl:
             name_i = i
         if pos_i is None and any(
             x in hl for x in ("position", "title", "officer", "office held", "principal")
         ):
             pos_i = i
+        if age_i is None and (
+            hl == "age" or (hl.startswith("age") and len(hl) <= 6)
+        ):
+            age_i = i
     if name_i is None and headers:
         name_i = 0
     if pos_i is None and len(headers) >= 2:
         pos_i = len(headers) - 1
-    return name_i, pos_i
+    return name_i, pos_i, age_i
 
 
 def _row_cell_texts(tr) -> list[str]:
@@ -121,6 +125,13 @@ def extract_executive_officers_from_filing_html(html: str) -> list[OfficerRow]:
     soup = BeautifulSoup(html, "html.parser")
     found: list[OfficerRow] = []
 
+    def _parse_age(cell: str) -> Optional[int]:
+        s = (cell or "").strip()
+        if not s.isdigit():
+            return None
+        n = int(s)
+        return n if 18 <= n <= 100 else None
+
     for table in soup.find_all("table"):
         rows = table.find_all("tr")
         if len(rows) < 2:
@@ -134,7 +145,7 @@ def extract_executive_officers_from_filing_html(html: str) -> list[OfficerRow]:
                 break
         if header_idx is None:
             continue
-        name_i, pos_i = _column_map(headers)
+        name_i, pos_i, age_i = _column_map(headers)
         if name_i is None or pos_i is None:
             continue
         for tr in rows[header_idx + 1 :]:
@@ -149,14 +160,21 @@ def extract_executive_officers_from_filing_html(html: str) -> list[OfficerRow]:
             title = _clean_title_table(title_raw)
             if not name or not title:
                 continue
-            found.append((name, title, "management_section"))
+            age_val: Optional[int] = None
+            if age_i is not None and len(cells) > age_i:
+                age_val = _parse_age(cells[age_i])
+            found.append((name, title, "management_section", age_val))
 
     by_name: dict[str, OfficerRow] = {}
-    for name, title, src in found:
+    for name, title, src, age in found:
         key = " ".join(name.lower().split())
         prev = by_name.get(key)
-        if prev is None or len(title) > len(prev[1]):
-            by_name[key] = (name, title, src)
+        if prev is None:
+            by_name[key] = (name, title, src, age)
+        elif len(title) > len(prev[1]):
+            by_name[key] = (name, title, src, age)
+        elif len(title) == len(prev[1]) and age is not None and prev[3] is None:
+            by_name[key] = (name, title, src, age)
     return sorted(by_name.values(), key=lambda x: (x[1], x[0]))
 
 
@@ -168,22 +186,26 @@ def merge_officer_rows(*groups: list[OfficerRow]) -> list[OfficerRow]:
     One row per person; prefer management_section over signature_table; then longer title.
     Pass arguments with management list first, then signature list.
     """
-    by_key: dict[str, tuple[str, str, str, int]] = {}
+    by_key: dict[str, tuple[str, str, str, int, Optional[int]]] = {}
     for group in groups:
-        for name, title, src in group:
+        for row in group:
+            name, title, src = row[0], row[1], row[2]
+            age = row[3] if len(row) > 3 else None
             key = " ".join(name.lower().replace(".", " ").split())
             rank = _SOURCE_RANK.get(src, 5)
             prev = by_key.get(key)
             if prev is None:
-                by_key[key] = (name, title, src, rank)
+                by_key[key] = (name, title, src, rank, age)
                 continue
-            _, ptitle, _, prank = prev
+            _, ptitle, _, prank, page = prev
             if rank < prank:
-                by_key[key] = (name, title, src, rank)
+                by_key[key] = (name, title, src, rank, age if age is not None else page)
             elif rank == prank and len(title) > len(ptitle):
-                by_key[key] = (name, title, src, rank)
+                by_key[key] = (name, title, src, rank, age if age is not None else page)
+            elif rank == prank and len(title) == len(ptitle) and age is not None and page is None:
+                by_key[key] = (name, title, src, rank, age)
     return sorted(
-        [(n, t, s) for n, t, s, _ in by_key.values()],
+        [(n, t, s, ag) for n, t, s, _, ag in by_key.values()],
         key=lambda x: (x[1], x[0]),
     )
 
@@ -221,6 +243,58 @@ def extract_issuer_summary_from_filing_html(
         chunk = re.sub(r"\s+", " ", m.group(1)).strip()
         if len(chunk) >= 40:
             return (chunk[:max_chars] + "…") if len(chunk) > max_chars else chunk
+    return ""
+
+
+_URL_IN_TEXT = re.compile(r"https?://[^\s\]\)\"'<>]+", re.I)
+_WWW_RE = re.compile(r"\bwww\.[a-z0-9][a-z0-9.-]+\.[a-z]{2,}\b", re.I)
+_HQ_RE = re.compile(
+    r"(?:principal executive offices?|headquarters|headquartered|corporate offices?)\s*"
+    r"[^\n.]{0,50}?(?:are|is|located|in|at)\s+([^\n.]{3,160})",
+    re.I,
+)
+
+
+def extract_issuer_website_from_filing_html(html: str) -> str:
+    """First issuer-style external URL from filing body (heuristic; no outbound fetch)."""
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n", strip=True)
+    skip = ("sec.gov", "edgar", "nasdaq.com", "nyse.com", "github.com")
+    for m in _URL_IN_TEXT.finditer(text):
+        u = m.group(0).rstrip(".,);")
+        if any(s in u.lower() for s in skip):
+            continue
+        start = max(0, m.start() - 120)
+        window = text[start : m.start()].lower()
+        if any(
+            k in window
+            for k in (
+                "website",
+                "internet",
+                "located at",
+                "visit us",
+                "visit our",
+                "please visit",
+                "see our",
+            )
+        ):
+            return u[:300]
+    m2 = _WWW_RE.search(text)
+    if m2:
+        start = max(0, m2.start() - 80)
+        if "website" in text[start : m2.start()].lower():
+            return "https://" + m2.group(0).lower().rstrip(".,)")
+    return ""
+
+
+def extract_issuer_headquarters_from_filing_html(html: str) -> str:
+    """Short HQ / principal office line from filing text (heuristic)."""
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n", strip=True)
+    m = _HQ_RE.search(text)
+    if m:
+        chunk = re.sub(r"\s+", " ", m.group(1)).strip()
+        return chunk[:220] if len(chunk) >= 4 else ""
     return ""
 
 
