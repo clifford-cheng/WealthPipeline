@@ -2,6 +2,8 @@
 REM If double-clicking opens this file in Cursor/VS Code instead of running:
 REM   use "Start Dashboard (use if .bat opens in editor).vbs" in this folder,
 REM   or right-click this file -> Open with -> Command Prompt (always).
+REM To avoid running this every time: run "Add WealthPipeline to Windows Startup.bat"
+REM then bookmark http://127.0.0.1:8765 or double-click "Open WealthPipeline Dashboard.url".
 setlocal EnableExtensions
 title WealthPipeline Dashboard
 
