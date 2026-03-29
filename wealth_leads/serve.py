@@ -36,6 +36,7 @@ def _leads_table(rows: list[sqlite3.Row]) -> str:
         doc = html.escape(r["primary_doc_url"] or "")
         idx_link = f'<a href="{idx}" target="_blank" rel="noopener">index</a>' if idx else "—"
         doc_link = f'<a href="{doc}" target="_blank" rel="noopener">S-1</a>' if doc else "—"
+        cy = r["comp_year"]
         body_rows.append(
             "<tr>"
             f"<td>{company}</td>"
@@ -43,6 +44,12 @@ def _leads_table(rows: list[sqlite3.Row]) -> str:
             f"<td>{html.escape(str(r['filing_date'] or ''))}</td>"
             f"<td>{html.escape(name)}</td>"
             f"<td>{title}</td>"
+            f"<td class='num'>{html.escape(str(cy)) if cy is not None else '—'}</td>"
+            f"<td class='num'>{_money(r['comp_salary'])}</td>"
+            f"<td class='num'>{_money(r['comp_bonus'])}</td>"
+            f"<td class='num'>{_money(r['comp_stock'])}</td>"
+            f"<td class='num'>{_money(r['comp_total'])}</td>"
+            f"<td class='num'>{_money(r['comp_equity'])}</td>"
             f"<td>{idx_link}</td>"
             f"<td>{doc_link}</td>"
             "</tr>"
@@ -50,14 +57,18 @@ def _leads_table(rows: list[sqlite3.Row]) -> str:
     inner = (
         "".join(body_rows)
         if body_rows
-        else '<tr><td colspan="7">No rows yet. Run sync first.</td></tr>'
+        else '<tr><td colspan="13">No rows yet. Run sync first.</td></tr>'
     )
     return f"""
-  <h2>Officers &amp; directors (signature block)</h2>
+  <h2>Lead factory — officers + NEO pay (matched by name)</h2>
+  <p class="meta">Comp columns come from the S-1 <b>summary compensation</b> table when the person’s name matches (latest fiscal year). Directors-only rows often have no NEO comp in the filing.</p>
   <table>
     <thead>
       <tr>
-        <th>Company</th><th title="Central Index Key — SEC's company ID number, not dollars">CIK</th><th>Filed</th><th>Name</th><th>Title</th><th>EDGAR</th><th>Doc</th>
+        <th>Company</th><th title="SEC company ID, not dollars">CIK</th><th>Filed</th><th>Name</th><th>Title</th>
+        <th title="Fiscal year of comp row">Comp yr</th>
+        <th>Salary</th><th>Bonus</th><th>Stock</th><th>Total</th><th>Equity sum</th>
+        <th>EDGAR</th><th>Doc</th>
       </tr>
     </thead>
     <tbody>{inner}</tbody>
@@ -116,10 +127,9 @@ def _comp_missing_callout(stats: dict) -> str:
         return ""
     return """<div class="callout">
     <strong>No compensation rows in your database yet.</strong>
-    Pay data is <em>not</em> the CIK column (that is only SEC’s company ID).
-    Salary / stock / bonus appear in the second table — <b>NEO summary compensation</b> — after you backfill:
-    <code>python -m wealth_leads sync --force</code>
-    (or run <code>Sync SEC data then open dashboard.bat</code>), then refresh this page. Many small S-1s also have no parseable summary table.
+    CIK is only SEC’s company ID (not pay). Run <code>python -m wealth_leads sync</code> (sync now auto-runs a comp backfill), or
+    <code>python -m wealth_leads backfill-comp</code>, then refresh. Use <code>backfill-comp --force</code> after upgrading the parser.
+    Many small S-1s have no parseable summary table.
   </div>"""
 
 
@@ -213,15 +223,44 @@ def _load_page_data() -> tuple[list[sqlite3.Row], list[sqlite3.Row], dict]:
     mtime = datetime.fromtimestamp(Path(dbp).stat().st_mtime).strftime("%Y-%m-%d %H:%M")
 
     with connect() as conn:
-        cur = conn.execute(
-            """
-            SELECT f.company_name, f.cik, f.filing_date, o.name, o.title,
-                   f.index_url, f.primary_doc_url
-            FROM filings f
-            LEFT JOIN officers o ON o.filing_id = f.id
-            ORDER BY f.filing_date DESC, f.company_name, o.name
-            """
-        )
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='neo_compensation'"
+        ).fetchone():
+            cur = conn.execute(
+                """
+                SELECT f.company_name, f.cik, f.filing_date, o.name, o.title,
+                       f.index_url, f.primary_doc_url,
+                       NULL AS comp_year, NULL AS comp_salary, NULL AS comp_bonus,
+                       NULL AS comp_stock, NULL AS comp_total, NULL AS comp_equity
+                FROM filings f
+                LEFT JOIN officers o ON o.filing_id = f.id
+                ORDER BY f.filing_date DESC, f.company_name, o.name
+                """
+            )
+        else:
+            cur = conn.execute(
+                """
+                SELECT f.company_name, f.cik, f.filing_date, o.name, o.title,
+                       f.index_url, f.primary_doc_url,
+                       nc.fiscal_year AS comp_year,
+                       nc.salary AS comp_salary,
+                       nc.bonus AS comp_bonus,
+                       nc.stock_awards AS comp_stock,
+                       nc.total AS comp_total,
+                       nc.equity_comp_disclosed AS comp_equity
+                FROM filings f
+                LEFT JOIN officers o ON o.filing_id = f.id
+                LEFT JOIN neo_compensation nc ON nc.id = (
+                    SELECT c.id FROM neo_compensation c
+                    WHERE c.filing_id = f.id
+                    AND o.name IS NOT NULL
+                    AND lower(trim(replace(replace(c.person_name, '.', ''), '  ', ' '))) =
+                        lower(trim(replace(replace(o.name, '.', ''), '  ', ' ')))
+                    ORDER BY c.fiscal_year DESC LIMIT 1
+                )
+                ORDER BY f.filing_date DESC, f.company_name, o.name
+                """
+            )
         leads = list(cur.fetchall())
 
         comp: list[sqlite3.Row] = []

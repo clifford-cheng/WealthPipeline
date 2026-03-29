@@ -43,6 +43,7 @@ def _is_dash_cell(s: str) -> bool:
 def _clean_person_name(raw: str) -> str:
     s = re.sub(r"<[^>]+>", "", raw)
     s = s.replace("\xa0", " ")
+    s = re.sub(r"[\u200b\u200c\u200d\ufeff]+", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     s = re.sub(r"\s*\(\d+\)(?:\s*,\s*\(\d+\))*", "", s)
     s = re.sub(r"\s*\(\d+\)\s*$", "", s)
@@ -56,6 +57,17 @@ def _row_cells(tr) -> list[str]:
 def _looks_like_summary_comp_header(tr) -> bool:
     blob = " ".join(_row_cells(tr)).lower()
     if "name" not in blob:
+        return False
+    if "year" not in blob and "fiscal" not in blob:
+        return False
+    if "salary" not in blob and "stock" not in blob:
+        return False
+    return True
+
+
+def _looks_like_summary_comp_two_row(tr0, tr1) -> bool:
+    blob = " ".join(_row_cells(tr0) + _row_cells(tr1)).lower()
+    if "name" not in blob and "principal" not in blob:
         return False
     if "year" not in blob and "fiscal" not in blob:
         return False
@@ -182,14 +194,19 @@ def _parse_comp_table(table) -> list[NeoCompRow]:
     rows = table.find_all("tr")
     if len(rows) < 3:
         return []
-    if not _looks_like_summary_comp_header(rows[0]):
+    skip_header = 1
+    if _looks_like_summary_comp_header(rows[0]):
+        skip_header = 1
+    elif len(rows) >= 3 and _looks_like_summary_comp_two_row(rows[0], rows[1]):
+        skip_header = 2
+    else:
         return []
 
     out: list[NeoCompRow] = []
     last_name: Optional[str] = None
     role_for_last: Optional[str] = None
 
-    for tr in rows[1:]:
+    for tr in rows[skip_header:]:
         raw = _row_cells(tr)
         if not any(x.strip() for x in raw):
             continue
@@ -280,6 +297,8 @@ def extract_neo_compensation_from_s1(html: str) -> list[NeoCompRow]:
     for table in soup.find_all("table"):
         rows = _parse_comp_table(table)
         for r in rows:
+            if not r.person_name.strip():
+                continue
             key = (r.person_name.lower(), r.fiscal_year)
             if key in seen:
                 continue

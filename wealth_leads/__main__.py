@@ -17,7 +17,7 @@ from wealth_leads.db import (
     update_primary_doc_url,
 )
 from wealth_leads.officers import extract_officers_from_s1_html
-from wealth_leads.parse_index import primary_s1_document_url
+from wealth_leads.parse_index import canonical_filing_document_url, primary_s1_document_url
 from wealth_leads.rss import fetch_current_s1_feed
 from wealth_leads.sec_client import get_text
 
@@ -56,6 +56,71 @@ def _neo_comp_db_rows(
     return out
 
 
+def backfill_compensation(
+    *, force: bool = False, conn=None, session=None
+) -> int:
+    """
+    Fetch S-1 HTML again and parse NEO tables for filings missing comp rows
+    (or all filings if force=True). Returns count of filings processed.
+    """
+    if session is None:
+        session = requests.Session()
+
+    n_done = 0
+
+    def _work(c) -> None:
+        nonlocal n_done
+        q = """
+            SELECT f.id, f.primary_doc_url, f.company_name, f.accession
+            FROM filings f
+            WHERE f.primary_doc_url IS NOT NULL
+            """
+        if not force:
+            q += """
+            AND (SELECT COUNT(*) FROM neo_compensation WHERE filing_id = f.id) = 0
+            """
+        q += " ORDER BY f.filing_date DESC"
+        rows = c.execute(q).fetchall()
+        if not rows:
+            print("Backfill compensation: nothing to do.", file=sys.stderr)
+            return
+        print(
+            f"Backfill compensation: processing {len(rows)} filing(s)…",
+            file=sys.stderr,
+        )
+        for r in rows:
+            fid = int(r["id"])
+            raw_u = r["primary_doc_url"]
+            url = canonical_filing_document_url(raw_u)
+            if url and url != raw_u:
+                update_primary_doc_url(c, fid, url)
+            if not url:
+                continue
+            try:
+                s1_html = get_text(url, session=session)
+            except Exception as e:
+                print(
+                    f"[warn] backfill comp fetch {r['company_name']}: {e}",
+                    file=sys.stderr,
+                )
+                continue
+            comps = extract_neo_compensation_from_s1(s1_html)
+            replace_neo_compensation(c, fid, _neo_comp_db_rows(fid, comps))
+            n_done += 1
+            if not comps:
+                print(
+                    f"[warn] backfill comp: no table parsed for {r['company_name']}",
+                    file=sys.stderr,
+                )
+
+    if conn is not None:
+        _work(conn)
+    else:
+        with connect() as c:
+            _work(c)
+    return n_done
+
+
 def sync(*, force_reprocess: bool = False) -> None:
     session = requests.Session()
     feed = fetch_current_s1_feed(session)
@@ -86,6 +151,10 @@ def sync(*, force_reprocess: bool = False) -> None:
             row = get_filing_by_accession(conn, item.accession)
             assert row is not None
             doc_url = row["primary_doc_url"]
+            if doc_url:
+                doc_url = canonical_filing_document_url(doc_url)
+                if doc_url != row["primary_doc_url"]:
+                    update_primary_doc_url(conn, filing_id, doc_url)
             if not doc_url:
                 idx_html = get_text(item.index_url, session=session)
                 doc_url = primary_s1_document_url(idx_html)
@@ -126,6 +195,7 @@ def sync(*, force_reprocess: bool = False) -> None:
                     f"({item.accession})",
                     file=sys.stderr,
                 )
+        backfill_compensation(conn=conn, session=session, force=False)
         print(f"Processed {len(feed)} RSS entries (see {database_path()}).")
 
 
@@ -140,20 +210,52 @@ def export_leads_csv() -> None:
             "filing_date",
             "officer_name",
             "officer_title",
+            "comp_fiscal_year",
+            "comp_salary",
+            "comp_bonus",
+            "comp_stock_awards",
+            "comp_total",
+            "comp_equity_disclosed",
             "index_url",
             "primary_doc_url",
         ]
     )
     with connect() as conn:
-        cur = conn.execute(
-            """
-            SELECT f.company_name, f.cik, f.accession, f.form_type, f.filing_date,
-                   o.name, o.title, f.index_url, f.primary_doc_url
-            FROM officers o
-            JOIN filings f ON f.id = o.filing_id
-            ORDER BY f.filing_date DESC, f.company_name, o.name
-            """
-        )
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='neo_compensation'"
+        ).fetchone():
+            cur = conn.execute(
+                """
+                SELECT f.company_name, f.cik, f.accession, f.form_type, f.filing_date,
+                       o.name, o.title,
+                       NULL, NULL, NULL, NULL, NULL, NULL,
+                       f.index_url, f.primary_doc_url
+                FROM officers o
+                JOIN filings f ON f.id = o.filing_id
+                ORDER BY f.filing_date DESC, f.company_name, o.name
+                """
+            )
+        else:
+            cur = conn.execute(
+                """
+                SELECT f.company_name, f.cik, f.accession, f.form_type, f.filing_date,
+                       o.name, o.title,
+                       nc.fiscal_year, nc.salary, nc.bonus, nc.stock_awards,
+                       nc.total, nc.equity_comp_disclosed,
+                       f.index_url, f.primary_doc_url
+                FROM officers o
+                JOIN filings f ON f.id = o.filing_id
+                LEFT JOIN neo_compensation nc ON nc.id = (
+                    SELECT c.id FROM neo_compensation c
+                    WHERE c.filing_id = f.id
+                    AND o.name IS NOT NULL
+                    AND lower(trim(replace(replace(c.person_name, '.', ''), '  ', ' '))) =
+                        lower(trim(replace(replace(o.name, '.', ''), '  ', ' ')))
+                    ORDER BY c.fiscal_year DESC LIMIT 1
+                )
+                ORDER BY f.filing_date DESC, f.company_name, o.name
+                """
+            )
         for r in cur:
             writer.writerow(list(r))
 
@@ -219,6 +321,15 @@ def main() -> None:
         "export-comp",
         help="Print NEO compensation rows (from S-1 tables) as CSV",
     )
+    bf = sub.add_parser(
+        "backfill-comp",
+        help="Re-fetch S-1 HTML and parse comp for filings missing NEO rows",
+    )
+    bf.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-parse compensation for every filing (slow; use after parser upgrades)",
+    )
 
     srv = sub.add_parser(
         "serve",
@@ -247,6 +358,9 @@ def main() -> None:
         export_leads_csv()
     elif args.cmd == "export-comp":
         export_compensation_csv()
+    elif args.cmd == "backfill-comp":
+        n = backfill_compensation(force=bool(getattr(args, "force", False)))
+        print(f"Backfill finished ({n} filings processed).")
     elif args.cmd == "serve":
         from wealth_leads.serve import run_localhost
 

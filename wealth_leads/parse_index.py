@@ -1,10 +1,29 @@
 from __future__ import annotations
 
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
 from bs4 import BeautifulSoup
 
 from wealth_leads.sec_client import absolute_url
+
+
+def canonical_filing_document_url(url: Optional[str]) -> Optional[str]:
+    """
+    SEC often links the primary S-1 through the inline-XBRL viewer (/ix?doc=/Archives/...).
+    That HTML is not the same as the raw registration statement; compensation tables
+    parse reliably from the direct /Archives/.../file.htm URL.
+    """
+    if not url:
+        return url
+    u = absolute_url(url)
+    if "/ix?doc=" not in u and "/ixviewer" not in u.lower():
+        return u
+    q = parse_qs(urlparse(u).query)
+    doc = (q.get("doc") or [""])[0]
+    if doc.startswith("/Archives/"):
+        return absolute_url(doc)
+    return u
 
 
 def primary_s1_document_url(index_html: str) -> Optional[str]:
@@ -30,5 +49,5 @@ def primary_s1_document_url(index_html: str) -> Optional[str]:
             link = cells[2].find("a", href=True)
             if not link:
                 continue
-            return absolute_url(link["href"])
+            return canonical_filing_document_url(link["href"])
     return None
