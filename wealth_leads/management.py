@@ -108,6 +108,11 @@ def _column_map(headers: list[str]) -> tuple[Optional[int], Optional[int]]:
     return name_i, pos_i
 
 
+def _row_cell_texts(tr) -> list[str]:
+    """SEC tables often use <th> for the name column; many insert blank <td> spacers between columns."""
+    return [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+
+
 def extract_executive_officers_from_filing_html(html: str) -> list[OfficerRow]:
     """
     Parse 'Executive Officers and Directors' style tables (Name / Age / Position, etc.).
@@ -120,15 +125,20 @@ def extract_executive_officers_from_filing_html(html: str) -> list[OfficerRow]:
         rows = table.find_all("tr")
         if len(rows) < 2:
             continue
-        hdr_cells = rows[0].find_all(["th", "td"])
-        headers = [c.get_text(" ", strip=True) for c in hdr_cells]
-        if not headers or not _is_executive_roster_table(headers):
+        header_idx: Optional[int] = None
+        headers: list[str] = []
+        for hi in range(min(20, len(rows))):
+            headers = _row_cell_texts(rows[hi])
+            if headers and _is_executive_roster_table(headers):
+                header_idx = hi
+                break
+        if header_idx is None:
             continue
         name_i, pos_i = _column_map(headers)
         if name_i is None or pos_i is None:
             continue
-        for tr in rows[1:]:
-            cells = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+        for tr in rows[header_idx + 1 :]:
+            cells = _row_cell_texts(tr)
             if len(cells) <= max(name_i, pos_i):
                 continue
             name_raw = cells[name_i]
