@@ -1,4 +1,7 @@
 @echo off
+REM If double-clicking opens this file in Cursor/VS Code instead of running:
+REM   use "Start Dashboard (use if .bat opens in editor).vbs" in this folder,
+REM   or right-click this file -> Open with -> Command Prompt (always).
 setlocal EnableExtensions
 title WealthPipeline Dashboard
 
