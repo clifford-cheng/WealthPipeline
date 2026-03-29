@@ -10,6 +10,7 @@ from typing import Optional
 import threading
 import webbrowser
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlencode
 from wsgiref.simple_server import make_server
 
 from wealth_leads.config import database_path
@@ -76,7 +77,7 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
             off_titles[k] = o["title"] or ""
 
     profiles: list[dict] = []
-    for _key, items in groups.items():
+    for key, items in groups.items():
         items.sort(
             key=lambda r: (
                 r["fiscal_year"] or 0,
@@ -151,6 +152,7 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
 
         profiles.append(
             {
+                "norm_name": key[1],
                 "display_name": head["person_name"] or "—",
                 "company_name": head["company_name"] or "",
                 "cik": head["cik"] or "",
@@ -213,73 +215,103 @@ def _profile_breakdown_table(p: dict) -> str:
     return "".join(parts)
 
 
-def _profiles_table(profiles: list[dict]) -> str:
+def _profile_lead_url(p: dict) -> str:
+    return "/lead?" + urlencode(
+        {"cik": str(p.get("cik") or ""), "name": p.get("display_name") or ""}
+    )
+
+
+def _find_profile(profiles: list[dict], cik: str, norm_name: str) -> Optional[dict]:
+    cik_s = str(cik or "").strip()
+    for p in profiles:
+        if str(p.get("cik") or "").strip() == cik_s and p.get("norm_name") == norm_name:
+            return p
+    return None
+
+
+def _filings_for_profile(conn: sqlite3.Connection, cik: str, norm_name: str) -> list[dict]:
+    cur = conn.execute(
+        """
+        SELECT f.id, f.accession, f.form_type, f.filing_date, f.index_url, f.primary_doc_url,
+               c.person_name
+        FROM filings f
+        JOIN neo_compensation c ON c.filing_id = f.id
+        WHERE f.cik = ?
+        ORDER BY f.filing_date DESC, f.id DESC
+        """,
+        (str(cik or "").strip(),),
+    )
+    seen: set[int] = set()
+    out: list[dict] = []
+    for r in cur.fetchall():
+        if _norm_person_name(r["person_name"] or "") != norm_name:
+            continue
+        fid = int(r["id"])
+        if fid in seen:
+            continue
+        seen.add(fid)
+        out.append(
+            {
+                "id": fid,
+                "accession": r["accession"] or "",
+                "form_type": r["form_type"] or "",
+                "filing_date": r["filing_date"] or "",
+                "index_url": r["index_url"] or "",
+                "primary_doc_url": r["primary_doc_url"] or "",
+            }
+        )
+    return out
+
+
+def _desk_table(profiles: list[dict]) -> str:
     if not profiles:
         return """
-  <h2>Lead profiles</h2>
-  <p class="meta">No NEO compensation rows yet — profiles are built from summary comp tables. Run sync / backfill-comp, or expand <b>Source rows</b> below for officer-level detail.</p>"""
+  <h2>Lead desk</h2>
+  <p class="meta">No NEO compensation rows yet — run sync / backfill-comp, or open <b>Source rows</b> below.</p>"""
 
-    colspan = 16
-    body_chunks: list[str] = []
+    rows: list[str] = []
     for p in profiles:
         company = html.escape(p["company_name"] or "")
-        nm = html.escape(p["display_name"] or "")
         title = html.escape(p["title"] or "—")
-        idx = html.escape(p["index_url"] or "")
-        doc = html.escape(p["primary_doc_url"] or "")
-        idx_link = f'<a href="{idx}" target="_blank" rel="noopener">EDGAR</a>' if idx else "—"
-        doc_link = f'<a href="{doc}" target="_blank" rel="noopener">S-1</a>' if doc else "—"
-        tl = html.escape(p["comp_timeline"] or "—")
+        href = html.escape(_profile_lead_url(p))
+        nm = html.escape(p["display_name"] or "")
         sum_sct = p.get("sum_year_totals")
         sum_cell = _money(sum_sct) if sum_sct is not None else "—"
-        body_chunks.append("<tbody class='pgrp'>")
-        body_chunks.append(
-            "<tr class='profile-main' tabindex='0' aria-expanded='false' title='Click to expand year-by-year breakdown'>"
-            f"<td class='profile-name'>{nm}</td>"
+        idx = html.escape(p["index_url"] or "")
+        doc = html.escape(p["primary_doc_url"] or "")
+        idx_l = f'<a href="{idx}" target="_blank" rel="noopener" onclick="event.stopPropagation()">EDGAR</a>' if idx else "—"
+        doc_l = f'<a href="{doc}" target="_blank" rel="noopener" onclick="event.stopPropagation()">S-1</a>' if doc else "—"
+        rows.append(
+            "<tr class='desk-row' tabindex='0' role='link' "
+            f"data-href='{href}' title='Open profile'>"
+            f"<td class='profile-name'><a href='{href}'>{nm}</a></td>"
             f"<td>{title}</td>"
             f"<td>{company}</td>"
-            f"<td class='cik'>{html.escape(str(p['cik'] or ''))}</td>"
-            f"<td class='num'>{html.escape(str(p['headline_year'] or '—'))}</td>"
+            f"<td><span class='badge'>S-1 · NEO</span></td>"
             f"<td class='num strong'>{_money(p['total'])}</td>"
-            f"<td class='num' title='Sum of SCT “Total” for each fiscal year in your DB (not lifetime cash)'>{sum_cell}</td>"
-            f"<td class='num'>{_money(p['salary'])}</td>"
-            f"<td class='num'>{_money(p['bonus'])}</td>"
-            f"<td class='num'>{_money(p['stock_awards'])}</td>"
-            f"<td class='num'>{_money(p.get('option_awards'))}</td>"
-            f"<td class='num'>{_money(p['equity'])}</td>"
-            f"<td class='num dim'>{p['years_count']}</td>"
-            f"<td class='timeline'>{tl}</td>"
-            f"<td>{idx_link} {doc_link}</td>"
+            f"<td class='num'>{sum_cell}</td>"
+            f"<td class='num dim'>{html.escape(str(p['headline_year'] or '—'))}</td>"
             f"<td>{html.escape(p['filing_date'] or '')}</td>"
+            f"<td class='cik'>{html.escape(str(p['cik'] or ''))}</td>"
+            f"<td>{idx_l} · {doc_l}</td>"
             "</tr>"
         )
-        body_chunks.append(
-            f"<tr class='profile-detail'><td colspan='{colspan}'>"
-            f"{_profile_breakdown_table(p)}"
-            "</td></tr>"
-        )
-        body_chunks.append("</tbody>")
-    inner = "".join(body_chunks)
+    inner = "".join(rows)
     return f"""
-  <h2>Lead profiles</h2>
+  <h2>Lead desk</h2>
   <p class="meta">
-    <b>One row per executive</b> (person + company via CIK). <b>Latest total</b> is the most recent fiscal year in your snapshot.
-    <b>Σ SCT</b> sums each year’s disclosed <b>Total</b> column across years you have — useful for trajectory, but it is <b>not</b> “lifetime take-home” (equity is grant-value, years can overlap concepts).
-    <b>Click a row</b> (not the links) for the full column breakdown by year. Audit trail: <b>Source rows</b> below.
+    <b>Timing-first.</b> Each row is one executive at one issuer (CIK). <b>Latest total</b> = most recent fiscal year in your DB; <b>Σ SCT</b> = sum of disclosed yearly totals (not take-home cash).
+    <b>Click the name or row</b> for compensation detail, filings, and (soon) management bio. Raw rows: <b>Source rows</b> below.
   </p>
   <div class="table-wrap">
-  <table id="profiles">
+  <table id="desk">
     <thead>
       <tr>
-        <th>Name</th><th>Role</th><th>Company</th><th>CIK</th><th>FY</th>
-        <th>Latest total</th>
-        <th title='Sum of Summary Compensation Table Total for each FY in DB'>Σ SCT</th>
-        <th>Salary</th><th>Bonus</th><th>Stock</th><th>Opt</th><th>Equity</th>
-        <th title='Fiscal years with comp'>Yrs</th>
-        <th>Timeline</th><th>Source</th><th>Filing</th>
+        <th>Person</th><th>Role</th><th>Company</th><th>Signal</th>
+        <th>Latest total</th><th title='Sum of SCT Total per FY in DB'>Σ SCT</th><th>FY</th><th>Filing</th><th>CIK</th><th>Quick source</th>
       </tr>
     </thead>
-    {inner}
+    <tbody id="desk-body">{inner}</tbody>
   </table>
   </div>"""
 
@@ -363,7 +395,7 @@ def _comp_table(rows: list[sqlite3.Row]) -> str:
     )
     return f"""
   <h2>NEO summary compensation lines (raw)</h2>
-  <p class="meta">Every parsed comp row — profiles above roll these up by person + company (CIK).</p>
+  <p class="meta">Every parsed comp row — the desk rolls these up by person + company (CIK).</p>
   <table>
     <thead>
       <tr>
@@ -406,7 +438,88 @@ def _stats_banner(stats: dict, rendered_at: str) -> str:
   </div>"""
 
 
-def _page(
+def _shared_css() -> str:
+    return """
+    :root {
+      font-family: system-ui, sans-serif;
+      background: #0a0e12;
+      color: #d8dee4;
+    }
+    body { margin: 0; padding: 1rem 1.1rem; max-width: 900px; margin-inline: auto; }
+    body.wide { max-width: 1480px; }
+    nav.top { margin-bottom: 1rem; font-size: 0.84rem; }
+    nav.top a { color: #5eb3e0; }
+    h1 { font-size: 1.2rem; font-weight: 600; margin-top: 0; letter-spacing: -0.02em; }
+    h1 span.tag { font-weight: 400; color: #6b7785; font-size: 0.88rem; }
+    h2 { font-size: 0.95rem; margin-top: 1.5rem; margin-bottom: 0.45rem; color: #a8b0ba; font-weight: 600; }
+    h2:first-of-type { margin-top: 0.5rem; }
+    p.meta { color: #6b7785; font-size: 0.8125rem; margin-bottom: 0.85rem; line-height: 1.5; }
+    .banner { background: #121820; border: 1px solid #2a3340; border-radius: 6px; padding: 0.75rem 0.9rem; margin-bottom: 0.85rem; }
+    .banner.warn { border-color: #8b4040; background: #1f1515; }
+    .banner .stats { display: flex; flex-wrap: wrap; gap: 0.5rem 1.1rem; margin: 0.4rem 0; font-size: 0.84rem; }
+    .banner .stats span { color: #6b7785; }
+    .banner .stats span::before { content: "· "; color: #2a3340; }
+    .banner .stats span:first-child::before { content: ""; }
+    .banner .sub { display: block; font-size: 0.75rem; color: #6b7785; margin-top: 0.3rem; }
+    .callout { background: #1a1810; border: 1px solid #5a4f2a; border-radius: 6px; padding: 0.75rem 0.9rem; margin: 0 0 0.85rem 0; font-size: 0.8125rem; line-height: 1.45; }
+    .callout strong { color: #d4b84a; }
+    label.sr { display: block; font-size: 0.75rem; color: #6b7785; margin-bottom: 0.3rem; }
+    #filter {
+      width: 100%; max-width: 22rem; padding: 0.4rem 0.55rem; border-radius: 4px;
+      border: 1px solid #2a3340; background: #0a0e12; color: #d8dee4; font: inherit;
+    }
+    .table-wrap { overflow-x: auto; border: 1px solid #2a3340; border-radius: 6px; margin-bottom: 0.5rem; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.75rem;
+      font-variant-numeric: tabular-nums;
+    }
+    #desk .num, .detail-page .num { font-family: ui-monospace, "Cascadia Mono", "Consolas", monospace; }
+    th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid #222a33; vertical-align: top; }
+    thead th { background: #0f1318; color: #8b96a3; font-weight: 600; position: sticky; top: 0; z-index: 1; }
+    th { color: #8b96a3; font-weight: 600; }
+    td.num { text-align: right; }
+    td.strong { font-weight: 600; color: #e8ecf0; }
+    td.dim { color: #6b7785; text-align: center; }
+    td.cik { color: #6b7785; font-size: 0.72rem; }
+    td.profile-name { font-weight: 600; color: #e8ecf0; }
+    td.profile-name a { color: #e8ecf0; }
+    tr.desk-row { cursor: pointer; }
+    tr.desk-row:focus { outline: 1px solid #5eb3e0; outline-offset: -1px; }
+    tr.desk-row:hover td { background: #121820; }
+    span.badge {
+      display: inline-block; font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.04em;
+      padding: 0.15rem 0.4rem; border-radius: 4px; background: #1a2634; color: #8b96a3; border: 1px solid #2a3340;
+    }
+    a { color: #5eb3e0; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    tr.hidden { display: none; }
+    code { font-size: 0.85em; }
+    p.bd-note { margin: 0 0 0.5rem 0; font-size: 0.72rem; color: #6b7785; line-height: 1.45; max-width: 52rem; }
+    table.inner-comp { width: 100%; font-size: 0.72rem; margin: 0; border-collapse: collapse; }
+    table.inner-comp th { background: #0c1016; color: #8b96a3; font-weight: 600; padding: 0.35rem 0.45rem; border-bottom: 1px solid #2a3340; }
+    table.inner-comp td { padding: 0.35rem 0.45rem; border-bottom: 1px solid #1a2228; }
+    table.inner-comp tbody tr:hover td { background: #0f141a; }
+    .hero { display: grid; gap: 0.75rem; margin-bottom: 1rem; }
+    @media (min-width: 640px) { .hero { grid-template-columns: 1fr 1fr 1fr; } }
+    .stat-card {
+      background: #121820; border: 1px solid #2a3340; border-radius: 6px; padding: 0.65rem 0.75rem;
+    }
+    .stat-card .lbl { font-size: 0.7rem; color: #6b7785; text-transform: uppercase; letter-spacing: 0.03em; }
+    .stat-card .val { font-size: 1.05rem; font-weight: 600; margin-top: 0.2rem; font-family: ui-monospace, monospace; }
+    .card {
+      background: #121820; border: 1px solid #2a3340; border-radius: 6px; padding: 0.85rem 1rem; margin-bottom: 1rem;
+    }
+    .card.bio-placeholder { border-style: dashed; border-color: #3d4a5c; }
+    table.comp-head td { font-size: 0.8rem; }
+    details.audit { margin-top: 1.5rem; border-top: 1px solid #2a3340; padding-top: 1rem; }
+    details.audit summary {
+      cursor: pointer; color: #8b96a3; font-size: 0.8125rem; user-select: none;
+      margin-bottom: 0.75rem;
+    }
+    details.audit summary:hover { color: #c5ccd4; }
+    """
+
+
+def _page_desk(
     profiles: list[dict],
     leads: list[sqlite3.Row],
     comp: list[sqlite3.Row],
@@ -414,89 +527,26 @@ def _page(
     rendered_at: str,
 ) -> str:
     banner = _stats_banner(stats, rendered_at)
+    css = _shared_css()
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>WealthPipeline — lead desk</title>
-  <style>
-    :root {{
-      font-family: system-ui, sans-serif;
-      background: #0a0e12;
-      color: #d8dee4;
-    }}
-    body {{ margin: 0; padding: 1rem 1.1rem; max-width: 1480px; margin-inline: auto; }}
-    h1 {{ font-size: 1.2rem; font-weight: 600; margin-top: 0; letter-spacing: -0.02em; }}
-    h1 span.tag {{ font-weight: 400; color: #6b7785; font-size: 0.88rem; }}
-    h2 {{ font-size: 0.95rem; margin-top: 1.75rem; margin-bottom: 0.45rem; color: #a8b0ba; font-weight: 600; }}
-    p.meta {{ color: #6b7785; font-size: 0.8125rem; margin-bottom: 0.85rem; line-height: 1.5; }}
-    .banner {{ background: #121820; border: 1px solid #2a3340; border-radius: 6px; padding: 0.75rem 0.9rem; margin-bottom: 0.85rem; }}
-    .banner.warn {{ border-color: #8b4040; background: #1f1515; }}
-    .banner .stats {{ display: flex; flex-wrap: wrap; gap: 0.5rem 1.1rem; margin: 0.4rem 0; font-size: 0.84rem; }}
-    .banner .stats span {{ color: #6b7785; }}
-    .banner .stats span::before {{ content: "· "; color: #2a3340; }}
-    .banner .stats span:first-child::before {{ content: ""; }}
-    .banner .sub {{ display: block; font-size: 0.75rem; color: #6b7785; margin-top: 0.3rem; }}
-    .callout {{ background: #1a1810; border: 1px solid #5a4f2a; border-radius: 6px; padding: 0.75rem 0.9rem; margin: 0 0 0.85rem 0; font-size: 0.8125rem; line-height: 1.45; }}
-    .callout strong {{ color: #d4b84a; }}
-    label.sr {{ display: block; font-size: 0.75rem; color: #6b7785; margin-bottom: 0.3rem; }}
-    #filter {{
-      width: 100%; max-width: 22rem; padding: 0.4rem 0.55rem; border-radius: 4px;
-      border: 1px solid #2a3340; background: #0a0e12; color: #d8dee4; font: inherit;
-    }}
-    .table-wrap {{ overflow-x: auto; border: 1px solid #2a3340; border-radius: 6px; margin-bottom: 0.5rem; }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 0.75rem;
-      font-variant-numeric: tabular-nums;
-      font-family: ui-sans-serif, system-ui, sans-serif;
-    }}
-    #profiles td, #profiles th {{ font-family: "Segoe UI", system-ui, sans-serif; }}
-    #profiles .num {{ font-family: ui-monospace, "Cascadia Mono", "Consolas", monospace; }}
-    th, td {{ text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid #222a33; vertical-align: top; }}
-    thead th {{ background: #0f1318; color: #8b96a3; font-weight: 600; position: sticky; top: 0; z-index: 1; }}
-    th {{ color: #8b96a3; font-weight: 600; }}
-    td.num {{ text-align: right; }}
-    td.strong {{ font-weight: 600; color: #e8ecf0; }}
-    td.dim {{ color: #6b7785; text-align: center; }}
-    td.cik {{ color: #6b7785; }}
-    td.profile-name {{ font-weight: 600; color: #e8ecf0; }}
-    td.timeline {{ font-size: 0.7rem; color: #8b96a3; max-width: 14rem; line-height: 1.35; }}
-    a {{ color: #5eb3e0; text-decoration: none; }}
-    a:hover {{ text-decoration: underline; }}
-    tbody tr:hover td {{ background: #121820; }}
-    tr.hidden {{ display: none; }}
-    code {{ font-size: 0.85em; }}
-    tr.profile-main {{ cursor: pointer; }}
-    tr.profile-main:focus {{ outline: 1px solid #5eb3e0; outline-offset: -1px; }}
-    tr.profile-main td.profile-name::after {{ content: " ▾"; color: #5c6570; font-size: 0.65rem; }}
-    tr.profile-main.open td.profile-name::after {{ content: " ▴"; }}
-    tr.profile-detail {{ display: none; }}
-    tr.profile-detail.open {{ display: table-row; }}
-    tr.profile-detail td {{ background: #070a0d; padding: 0.55rem 0.5rem 0.8rem; border-bottom: 1px solid #2a3340; vertical-align: top; }}
-    p.bd-note {{ margin: 0 0 0.5rem 0; font-size: 0.72rem; color: #6b7785; line-height: 1.45; max-width: 52rem; }}
-    table.inner-comp {{ width: 100%; font-size: 0.72rem; margin: 0; border-collapse: collapse; }}
-    table.inner-comp th {{ background: #0c1016; color: #8b96a3; font-weight: 600; padding: 0.35rem 0.45rem; border-bottom: 1px solid #2a3340; }}
-    table.inner-comp td {{ padding: 0.35rem 0.45rem; border-bottom: 1px solid #1a2228; }}
-    table.inner-comp tbody tr:hover td {{ background: #0f141a; }}
-    details.audit {{ margin-top: 1.5rem; border-top: 1px solid #2a3340; padding-top: 1rem; }}
-    details.audit summary {{
-      cursor: pointer; color: #8b96a3; font-size: 0.8125rem; user-select: none;
-      margin-bottom: 0.75rem;
-    }}
-    details.audit summary:hover {{ color: #c5ccd4; }}
-  </style>
+  <style>{css}</style>
 </head>
-<body>
+<body class="wide">
   <h1>WealthPipeline <span class="tag">lead desk · local</span></h1>
   <p class="meta">
-    Aggregated <b>executive profiles</b> from your S-1 pipeline (disclosed NEO pay + filing context). Not a public terminal — data updates when you run <code>sync</code>.
+    SEC filing–native lead timing. Data updates when you run <code>sync</code>.
     Database: <code>{html.escape(str(Path(database_path()).resolve()))}</code>
   </p>
   {banner}
   {_comp_missing_callout(stats)}
-  <label class="sr" for="filter">Filter all tables</label>
+  <label class="sr" for="filter">Filter desk + audit tables</label>
   <input type="search" id="filter" placeholder="Company, person, or CIK…" autocomplete="off"/>
-  {_profiles_table(profiles)}
+  {_desk_table(profiles)}
   <details class="audit">
     <summary>Source rows (audit) — officers × filings and raw NEO comp lines</summary>
     {_leads_table(leads)}
@@ -508,10 +558,9 @@ def _page(
     if (input) {{
       input.addEventListener('input', function() {{
         var q = (input.value || '').toLowerCase().trim();
-        document.querySelectorAll('#profiles tbody.pgrp').forEach(function(tb) {{
-          if (!q) {{ tb.style.display = ''; return; }}
-          var t = (tb.textContent || '').toLowerCase();
-          tb.style.display = t.indexOf(q) >= 0 ? '' : 'none';
+        document.querySelectorAll('#desk-body tr').forEach(function(tr) {{
+          if (!q) {{ tr.classList.remove('hidden'); return; }}
+          tr.classList.toggle('hidden', (tr.textContent || '').toLowerCase().indexOf(q) < 0);
         }});
         document.querySelectorAll('details.audit table tbody tr').forEach(function(tr) {{
           if (!q) {{ tr.classList.remove('hidden'); return; }}
@@ -519,32 +568,153 @@ def _page(
         }});
       }});
     }}
-    var prof = document.getElementById('profiles');
-    if (prof) {{
-      function toggleDetail(trMain) {{
-        var d = trMain.nextElementSibling;
-        if (!d || !d.classList.contains('profile-detail')) return;
-        var on = !d.classList.contains('open');
-        d.classList.toggle('open', on);
-        trMain.classList.toggle('open', on);
-        trMain.setAttribute('aria-expanded', on ? 'true' : 'false');
+    document.querySelectorAll('#desk-body tr.desk-row').forEach(function(tr) {{
+      function go() {{
+        var h = tr.getAttribute('data-href');
+        if (h) window.location = h;
       }}
-      prof.addEventListener('click', function(e) {{
+      tr.addEventListener('click', function(e) {{
         if (e.target.closest('a')) return;
-        var tr = e.target.closest('tr.profile-main');
-        if (!tr || !prof.contains(tr)) return;
-        toggleDetail(tr);
+        go();
       }});
-      prof.addEventListener('keydown', function(e) {{
-        if (e.key !== 'Enter' && e.key !== ' ') return;
-        var tr = e.target.closest('tr.profile-main');
-        if (!tr || document.activeElement !== tr) return;
-        e.preventDefault();
-        toggleDetail(tr);
+      tr.addEventListener('keydown', function(e) {{
+        if (e.key === 'Enter') {{ e.preventDefault(); go(); }}
       }});
-    }}
+    }});
   }})();
   </script>
+</body>
+</html>"""
+
+
+def _filings_table_html(filings: list[dict]) -> str:
+    if not filings:
+        return "<p class='meta'>No linked filings in DB for this person.</p>"
+    rows = []
+    for f in filings:
+        idx = html.escape(f.get("index_url") or "")
+        doc = html.escape(f.get("primary_doc_url") or "")
+        idx_l = f'<a href="{idx}" target="_blank" rel="noopener">EDGAR</a>' if idx else "—"
+        doc_l = f'<a href="{doc}" target="_blank" rel="noopener">Doc</a>' if doc else "—"
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(f.get('filing_date') or '')}</td>"
+            f"<td>{html.escape(f.get('form_type') or '')}</td>"
+            f"<td class='cik'>{html.escape(f.get('accession') or '')}</td>"
+            f"<td>{idx_l} · {doc_l}</td>"
+            "</tr>"
+        )
+    return (
+        "<div class='table-wrap'><table><thead><tr>"
+        "<th>Filing date</th><th>Form</th><th>Accession</th><th>Links</th>"
+        "</tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table></div>"
+    )
+
+
+def _page_lead(
+    profile: Optional[dict],
+    filings: list[dict],
+    *,
+    query_cik: str,
+    query_name: str,
+    stats: dict,
+    rendered_at: str,
+) -> str:
+    css = _shared_css()
+    banner = _stats_banner(stats, rendered_at)
+    if profile is None:
+        q = html.escape(urlencode({"cik": query_cik, "name": query_name}))
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Lead not found — WealthPipeline</title>
+  <style>{css}</style>
+</head>
+<body>
+  <nav class="top"><a href="/">← Lead desk</a></nav>
+  <h1>Profile not found</h1>
+  <p class="meta">No matching executive + CIK in your snapshot. Check <code>cik</code> and <code>name</code> query params, run <code>sync</code>, or return to the desk.</p>
+  <p class="meta">Requested: CIK <code>{html.escape(query_cik)}</code>, name <code>{html.escape(query_name)}</code></p>
+  <p class="meta"><a href="/?">Back to lead desk</a> · <a href="/lead?{q}">Retry this URL</a></p>
+  {banner}
+</body>
+</html>"""
+
+    p = profile
+    sum_sct = p.get("sum_year_totals")
+    sum_disp = _money(sum_sct) if sum_sct is not None else "—"
+    doc_u = p.get("primary_doc_url") or ""
+    doc_e = html.escape(doc_u)
+    doc_link = f'<a href="{doc_e}" target="_blank" rel="noopener">Open primary S-1 doc</a>' if doc_u else ""
+
+    headline_tbl = f"""
+    <div class="table-wrap"><table class="comp-head">
+      <thead><tr>
+        <th>FY</th><th>Salary</th><th>Bonus</th><th>Stock</th><th>Options</th><th>Equity Σ</th><th>Total</th>
+      </tr></thead>
+      <tbody><tr>
+        <td class="num">{html.escape(str(p.get('headline_year') or '—'))}</td>
+        <td class="num">{_money(p.get('salary'))}</td>
+        <td class="num">{_money(p.get('bonus'))}</td>
+        <td class="num">{_money(p.get('stock_awards'))}</td>
+        <td class="num">{_money(p.get('option_awards'))}</td>
+        <td class="num">{_money(p.get('equity'))}</td>
+        <td class="num strong">{_money(p.get('total'))}</td>
+      </tr></tbody>
+    </table></div>"""
+
+    bio_block = f"""
+    <div class="card bio-placeholder">
+      <h2 style="margin-top:0">Management biography</h2>
+      <p class="meta" style="margin-bottom:0">
+        <strong>Coming next.</strong> We have not extracted the narrative bio from the registration statement yet.
+        For now, {doc_link or "open the issuer’s S-1 from EDGAR"} and search for <b>Management</b>,
+        <b>Directors and Executive Officers</b>, or the person’s name. That section usually lists prior roles, education, and board seats — ideal for professional rapport cues.
+      </p>
+    </div>"""
+
+    bookmark_q = urlencode(
+        {"cik": str(p.get("cik") or ""), "name": p.get("display_name") or ""}
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>{html.escape(p.get('display_name') or 'Lead')} — WealthPipeline</title>
+  <style>{css}</style>
+</head>
+<body class="detail-page">
+  <nav class="top"><a href="/">← Lead desk</a></nav>
+  <h1>{html.escape(p.get('display_name') or '—')}</h1>
+  <p class="meta">
+    <b>{html.escape(p.get('title') or '—')}</b> · {html.escape(p.get('company_name') or '')}
+    · CIK <span class="cik">{html.escape(str(p.get('cik') or ''))}</span>
+  </p>
+  <p class="meta">
+    Latest filing in profile: <b>{html.escape(p.get('filing_date') or '—')}</b>.
+    <a href="{html.escape(p.get('index_url') or '')}" target="_blank" rel="noopener">EDGAR index</a>
+    {(' · ' + doc_link) if doc_link else ''}
+  </p>
+  <div class="hero">
+    <div class="stat-card"><div class="lbl">Latest FY total</div><div class="val">{_money(p.get('total'))}</div></div>
+    <div class="stat-card"><div class="lbl">Σ SCT (years in DB)</div><div class="val">{sum_disp}</div></div>
+    <div class="stat-card"><div class="lbl">Fiscal years w/ comp</div><div class="val">{int(p.get('years_count') or 0)}</div></div>
+  </div>
+  <h2>Headline compensation (latest fiscal year)</h2>
+  {headline_tbl}
+  <h2>Year-by-year (summary comp table)</h2>
+  {_profile_breakdown_table(p)}
+  {bio_block}
+  <h2>Filings (this person + issuer)</h2>
+  {_filings_table_html(filings)}
+  <p class="meta">Bookmark this page: <code>/lead?{html.escape(bookmark_q)}</code></p>
+  {banner}
 </body>
 </html>"""
 
@@ -640,13 +810,37 @@ def _load_page_data() -> tuple[list[dict], list[sqlite3.Row], list[sqlite3.Row],
 
 
 def _app(environ, start_response):
-    if environ.get("PATH_INFO", "/") not in ("/", ""):
+    path = environ.get("PATH_INFO") or "/"
+    if path != "/" and path.rstrip("/") != "/lead":
         start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
         return [b"Not Found"]
 
     profiles, leads, comp, stats = _load_page_data()
     rendered_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    body = _page(profiles, leads, comp, stats, rendered_at).encode("utf-8")
+
+    if path.rstrip("/") == "/lead":
+        qs = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
+        cik = (qs.get("cik") or [""])[0].strip()
+        name_raw = (qs.get("name") or [""])[0]
+        name_decoded = unquote(name_raw) if name_raw else ""
+        norm = _norm_person_name(name_decoded)
+        prof = _find_profile(profiles, cik, norm) if not stats.get("missing_db") else None
+        filings: list[dict] = []
+        if prof is not None and not stats.get("missing_db"):
+            with connect() as conn:
+                filings = _filings_for_profile(conn, cik, norm)
+        html_out = _page_lead(
+            prof,
+            filings,
+            query_cik=cik,
+            query_name=name_decoded,
+            stats=stats,
+            rendered_at=rendered_at,
+        )
+    else:
+        html_out = _page_desk(profiles, leads, comp, stats, rendered_at)
+
+    body = html_out.encode("utf-8")
     start_response(
         "200 OK",
         [
