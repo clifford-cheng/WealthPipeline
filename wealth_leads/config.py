@@ -54,7 +54,8 @@ def user_agent() -> str:
 
 
 def rss_count() -> int:
-    return int(os.environ.get("SEC_RSS_COUNT", "100"))
+    # EDGAR "current" Atom: higher count ≈ longer recent window (often months of S-1s).
+    return int(os.environ.get("SEC_RSS_COUNT", "350"))
 
 
 def database_path() -> str:
@@ -94,3 +95,111 @@ def lead_desk_min_signal_usd() -> float:
 def lead_desk_equity_only_min_usd() -> bool:
     """True if legacy WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD is set (equity-only comparison)."""
     return "WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD" in os.environ
+
+
+def app_secret_key() -> str:
+    """Required for signed session cookies on serve-app (min 32 chars recommended)."""
+    return os.environ.get("WEALTH_LEADS_APP_SECRET", "").strip()
+
+
+def app_allow_public_signup() -> bool:
+    """After the first user exists, allow /register only if this is true (or zero users)."""
+    v = os.environ.get("WEALTH_LEADS_ALLOW_SIGNUP", "0").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def app_listen_port() -> int:
+    return int(os.environ.get("WEALTH_LEADS_APP_PORT", "8080"))
+
+
+def require_app_auth() -> bool:
+    """
+    When False (default), the app opens straight to the data UI with no login.
+    Set WEALTH_LEADS_REQUIRE_AUTH=1 to restore sign-in, My leads, and watchlist writes.
+    """
+    return os.environ.get("WEALTH_LEADS_REQUIRE_AUTH", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def auto_sync_interval_hours() -> float:
+    """
+    While the advisor server process is running, run SEC sync on this interval (hours).
+    Set WEALTH_LEADS_AUTO_SYNC_HOURS=0 to disable. Default 24.
+    """
+    if "WEALTH_LEADS_AUTO_SYNC_HOURS" not in os.environ:
+        return 24.0
+    raw = os.environ["WEALTH_LEADS_AUTO_SYNC_HOURS"].strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 24.0
+
+
+def auto_sync_first_delay_sec() -> float:
+    """Wait this long after server start before the first automatic sync."""
+    raw = os.environ.get("WEALTH_LEADS_AUTO_SYNC_FIRST_DELAY_SEC", "300").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 300.0
+
+
+def openai_api_key() -> str:
+    """OpenAI API key for S-1 LLM extraction (enrich-s1-ai)."""
+    return (
+        os.environ.get("WEALTH_LEADS_OPENAI_API_KEY", "").strip()
+        or os.environ.get("OPENAI_API_KEY", "").strip()
+    )
+
+
+def openai_s1_model() -> str:
+    """Chat model for `enrich-s1-ai` when provider is OpenAI (JSON mode)."""
+    m = os.environ.get("WEALTH_LEADS_S1_AI_MODEL", "gpt-4o-mini").strip()
+    return m or "gpt-4o-mini"
+
+
+def s1_ai_provider() -> str:
+    """
+    LLM backend for enrich-s1-ai: openai (default), anthropic, or ollama (local).
+    """
+    v = os.environ.get("WEALTH_LEADS_S1_AI_PROVIDER", "openai").strip().lower()
+    if v in ("anthropic", "claude"):
+        return "anthropic"
+    if v in ("ollama", "local"):
+        return "ollama"
+    return "openai"
+
+
+def ollama_base_url() -> str:
+    """Ollama HTTP API base (no trailing slash)."""
+    u = os.environ.get("WEALTH_LEADS_OLLAMA_URL", "http://127.0.0.1:11434").strip()
+    return u.rstrip("/") or "http://127.0.0.1:11434"
+
+
+def ollama_s1_model() -> str:
+    """Model name as shown by `ollama list` (e.g. llama3.1, qwen2.5:14b)."""
+    m = os.environ.get("WEALTH_LEADS_OLLAMA_MODEL", "llama3.1").strip()
+    return m or "llama3.1"
+
+
+def anthropic_api_key() -> str:
+    """Anthropic API key for enrich-s1-ai when provider is anthropic."""
+    return (
+        os.environ.get("WEALTH_LEADS_ANTHROPIC_API_KEY", "").strip()
+        or os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    )
+
+
+def anthropic_s1_model() -> str:
+    """Claude model id for enrich-s1-ai (see Anthropic docs for current ids)."""
+    m = os.environ.get(
+        "WEALTH_LEADS_ANTHROPIC_S1_MODEL",
+        "claude-3-5-haiku-20241022",
+    ).strip()
+    return m or "claude-3-5-haiku-20241022"

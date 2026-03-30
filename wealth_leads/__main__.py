@@ -19,6 +19,9 @@ from wealth_leads.db import (
     insert_filing,
     replace_neo_compensation,
     replace_officers,
+    replace_person_management_narratives,
+    update_filing_director_term_summary,
+    update_filing_issuer_industry,
     update_filing_issuer_meta,
     update_filing_issuer_summary,
     update_primary_doc_url,
@@ -26,9 +29,14 @@ from wealth_leads.db import (
 from wealth_leads.management import (
     extract_executive_officers_from_filing_html,
     extract_issuer_headquarters_from_filing_html,
+    extract_issuer_industry_from_filing_html,
     extract_issuer_summary_from_filing_html,
     extract_issuer_website_from_filing_html,
     merge_officer_rows,
+)
+from wealth_leads.management_bios import (
+    extract_director_term_summary_from_filing_html,
+    extract_management_biographies_from_filing_html,
 )
 from wealth_leads.officers import extract_officers_from_s1_html
 from wealth_leads.parse_index import (
@@ -122,19 +130,25 @@ def backfill_compensation(
                     file=sys.stderr,
                 )
                 continue
-            if force:
-                mgmt_b = extract_executive_officers_from_filing_html(s1_html)
-                sig_b = extract_officers_from_s1_html(s1_html)
-                replace_officers(c, fid, merge_officer_rows(mgmt_b, sig_b))
-                summ_b = extract_issuer_summary_from_filing_html(s1_html)
-                if summ_b:
-                    update_filing_issuer_summary(c, fid, summ_b)
+            mgmt_b = extract_executive_officers_from_filing_html(s1_html)
+            sig_b = extract_officers_from_s1_html(s1_html)
+            replace_officers(c, fid, merge_officer_rows(mgmt_b, sig_b))
+            summ_b = extract_issuer_summary_from_filing_html(s1_html)
+            if summ_b:
+                update_filing_issuer_summary(c, fid, summ_b)
             web_b = extract_issuer_website_from_filing_html(s1_html)
             hq_b = extract_issuer_headquarters_from_filing_html(s1_html)
             if web_b or hq_b:
                 update_filing_issuer_meta(
                     c, fid, website=web_b, headquarters=hq_b
                 )
+            ind_b = extract_issuer_industry_from_filing_html(s1_html)
+            if ind_b:
+                update_filing_issuer_industry(c, fid, ind_b)
+            bios_b = extract_management_biographies_from_filing_html(s1_html)
+            replace_person_management_narratives(c, fid, bios_b)
+            dts_b = extract_director_term_summary_from_filing_html(s1_html)
+            update_filing_director_term_summary(c, fid, dts_b)
             comps = extract_neo_compensation_from_s1(s1_html)
             replace_neo_compensation(c, fid, _neo_comp_db_rows(fid, comps))
             n_done += 1
@@ -231,6 +245,15 @@ def _process_rss_item(
             conn, filing_id, website=web, headquarters=hq
         )
 
+    ind = extract_issuer_industry_from_filing_html(body_html)
+    if ind:
+        update_filing_issuer_industry(conn, filing_id, ind)
+
+    bios = extract_management_biographies_from_filing_html(body_html)
+    replace_person_management_narratives(conn, filing_id, bios)
+    dts = extract_director_term_summary_from_filing_html(body_html)
+    update_filing_director_term_summary(conn, filing_id, dts)
+
     comps = extract_neo_compensation_from_s1(body_html)
     replace_neo_compensation(conn, filing_id, _neo_comp_db_rows(filing_id, comps))
     if not comps:
@@ -286,6 +309,17 @@ def sync(*, force_reprocess: bool = False) -> None:
             f"Processed {len(feed)} RSS entr(y/ies) across {len(forms)} form type(s) "
             f"(see {database_path()})."
         )
+
+    from wealth_leads.profile_build import rebuild_lead_profiles
+
+    with connect() as conn:
+        pr_stats = rebuild_lead_profiles(conn)
+    print(
+        f"Lead profiles materialized: {pr_stats['rows_written']} rows "
+        f"(from {pr_stats['profiles_source']} NEO profiles; "
+        f"{pr_stats.get('cross_company_flagged', 0)} cross-CIK name hints).",
+        file=sys.stderr,
+    )
 
 
 def export_leads_csv() -> None:
@@ -438,18 +472,122 @@ def main() -> None:
 
     srv = sub.add_parser(
         "serve",
-        help="Open dashboard at http://127.0.0.1:8765 (run sync first for data)",
+        help="Legacy lead desk at http://127.0.0.1:8766 (/, /lead, /finder; no /login — use serve_advisor for that)",
     )
     srv.add_argument(
         "--port",
         type=int,
         default=None,
-        help="Port (default 8765 or WEALTH_LEADS_PORT)",
+        help="Port (default 8766 or WEALTH_LEADS_PORT; advisor app uses 8765 by default)",
     )
     srv.add_argument(
         "--no-browser",
         action="store_true",
         help="Do not open a browser tab automatically",
+    )
+    srv.add_argument(
+        "--no-live",
+        action="store_true",
+        help="Disable automatic browser refresh when the DB file or server process changes",
+    )
+    srv.add_argument(
+        "--reload",
+        action="store_true",
+        help="Dev: restart the server when wealth_leads Python files change (implies live refresh)",
+    )
+
+    app_cmd = sub.add_parser(
+        "serve-app",
+        help="Advisor app: sign-in, watchlist, CSV export (set WEALTH_LEADS_APP_SECRET)",
+    )
+    app_cmd.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind address (default 127.0.0.1; use 0.0.0.0 behind TLS reverse proxy)",
+    )
+    app_cmd.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Port (default WEALTH_LEADS_APP_PORT or 8080)",
+    )
+
+    alloc_cmd = sub.add_parser(
+        "allocate",
+        help="Run monthly territory lead assignment (writes lead_assignments; use after sync)",
+    )
+    alloc_cmd.add_argument(
+        "--cycle",
+        type=str,
+        default=None,
+        help="Billing cycle YYYYMM (default: current UTC month)",
+    )
+    alloc_cmd.add_argument(
+        "--no-replace",
+        action="store_true",
+        help="Do not delete existing assignments for the cycle before assigning",
+    )
+
+    sub.add_parser(
+        "rebuild-profiles",
+        help="Refresh lead_profile table from NEO data (no SEC fetch; run after sync or parser changes)",
+    )
+
+    ai = sub.add_parser(
+        "enrich-s1-ai",
+        help="Use an LLM (OpenAI, Anthropic, or local Ollama) to extract NEO comp, officers, bios, HQ from S-1 HTML (not on sync)",
+    )
+    ai.add_argument(
+        "--limit",
+        type=int,
+        default=5,
+        help="Max filings to process (default 5; cap 200)",
+    )
+    ai.add_argument(
+        "--filing-id",
+        type=int,
+        default=None,
+        help="Process a single filing by database id",
+    )
+    ai.add_argument(
+        "--only-missing-neo",
+        action="store_true",
+        help="Only filings with zero neo_compensation rows",
+    )
+    ai.add_argument(
+        "--replace-neo",
+        action="store_true",
+        help="Overwrite existing NEO rows when AI returns data (default: fill only if empty)",
+    )
+    ai.add_argument(
+        "--replace-officers",
+        action="store_true",
+        help="Overwrite officers even if already parsed",
+    )
+    ai.add_argument(
+        "--replace-bios",
+        action="store_true",
+        help="Overwrite management bios even if already stored",
+    )
+    ai.add_argument(
+        "--allow-empty-neo",
+        action="store_true",
+        help="With --replace-neo: clear NEO table if AI returns no comp rows (dangerous)",
+    )
+    ai.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fetch HTML and report size; do not call the LLM",
+    )
+    ai.epilog = (
+        "Provider: WEALTH_LEADS_S1_AI_PROVIDER=openai (default), anthropic, or ollama (alias: local). "
+        "OpenAI: OPENAI_API_KEY; WEALTH_LEADS_S1_AI_MODEL (default gpt-4o-mini). "
+        "Anthropic: ANTHROPIC_API_KEY; WEALTH_LEADS_ANTHROPIC_S1_MODEL. "
+        "Ollama: run `ollama serve`, pull a model, set WEALTH_LEADS_OLLAMA_MODEL (default llama3.1); "
+        "optional WEALTH_LEADS_OLLAMA_URL (default http://127.0.0.1:11434). "
+        "Cloud APIs bill per token; local uses your RAM/GPU. Output includes lead_intel "
+        "(offering, ownership, related parties, etc.) stored on the filing row and shown in the pipeline drawer. "
+        "Then: py -m wealth_leads rebuild-profiles"
     )
 
     args = p.parse_args()
@@ -469,7 +607,52 @@ def main() -> None:
     elif args.cmd == "serve":
         from wealth_leads.serve import run_localhost
 
-        run_localhost(port=args.port, open_browser=not args.no_browser)
+        run_localhost(
+            port=args.port,
+            open_browser=not args.no_browser,
+            live=not bool(getattr(args, "no_live", False)),
+            reload=bool(getattr(args, "reload", False)),
+        )
+    elif args.cmd == "serve-app":
+        import uvicorn
+
+        from wealth_leads.config import app_listen_port
+
+        port = getattr(args, "port", None) or app_listen_port()
+        uvicorn.run(
+            "wealth_leads.web_app:app",
+            host=args.host,
+            port=port,
+            log_level="info",
+        )
+    elif args.cmd == "allocate":
+        from wealth_leads.allocation import run_allocation_from_db
+
+        stats = run_allocation_from_db(
+            cycle_yyyymm=getattr(args, "cycle", None),
+            replace=not bool(getattr(args, "no_replace", False)),
+        )
+        print(stats, file=sys.stderr)
+    elif args.cmd == "rebuild-profiles":
+        from wealth_leads.profile_build import rebuild_lead_profiles
+
+        with connect() as conn:
+            st = rebuild_lead_profiles(conn)
+        print(st, file=sys.stderr)
+    elif args.cmd == "enrich-s1-ai":
+        from wealth_leads.s1_ai_extract import run_enrich_s1_ai
+
+        n = run_enrich_s1_ai(
+            limit=int(getattr(args, "limit", 5) or 5),
+            filing_id=getattr(args, "filing_id", None),
+            only_missing_neo=bool(getattr(args, "only_missing_neo", False)),
+            replace_neo=bool(getattr(args, "replace_neo", False)),
+            replace_officers=bool(getattr(args, "replace_officers", False)),
+            replace_bios=bool(getattr(args, "replace_bios", False)),
+            allow_empty_neo=bool(getattr(args, "allow_empty_neo", False)),
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+        print(f"enrich-s1-ai finished ({n} filing(s) processed).", file=sys.stderr)
 
 
 if __name__ == "__main__":
