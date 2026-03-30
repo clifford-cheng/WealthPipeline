@@ -9,10 +9,10 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo This adds a shortcut to your Windows Startup folder so the dashboard
-echo server runs in the background when you log in. No window will appear.
+echo This adds a shortcut to your Windows Startup folder so the advisor app
+echo runs in the background when you log in. No window will appear.
 echo.
-echo Browser URL: http://127.0.0.1:8765
+echo Browser URL: http://127.0.0.1:8765/login
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install_startup.ps1"
 if errorlevel 1 (
@@ -21,7 +21,7 @@ if errorlevel 1 (
     exit /b 1
 )
 echo.
-echo Tip: Bookmark http://127.0.0.1:8765 — you only need the browser after this.
-echo To undo: run "Remove WealthPipeline from Startup.bat"
+echo Tip: In your browser, bookmark http://127.0.0.1:8765/login
+echo To undo: run "Remove WealthPipeline from Startup.bat" in this folder.
 echo.
 pause
