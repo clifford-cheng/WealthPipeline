@@ -47,7 +47,7 @@ REM If the advisor is already running, only open the browser — no second conso
 where powershell >nul 2>&1 && powershell -NoProfile -WindowStyle Hidden -File "%~dp0scripts\windows\if_advisor_running_open_browser.ps1"
 if errorlevel 1 goto need_server
 echo.
-echo Advisor is already running — opened the login page. No new window started.
+echo Advisor is already running — opened the pipeline page. No new window started.
 echo Close the existing WealthPipeline console when you want to stop the server.
 exit /b 0
 
@@ -59,15 +59,16 @@ timeout /t 1 /nobreak >nul
 
 echo Using: %_PY%
 echo.
-echo Open in browser:  http://127.0.0.1:8765/login
+echo Open in browser:  http://127.0.0.1:8765/pipeline  ^(data review; no login by default^)
+echo Optional sign-in: set WEALTH_LEADS_REQUIRE_AUTH=1 then use http://127.0.0.1:8765/login
 echo After sign-in:    My assigned leads, Admin ^(territories / run allocation^)
-echo Legacy full desk: Admin ^> Lead desk ^(same login^)
+echo Legacy full desk: Admin ^> Lead desk
 echo.
 echo Leave this window OPEN while you use the site. Close it to stop the server.
-echo After you change Python code: save the file, wait ~1s, refresh the browser.
-echo Hot reload: on Windows it defaults OFF ^(stable^). To enable: set WEALTH_LEADS_NO_RELOAD=0
+echo Code changes: save any .py under wealth_leads ^(or project root^) — server auto-restarts; then refresh the browser ^(Ctrl+F5 if CSS looks stuck^).
+echo To turn OFF auto-reload ^(single process^): set WEALTH_LEADS_NO_RELOAD=1 before starting this .bat
 echo If the browser says it can't connect, wait 2 seconds and refresh.
-echo If /login is 404: open http://127.0.0.1:8765/healthz — JSON with "ok" ^= advisor app.
+echo If /pipeline is 404: open http://127.0.0.1:8765/healthz — JSON with "ok" ^= advisor app.
 echo   Plain "Not Found" on /healthz ^= wrong server; this .bat now clears port 8765 first.
 echo If tables are empty, run scripts\windows\Sync SEC data then open dashboard.bat once.
 echo Browser opens automatically from the server when this window is visible.

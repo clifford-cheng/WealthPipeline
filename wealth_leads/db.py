@@ -116,6 +116,12 @@ def _migrate_filings_issuer_industry(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE filings ADD COLUMN issuer_industry TEXT")
 
 
+def _migrate_filings_s1_llm_lead_pack(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(filings)").fetchall()}
+    if "s1_llm_lead_pack" not in cols:
+        conn.execute("ALTER TABLE filings ADD COLUMN s1_llm_lead_pack TEXT")
+
+
 def _migrate_app_auth(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -160,8 +166,11 @@ def connect(path: Optional[str] = None) -> Generator[sqlite3.Connection, None, N
         _migrate_officers_age(conn)
         _migrate_filings_director_term(conn)
         _migrate_filings_issuer_industry(conn)
+        _migrate_filings_s1_llm_lead_pack(conn)
         _migrate_app_auth(conn)
         _migrate_allocation_system(conn)
+        _migrate_lead_profile(conn)
+        _migrate_lead_profile_llm_flag(conn)
         yield conn
         conn.commit()
     finally:
@@ -300,6 +309,19 @@ def update_filing_director_term_summary(
     conn.execute(
         "UPDATE filings SET director_term_summary = ? WHERE id = ?",
         (text.strip(), filing_id),
+    )
+
+
+def update_filing_s1_llm_lead_pack(
+    conn: sqlite3.Connection, filing_id: int, payload_json: str
+) -> None:
+    """Store JSON object text from LLM (offering, ownership, related parties, etc.)."""
+    s = (payload_json or "").strip()
+    if not s:
+        return
+    conn.execute(
+        "UPDATE filings SET s1_llm_lead_pack = ? WHERE id = ?",
+        (s[:60_000], filing_id),
     )
 
 
@@ -512,6 +534,62 @@ def _migrate_allocation_system(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE app_users SET is_admin = 1 WHERE id = (SELECT MIN(id) FROM app_users)")
 
 
+def _migrate_lead_profile(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lead_profile (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cik TEXT NOT NULL,
+            person_norm TEXT NOT NULL,
+            display_name TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            company_name TEXT NOT NULL DEFAULT '',
+            filing_date_latest TEXT NOT NULL DEFAULT '',
+            accession_latest TEXT NOT NULL DEFAULT '',
+            primary_doc_url TEXT NOT NULL DEFAULT '',
+            form_type_latest TEXT NOT NULL DEFAULT '',
+            issuer_headquarters TEXT NOT NULL DEFAULT '',
+            issuer_industry TEXT NOT NULL DEFAULT '',
+            issuer_website TEXT NOT NULL DEFAULT '',
+            index_url TEXT NOT NULL DEFAULT '',
+            equity_hwm REAL,
+            total_hwm REAL,
+            signal_hwm REAL,
+            headline_year INTEGER,
+            has_s1_comp INTEGER NOT NULL DEFAULT 0,
+            has_mgmt_bio INTEGER NOT NULL DEFAULT 0,
+            has_officer_row INTEGER NOT NULL DEFAULT 0,
+            neo_row_count INTEGER NOT NULL DEFAULT 0,
+            comp_timeline TEXT NOT NULL DEFAULT '',
+            issuer_summary_excerpt TEXT NOT NULL DEFAULT '',
+            why_surfaced TEXT NOT NULL DEFAULT '',
+            neo_filing_ids_json TEXT NOT NULL DEFAULT '[]',
+            quality_score INTEGER NOT NULL DEFAULT 0,
+            cross_company_hint INTEGER NOT NULL DEFAULT 0,
+            other_ciks_json TEXT NOT NULL DEFAULT '[]',
+            built_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(cik, person_norm)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_lead_profile_quality ON lead_profile(quality_score DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_lead_profile_filing_date ON lead_profile(filing_date_latest DESC)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_lead_profile_cik ON lead_profile(cik)")
+
+
+def _migrate_lead_profile_llm_flag(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(lead_profile)").fetchall()}
+    if "comp_llm_assisted" not in cols:
+        conn.execute(
+            "ALTER TABLE lead_profile ADD COLUMN comp_llm_assisted "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+
+
 def get_allocation_settings(conn: sqlite3.Connection) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM allocation_settings WHERE id = 1").fetchone()
     assert row is not None
@@ -719,3 +797,66 @@ def count_users_with_state_territory(conn: sqlite3.Connection, state_abbr: str) 
             (st,),
         ).fetchone()[0]
     )
+
+
+def count_lead_profiles(conn: sqlite3.Connection) -> int:
+    try:
+        return int(conn.execute("SELECT COUNT(*) FROM lead_profile").fetchone()[0])
+    except sqlite3.OperationalError:
+        return 0
+
+
+def get_lead_profile_row(
+    conn: sqlite3.Connection, cik: str, person_norm: str
+) -> Optional[sqlite3.Row]:
+    try:
+        return conn.execute(
+            "SELECT * FROM lead_profile WHERE cik = ? AND person_norm = ? LIMIT 1",
+            ((cik or "").strip(), (person_norm or "").strip()),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+
+
+def list_lead_profiles_for_review(
+    conn: sqlite3.Connection,
+    *,
+    search: str = "",
+    limit: int = 500,
+    cross_only: bool = False,
+    s1_only: bool = True,
+    months_back: Optional[int] = 6,
+) -> list[sqlite3.Row]:
+    """
+    Pipeline review rows. By default only NEO rows tied to an S-1-family filing
+    (has_s1_comp), matching a pre-IPO lead thesis. Set s1_only=False to include e.g. 10-K NEO.
+    months_back: limit to filing_date_latest within this many calendar months (approximate);
+    None or <=0 means no date window.
+    Sorted newest filing first.
+    """
+    try:
+        sql = "SELECT * FROM lead_profile WHERE 1=1"
+        params: list[object] = []
+        if s1_only:
+            sql += " AND has_s1_comp = 1"
+        if cross_only:
+            sql += " AND cross_company_hint = 1"
+        if months_back is not None and months_back > 0:
+            from datetime import date, timedelta
+
+            approx_days = int(float(months_back) * 30.437)
+            cutoff = (date.today() - timedelta(days=approx_days)).isoformat()
+            sql += " AND filing_date_latest >= ?"
+            params.append(cutoff)
+        if (search or "").strip():
+            pat = f"%{(search or '').strip()}%"
+            sql += (
+                " AND (display_name LIKE ? OR company_name LIKE ? OR title LIKE ? "
+                "OR issuer_headquarters LIKE ? OR person_norm LIKE ? OR cik LIKE ?)"
+            )
+            params.extend([pat, pat, pat, pat, pat, pat])
+        sql += " ORDER BY filing_date_latest DESC, cik, person_norm LIMIT ?"
+        params.append(max(1, min(int(limit), 5000)))
+        return list(conn.execute(sql, params).fetchall())
+    except sqlite3.OperationalError:
+        return []

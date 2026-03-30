@@ -310,6 +310,17 @@ def sync(*, force_reprocess: bool = False) -> None:
             f"(see {database_path()})."
         )
 
+    from wealth_leads.profile_build import rebuild_lead_profiles
+
+    with connect() as conn:
+        pr_stats = rebuild_lead_profiles(conn)
+    print(
+        f"Lead profiles materialized: {pr_stats['rows_written']} rows "
+        f"(from {pr_stats['profiles_source']} NEO profiles; "
+        f"{pr_stats.get('cross_company_flagged', 0)} cross-CIK name hints).",
+        file=sys.stderr,
+    )
+
 
 def export_leads_csv() -> None:
     writer = csv.writer(sys.stdout)
@@ -517,6 +528,68 @@ def main() -> None:
         help="Do not delete existing assignments for the cycle before assigning",
     )
 
+    sub.add_parser(
+        "rebuild-profiles",
+        help="Refresh lead_profile table from NEO data (no SEC fetch; run after sync or parser changes)",
+    )
+
+    ai = sub.add_parser(
+        "enrich-s1-ai",
+        help="Use an LLM (OpenAI, Anthropic, or local Ollama) to extract NEO comp, officers, bios, HQ from S-1 HTML (not on sync)",
+    )
+    ai.add_argument(
+        "--limit",
+        type=int,
+        default=5,
+        help="Max filings to process (default 5; cap 200)",
+    )
+    ai.add_argument(
+        "--filing-id",
+        type=int,
+        default=None,
+        help="Process a single filing by database id",
+    )
+    ai.add_argument(
+        "--only-missing-neo",
+        action="store_true",
+        help="Only filings with zero neo_compensation rows",
+    )
+    ai.add_argument(
+        "--replace-neo",
+        action="store_true",
+        help="Overwrite existing NEO rows when AI returns data (default: fill only if empty)",
+    )
+    ai.add_argument(
+        "--replace-officers",
+        action="store_true",
+        help="Overwrite officers even if already parsed",
+    )
+    ai.add_argument(
+        "--replace-bios",
+        action="store_true",
+        help="Overwrite management bios even if already stored",
+    )
+    ai.add_argument(
+        "--allow-empty-neo",
+        action="store_true",
+        help="With --replace-neo: clear NEO table if AI returns no comp rows (dangerous)",
+    )
+    ai.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fetch HTML and report size; do not call the LLM",
+    )
+    ai.epilog = (
+        "Provider: WEALTH_LEADS_S1_AI_PROVIDER=openai (default), anthropic, or ollama (alias: local). "
+        "OpenAI: OPENAI_API_KEY; WEALTH_LEADS_S1_AI_MODEL (default gpt-4o-mini). "
+        "Anthropic: ANTHROPIC_API_KEY; WEALTH_LEADS_ANTHROPIC_S1_MODEL. "
+        "Ollama: run `ollama serve`, pull a model, set WEALTH_LEADS_OLLAMA_MODEL (default llama3.1); "
+        "optional WEALTH_LEADS_OLLAMA_URL (default http://127.0.0.1:11434). "
+        "Cloud APIs bill per token; local uses your RAM/GPU. Output includes lead_intel "
+        "(offering, ownership, related parties, etc.) stored on the filing row and shown in the pipeline drawer. "
+        "Then: py -m wealth_leads rebuild-profiles"
+    )
+
     args = p.parse_args()
     if args.cmd == "sync":
         sync(
@@ -560,6 +633,26 @@ def main() -> None:
             replace=not bool(getattr(args, "no_replace", False)),
         )
         print(stats, file=sys.stderr)
+    elif args.cmd == "rebuild-profiles":
+        from wealth_leads.profile_build import rebuild_lead_profiles
+
+        with connect() as conn:
+            st = rebuild_lead_profiles(conn)
+        print(st, file=sys.stderr)
+    elif args.cmd == "enrich-s1-ai":
+        from wealth_leads.s1_ai_extract import run_enrich_s1_ai
+
+        n = run_enrich_s1_ai(
+            limit=int(getattr(args, "limit", 5) or 5),
+            filing_id=getattr(args, "filing_id", None),
+            only_missing_neo=bool(getattr(args, "only_missing_neo", False)),
+            replace_neo=bool(getattr(args, "replace_neo", False)),
+            replace_officers=bool(getattr(args, "replace_officers", False)),
+            replace_bios=bool(getattr(args, "replace_bios", False)),
+            allow_empty_neo=bool(getattr(args, "allow_empty_neo", False)),
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+        print(f"enrich-s1-ai finished ({n} filing(s) processed).", file=sys.stderr)
 
 
 if __name__ == "__main__":

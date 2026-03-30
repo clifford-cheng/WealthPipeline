@@ -4,6 +4,7 @@ import csv
 import html
 import io
 import json
+import math
 import os
 import re
 import sqlite3
@@ -15,8 +16,8 @@ import webbrowser
 from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
-from typing import Optional
-from urllib.parse import parse_qs, unquote, urlencode
+from typing import Any, Optional
+from urllib.parse import parse_qs, quote, unquote, urlencode
 from wsgiref.simple_server import make_server
 
 from wealth_leads.config import (
@@ -30,6 +31,8 @@ from wealth_leads.management import issuer_summary_looks_spammy, why_surfaced_li
 from wealth_leads.management_bios import extract_age_from_bio_text
 
 _SERVE_CHILD_ENV = "WEALTH_LEADS_SERVE_CHILD"
+# Below this high-water SCT total, label comp as "minimal" (typical director fees, etc.).
+_ROSTER_MEANINGFUL_COMP_USD = 25_000.0
 # New value each process start so the tab reloads after you restart the server (picks up code changes).
 _DEV_BOOT = f"{time.time_ns()}-{os.getpid()}"
 
@@ -803,6 +806,143 @@ def _find_profile(profiles: list[dict], cik: str, norm_name: str) -> Optional[di
     return None
 
 
+def _hq_one_line_for_maps(raw: str | None) -> str:
+    """Collapse multiline SEC HQ blocks to one line for map search URLs."""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    parts = [p.strip() for p in re.split(r"[\n\r]+", s) if p.strip()]
+    one = ", ".join(parts)
+    return re.sub(r"[ \t]{2,}", " ", one).strip()
+
+
+def _title_suggests_director_role(title: str) -> bool:
+    """Rough heuristic: title text skews toward outside / independent directors."""
+    t = re.sub(r"\s+", " ", (title or "").strip().lower())
+    if not t:
+        return False
+    needles = (
+        "director",
+        "board member",
+        "audit committee",
+        "compensation committee",
+        "nominating committee",
+        "chair of the board",
+        "chairman of the board",
+        "vice chair",
+        "lead director",
+    )
+    if "independent" in t and "director" in t:
+        return True
+    return any(n in t for n in needles)
+
+
+def _neo_stats_by_norm_for_cik(
+    conn: sqlite3.Connection, cik: str
+) -> dict[str, dict[str, Any]]:
+    """Per normalized person name: NEO row count, high-water total, latest FY (any filing for CIK)."""
+    ck = (cik or "").strip()
+    out: dict[str, dict[str, Any]] = {}
+    if not ck:
+        return out
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='neo_compensation'"
+    ).fetchone():
+        return out
+    for r in conn.execute(
+        """
+        SELECT c.person_name, c.fiscal_year, c.total
+        FROM neo_compensation c
+        JOIN filings f ON f.id = c.filing_id
+        WHERE f.cik = ?
+        """,
+        (ck,),
+    ).fetchall():
+        pn = _norm_person_name(r["person_name"] or "")
+        if not pn:
+            continue
+        if pn not in out:
+            out[pn] = {"max_total": None, "row_count": 0, "latest_fy": None}
+        st = out[pn]
+        st["row_count"] += 1
+        fy = r["fiscal_year"]
+        if fy is not None:
+            try:
+                fy_i = int(fy)
+                if st["latest_fy"] is None or fy_i > st["latest_fy"]:
+                    st["latest_fy"] = fy_i
+            except (TypeError, ValueError):
+                pass
+        tot = r["total"]
+        if tot is None:
+            continue
+        try:
+            fv = float(tot)
+            if math.isnan(fv):
+                continue
+        except (TypeError, ValueError):
+            continue
+        if st["max_total"] is None or fv > st["max_total"]:
+            st["max_total"] = fv
+    return out
+
+
+def company_sidebar_for_lead(conn: sqlite3.Connection, cik: str) -> dict[str, Any]:
+    """
+    Company column context: officer roster from the registrant's newest filing in DB.
+    (Proxy for \"who else is named\" — not full company headcount.)
+    """
+    ck = (cik or "").strip()
+    empty: dict[str, Any] = {"officer_roster": [], "roster_source": "", "roster_filing_id": None}
+    if not ck:
+        return empty
+    fr = conn.execute(
+        """
+        SELECT id, filing_date, form_type FROM filings
+        WHERE cik = ?
+        ORDER BY COALESCE(filing_date, '') DESC, id DESC
+        LIMIT 1
+        """,
+        (ck,),
+    ).fetchone()
+    if not fr:
+        return empty
+    fid = int(fr["id"])
+    fd = (fr["filing_date"] or "").strip()
+    ft = (fr["form_type"] or "").strip()
+    bits = [x for x in (fd, ft) if x]
+    src = " · ".join(bits) if bits else f"filing #{fid}"
+    neo_by_norm = _neo_stats_by_norm_for_cik(conn, ck)
+    roster: list[dict[str, Any]] = []
+    for r in conn.execute(
+        """
+        SELECT name, title FROM officers
+        WHERE filing_id = ?
+        ORDER BY name COLLATE NOCASE
+        """,
+        (fid,),
+    ).fetchall():
+        name = (r["name"] or "").strip()
+        title = (r["title"] or "").strip()
+        pn = _norm_person_name(name)
+        ns = neo_by_norm.get(pn) if pn else None
+        roster.append(
+            {
+                "name": name,
+                "title": title,
+                "person_norm": pn,
+                "neo_max_total": ns["max_total"] if ns else None,
+                "neo_row_count": int(ns["row_count"]) if ns else 0,
+                "neo_latest_fy": ns["latest_fy"] if ns else None,
+            }
+        )
+    return {
+        "officer_roster": roster,
+        "roster_source": src,
+        "roster_filing_id": fid,
+    }
+
+
 def _filings_for_profile(conn: sqlite3.Connection, cik: str, _norm_name: str) -> list[dict]:
     """
     Issuer filing timeline for cross-reference: every S-1 and 10-K (incl. /A) we have for
@@ -1362,6 +1502,78 @@ def _shared_css() -> str:
       margin-bottom: 0.75rem;
     }
     details.audit summary:hover { color: #c5ccd4; }
+    body.lead-profile-page { max-width: 1180px; }
+    .lead-page-header { margin-bottom: 1rem; padding-bottom: 0.85rem; border-bottom: 1px solid #2a3340; }
+    .lead-split {
+      display: grid;
+      gap: 1.25rem;
+      align-items: start;
+      margin-bottom: 1rem;
+    }
+    @media (min-width: 920px) {
+      .lead-split { grid-template-columns: 1fr 1fr; }
+    }
+    .lead-col { min-width: 0; }
+    .lead-col-title {
+      font-size: 0.68rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #9aa3b0;
+      margin: 0 0 0.25rem;
+      font-weight: 700;
+    }
+    .lead-col-hint {
+      font-size: 0.72rem;
+      color: #6b7785;
+      line-height: 1.45;
+      margin: 0 0 0.85rem;
+    }
+    .lead-map-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem 1rem;
+      align-items: center;
+      margin: 0.5rem 0 0.75rem;
+      font-size: 0.8125rem;
+    }
+    .lead-data-note {
+      background: #141c24;
+      border: 1px dashed #3d4d60;
+      border-radius: 6px;
+      padding: 0.55rem 0.65rem;
+      font-size: 0.75rem;
+      color: #8b96a3;
+      line-height: 1.45;
+      margin: 0 0 0.85rem;
+    }
+    .lead-col .hero { grid-template-columns: 1fr 1fr; }
+    table.roster-grid { font-size: 0.74rem; }
+    table.roster-grid td.roster-comp-col { white-space: nowrap; vertical-align: top; }
+    table.roster-grid td.roster-note-col {
+      font-size: 0.68rem;
+      color: #8b96a3;
+      line-height: 1.4;
+      max-width: 17rem;
+      vertical-align: top;
+    }
+    table.roster-grid td.roster-title { max-width: 13rem; vertical-align: top; }
+    .roster-pill-row { display: flex; flex-wrap: wrap; gap: 0.25rem; margin-top: 0.3rem; }
+    .roster-pill {
+      display: inline-block;
+      font-size: 0.58rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      padding: 0.08rem 0.35rem;
+      border-radius: 3px;
+      font-weight: 600;
+    }
+    .roster-pill-lead { background: #1e2d3d; color: #79c0ff; border: 1px solid #316d9a; }
+    .roster-pill-neo { background: #15251c; color: #56d364; border: 1px solid #2a6a3f; }
+    .roster-pill-soft { background: #22252c; color: #a8b0ba; border: 1px solid #3d424d; }
+    .roster-comp-num { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
+    .roster-comp-strong { font-weight: 600; color: #e8ecf0; }
+    .roster-comp-min { color: #a8b5c4; }
+    .roster-note { color: #8b96a3; }
     """
 
 
@@ -1461,6 +1673,149 @@ def _filings_table_html(filings: list[dict]) -> str:
     )
 
 
+def _roster_money_float(v: object) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        x = float(v)
+        if math.isnan(x):
+            return None
+        return x
+    except (TypeError, ValueError):
+        return None
+
+
+def _lead_roster_comp_cell(o: dict[str, Any]) -> str:
+    nrows = int(o.get("neo_row_count") or 0)
+    mx = _roster_money_float(o.get("neo_max_total"))
+    fy = o.get("neo_latest_fy")
+    if nrows == 0 or mx is None:
+        return "<span class='dim'>No SCT row</span>"
+    fy_l = f"FY {fy}" if fy is not None else "FY in DB"
+    if mx < _ROSTER_MEANINGFUL_COMP_USD:
+        return (
+            f"<span class='roster-comp-num roster-comp-min'>{html.escape(_money(mx))}</span>"
+            f" <span class='dim'>({html.escape(fy_l)}, minimal)</span>"
+        )
+    return (
+        f"<span class='roster-comp-num roster-comp-strong'>{html.escape(_money(mx))}</span>"
+        f" <span class='dim'>({html.escape(fy_l)} high-water)</span>"
+    )
+
+
+def _lead_roster_note_cell(o: dict[str, Any]) -> str:
+    title = o.get("title") or ""
+    dirish = _title_suggests_director_role(title)
+    nrows = int(o.get("neo_row_count") or 0)
+    mx = _roster_money_float(o.get("neo_max_total"))
+    if dirish and nrows == 0:
+        txt = (
+            "Director / board role — often no NEO line in SCT; cash fees may be elsewhere "
+            "in the filing."
+        )
+    elif dirish and mx is not None and mx < _ROSTER_MEANINGFUL_COMP_USD:
+        txt = "Director — small SCT totals are common (fees, retainers vs. executive pay)."
+    elif nrows > 0 and mx is not None and mx >= _ROSTER_MEANINGFUL_COMP_USD:
+        txt = (
+            "Summary comp table in DB with larger totals — comparable executive signal to "
+            "pipeline NEO profiles (confirm title and duties in the filing)."
+        )
+    elif nrows > 0:
+        txt = "SCT row exists but amounts are low—may be director fees or partial parse."
+    else:
+        txt = (
+            "Signature-table name only in our DB—no matching NEO row for this person "
+            "on this CIK (not necessarily a non-executive; check parse / filing)."
+        )
+    return f"<span class='roster-note'>{html.escape(txt)}</span>"
+
+
+def _officer_roster_html(
+    roster: list[dict[str, Any]],
+    roster_source: str,
+    *,
+    lead_norm: str,
+) -> str:
+    if not roster:
+        return (
+            "<p class='meta' style='margin-bottom:0'>"
+            "<span class='dim'>No officer rows in DB for the latest filing on this CIK. "
+            "Sync / parse may not have captured the signature table.</span>"
+            "</p>"
+        )
+
+    def sort_key(o: dict[str, Any]) -> tuple:
+        pn = (o.get("person_norm") or "") or _norm_person_name(o.get("name") or "")
+        is_lead = bool(lead_norm and pn == lead_norm)
+        nrows = int(o.get("neo_row_count") or 0)
+        mx = _roster_money_float(o.get("neo_max_total"))
+        has_any_neo = nrows > 0
+        meaningful = has_any_neo and mx is not None and mx >= _ROSTER_MEANINGFUL_COMP_USD
+        if is_lead:
+            tier = 0
+        elif meaningful:
+            tier = 1
+        elif has_any_neo:
+            tier = 2
+        else:
+            tier = 3
+        sub = -(mx if mx is not None else 0.0) if tier <= 2 else 0.0
+        return (tier, sub, (o.get("name") or "").lower())
+
+    sorted_roster = sorted(roster, key=sort_key)
+    body_rows: list[str] = []
+    for o in sorted_roster[:60]:
+        nm = o.get("name") or "—"
+        tl = o.get("title") or "—"
+        pn = (o.get("person_norm") or "") or _norm_person_name(nm)
+        nrows = int(o.get("neo_row_count") or 0)
+        mx = _roster_money_float(o.get("neo_max_total"))
+        pills: list[str] = []
+        if lead_norm and pn == lead_norm:
+            pills.append("<span class='roster-pill roster-pill-lead'>This page</span>")
+        if nrows > 0 and mx is not None and mx >= _ROSTER_MEANINGFUL_COMP_USD:
+            pills.append("<span class='roster-pill roster-pill-neo'>NEO</span>")
+        elif nrows > 0:
+            pills.append("<span class='roster-pill roster-pill-soft'>SCT</span>")
+        pill_html = (
+            "<div class='roster-pill-row'>" + "".join(pills) + "</div>"
+        ) if pills else ""
+        body_rows.append(
+            "<tr>"
+            f"<td class='profile-name'>{html.escape(nm)}{pill_html}</td>"
+            f"<td class='roster-title'>{html.escape(tl)}</td>"
+            f"<td class='roster-comp-col'>{_lead_roster_comp_cell(o)}</td>"
+            f"<td class='roster-note-col'>{_lead_roster_note_cell(o)}</td>"
+            "</tr>"
+        )
+    cap = ""
+    if len(roster) > 60:
+        cap = f"<p class='meta dim' style='margin:0.35rem 0 0;font-size:0.72rem'>Showing 60 of {len(roster)} names.</p>"
+    src = html.escape(roster_source) if roster_source else "latest filing"
+    expl = (
+        "<strong>How to read this:</strong> The left column is everyone named on the "
+        "<em>latest</em> officer/signature table we parsed. "
+        "<strong>Comp (DB)</strong> is our match to a <em>summary compensation (NEO)</em> row "
+        "for this CIK anywhere in your database—not every director gets an SCT line, and "
+        "many only show modest fees. "
+        f"High-water totals below {_money(_ROSTER_MEANINGFUL_COMP_USD)} are labeled "
+        "<em>minimal</em> (common for director fees). "
+        "Sort order: this profile first, then larger NEO totals, then small or missing SCT."
+    )
+    return (
+        "<p class='meta roster-explainer' style='margin-top:0.25rem;margin-bottom:0.65rem;font-size:0.78rem;line-height:1.5;color:#9aa3b0'>"
+        f"{expl}</p>"
+        f"<p class='meta' style='margin-top:0;margin-bottom:0.4rem;font-size:0.72rem;color:#7a8796'>"
+        f"Officer table source: <strong>{src}</strong> · not total company headcount.</p>"
+        "<div class='table-wrap'><table class='roster-grid'><thead><tr>"
+        "<th>Name</th><th>Title</th><th>Comp in DB</th><th>Context</th>"
+        "</tr></thead><tbody>"
+        + "".join(body_rows)
+        + "</tbody></table></div>"
+        + cap
+    )
+
+
 def _page_lead(
     profile: Optional[dict],
     filings: list[dict],
@@ -1469,6 +1824,7 @@ def _page_lead(
     query_name: str,
     stats: dict,
     rendered_at: str,
+    company_sidebar: Optional[dict[str, Any]] = None,
 ) -> str:
     css = _shared_css()
     banner = _stats_banner(stats, rendered_at)
@@ -1645,6 +2001,87 @@ def _page_lead(
       <p class="meta" style="margin-top:0.35rem; margin-bottom:0">{summ_html}</p>
     </div>"""
 
+    sb = company_sidebar or {}
+    roster = list(sb.get("officer_roster") or [])
+    roster_src = (sb.get("roster_source") or "").strip()
+    lead_norm = _norm_person_name(
+        (p.get("display_name") or "").strip() or query_name
+    )
+    roster_block = _officer_roster_html(roster, roster_src, lead_norm=lead_norm)
+
+    hq_one = _hq_one_line_for_maps(hq_txt)
+    co_nm = (p.get("company_name") or "").strip()
+    map_query = hq_one or (f"{co_nm} headquarters" if co_nm else "")
+    maps_row = ""
+    if map_query.strip():
+        maps_url = "https://www.google.com/maps/search/?api=1&query=" + quote(
+            map_query, safe=""
+        )
+        maps_row = (
+            "<div class='lead-map-row'>"
+            f'<a href="{html.escape(maps_url)}" target="_blank" rel="noopener">Open map</a>'
+            "<span class='dim'>Google Maps search from registrant HQ (or company name). Verify on the filing.</span>"
+            "</div>"
+        )
+
+    data_note = (
+        "<div class='lead-data-note'>"
+        "<strong>Revenue &amp; headcount:</strong> Not stored as numbers in WealthPipeline yet. "
+        "They often appear in Business / MD&amp;A in the filing—use the business summary here "
+        "or the primary document link in the header. The officer table lists <strong>named executives</strong> "
+        "from the filing, not total employees—useful for referral paths inside the company."
+        "</div>"
+    )
+
+    roster_card = f"""
+    <div class="card">
+      <h2 style="margin-top:0">Officer roster &amp; SCT coverage</h2>
+      {roster_block}
+    </div>"""
+
+    why_card = f"""
+    <div class="card">
+      <h2 style="margin-top:0">Why this lead</h2>
+      <p class="meta" style="margin-bottom:0">{html.escape(p.get('why_surfaced') or '—')}</p>
+    </div>"""
+
+    filings_block = f"""
+    <h2>Issuer filings (S-1 / 10-K)</h2>
+    <p class="meta">Same <b>CIK</b> — registration statements and annual reports in your DB (newest first, up to 50).</p>
+    {_filings_table_html(filings)}
+    """
+
+    col_company = f"""
+    <aside class="lead-col lead-col-company" aria-labelledby="lead-col-company">
+      <div class="lead-col-title" id="lead-col-company">Company</div>
+      <p class="lead-col-hint">Registrant facts, map, business text, board terms, filing list, and who else is named—context for referrals and outreach.</p>
+      {company_card}
+      {maps_row}
+      {data_note}
+      {roster_card}
+      {director_card}
+      {filings_block}
+    </aside>"""
+
+    col_person = f"""
+    <main class="lead-col lead-col-person" aria-labelledby="lead-col-person">
+      <div class="lead-col-title" id="lead-col-person">Person</div>
+      <p class="lead-col-hint">Why they surfaced, demographics proxy, disclosed compensation, and management bio from the filing.</p>
+      {why_card}
+      {person_card}
+      <div class="hero">
+        <div class="stat-card"><div class="lbl">Latest FY total</div><div class="val">{_money(p.get('total'))}</div></div>
+        <div class="stat-card"><div class="lbl">Max equity (any FY)</div><div class="val">{_money(p.get('equity_hwm'))}</div></div>
+        <div class="stat-card"><div class="lbl">Σ SCT (years in DB)</div><div class="val">{sum_disp}</div></div>
+        <div class="stat-card"><div class="lbl">Fiscal years w/ comp</div><div class="val">{int(p.get('years_count') or 0)}</div></div>
+      </div>
+      <h2>Headline compensation (latest fiscal year)</h2>
+      {headline_tbl}
+      <h2>Year-by-year (summary comp table)</h2>
+      {_profile_breakdown_table(p)}
+      {mgmt_narrative_card}
+    </main>"""
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1653,39 +2090,24 @@ def _page_lead(
   <title>{html.escape(p.get('display_name') or 'Lead')} — WealthPipeline</title>
   <style>{css}</style>
 </head>
-<body class="detail-page">
-  <nav class="top"><a href="/">← Lead desk</a> · <a href="/finder">Lead finder</a></nav>
-  <h1>{html.escape(p.get('display_name') or '—')}</h1>
-  <p class="meta">
-    <b>{html.escape(p.get('title') or '—')}</b> · {html.escape(p.get('company_name') or '')}
-    · CIK <span class="cik">{html.escape(str(p.get('cik') or ''))}</span>
-  </p>
-  <p class="meta">
-    Latest filing in profile: <b>{html.escape(p.get('filing_date') or '—')}</b>.
-    <a href="{html.escape(p.get('index_url') or '')}" target="_blank" rel="noopener">EDGAR index</a>
-    {(' · ' + doc_link) if doc_link else ''}
-  </p>
-  {person_card}
-  {company_card}
-  {director_card}
-  <div class="card">
-    <h2 style="margin-top:0">Why this lead</h2>
-    <p class="meta" style="margin-bottom:0">{html.escape(p.get('why_surfaced') or '—')}</p>
+<body class="detail-page lead-profile-page">
+  <header class="lead-page-header">
+    <nav class="top"><a href="/">← Lead desk</a> · <a href="/finder">Lead finder</a></nav>
+    <h1>{html.escape(p.get('display_name') or '—')}</h1>
+    <p class="meta">
+      <b>{html.escape(p.get('title') or '—')}</b> · {html.escape(p.get('company_name') or '')}
+      · CIK <span class="cik">{html.escape(str(p.get('cik') or ''))}</span>
+    </p>
+    <p class="meta">
+      Latest filing in profile: <b>{html.escape(p.get('filing_date') or '—')}</b>.
+      <a href="{html.escape(p.get('index_url') or '')}" target="_blank" rel="noopener">EDGAR index</a>
+      {(' · ' + doc_link) if doc_link else ''}
+    </p>
+  </header>
+  <div class="lead-split" role="presentation">
+    {col_company}
+    {col_person}
   </div>
-  <div class="hero">
-    <div class="stat-card"><div class="lbl">Latest FY total</div><div class="val">{_money(p.get('total'))}</div></div>
-    <div class="stat-card"><div class="lbl">Max equity (any FY)</div><div class="val">{_money(p.get('equity_hwm'))}</div></div>
-    <div class="stat-card"><div class="lbl">Σ SCT (years in DB)</div><div class="val">{sum_disp}</div></div>
-    <div class="stat-card"><div class="lbl">Fiscal years w/ comp</div><div class="val">{int(p.get('years_count') or 0)}</div></div>
-  </div>
-  <h2>Headline compensation (latest fiscal year)</h2>
-  {headline_tbl}
-  <h2>Year-by-year (summary comp table)</h2>
-  {_profile_breakdown_table(p)}
-  {mgmt_narrative_card}
-  <h2>Issuer filings (S-1 / 10-K)</h2>
-  <p class="meta">Same <b>CIK</b> as this lead — registration statements and annual reports we have in your DB (newest first, up to 50). Run <code>sync</code> to pull 10-Ks after S-1s (<code>SEC_FOLLOW_10K=1</code>, default).</p>
-  {_filings_table_html(filings)}
   <p class="meta">Bookmark this page: <code>/lead?{html.escape(bookmark_q)}</code></p>
   {banner}
   {_live_reload_snippet()}
@@ -1911,9 +2333,11 @@ def _app(environ, start_response):
         norm = _norm_person_name(name_decoded)
         prof = _find_profile(profiles_all, cik, norm) if not stats.get("missing_db") else None
         filings: list[dict] = []
+        company_sidebar = None
         if prof is not None and not stats.get("missing_db"):
             with connect() as conn:
                 filings = _filings_for_profile(conn, cik, norm)
+                company_sidebar = company_sidebar_for_lead(conn, cik)
         html_out = _page_lead(
             prof,
             filings,
@@ -1921,6 +2345,7 @@ def _app(environ, start_response):
             query_name=name_decoded,
             stats=stats,
             rendered_at=rendered_at,
+            company_sidebar=company_sidebar,
         )
     else:
         html_out = _page_desk(profiles, leads, comp, stats, rendered_at)
