@@ -153,6 +153,7 @@ def _latest_filing_issuer_fallback(
     r = conn.execute(
         """
         SELECT issuer_website, issuer_headquarters, issuer_industry, issuer_summary,
+               issuer_revenue_text,
                company_name, filing_date, form_type, accession
         FROM filings
         WHERE cik = ?
@@ -319,6 +320,7 @@ from wealth_leads.serve import (
     filter_profiles_geo_industry_text,
     filter_profiles_pay_band,
     finder_export_csv_bytes,
+    management_roster_scale_stats,
 )
 
 AUTH_COOKIE = "wl_auth"
@@ -1334,12 +1336,14 @@ async def lead(
     filings: list[dict] = []
     cr_dict: dict[str, Any] | None = None
     issuer_snap: dict[str, Any] | None = None
+    roster_stats: dict[str, int] | None = None
     if prof is not None and not stats.get("missing_db"):
         with connect() as conn:
             filings = _filings_for_profile(conn, cik, norm)
             cr_row = get_lead_client_research(conn, (cik or "").strip(), norm)
             cr_dict = row_to_client_research_dict(cr_row)
             issuer_snap = get_issuer_snapshot_dict(conn, (cik or "").strip())
+            roster_stats = management_roster_scale_stats(conn, (cik or "").strip())
     body = _page_lead(
         prof,
         filings,
@@ -1349,6 +1353,7 @@ async def lead(
         rendered_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         client_research=cr_dict,
         issuer_snapshot=issuer_snap,
+        roster_stats=roster_stats,
     )
     return HTMLResponse(_inject_chrome(body, user))
 

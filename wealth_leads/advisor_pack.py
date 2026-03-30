@@ -324,7 +324,8 @@ def gather_issuer_text_blob(conn, cik: str, *, max_chars: int = 24_000) -> tuple
         return "", ""
     cur = conn.execute(
         """
-        SELECT filing_date, issuer_summary, s1_llm_lead_pack, company_name, form_type
+        SELECT filing_date, issuer_summary, s1_llm_lead_pack, company_name, form_type,
+               issuer_revenue_text
         FROM filings
         WHERE cik = ?
           AND (issuer_summary IS NOT NULL AND TRIM(issuer_summary) != '')
@@ -342,6 +343,9 @@ def gather_issuer_text_blob(conn, cik: str, *, max_chars: int = 24_000) -> tuple
             continue
         hdr = f"=== Filing {r['form_type'] or ''} dated {r['filing_date'] or ''} ===\n"
         chunk = hdr + summ
+        rv = (r["issuer_revenue_text"] or "").strip()
+        if rv:
+            chunk += f"\nRevenue (S-1 extract): {rv}\n"
         lp = ""
         try:
             raw_lp = r["s1_llm_lead_pack"]
@@ -373,13 +377,12 @@ def llm_issuer_advisor_snapshot(
         )
     system = (
         "You write concise briefing sections for wealth advisors reviewing a pre-IPO / public registrant. "
-        "Use ONLY facts stated or clearly implied in the SEC excerpt. If revenue or employee count is "
+        "Use ONLY facts stated or clearly implied in the SEC excerpt. If revenue is "
         "not in the text, say explicitly: 'Not stated in this excerpt — check MD&A / prospectus in EDGAR.' "
         "Do not invent numbers. Respond with JSON only:\n"
-        '{"headline":"","revenue":"","employees":"","business_plain":"","pool_angle":"","caveat":""}\n'
+        '{"headline":"","revenue":"","business_plain":"","pool_angle":"","caveat":""}\n'
         "headline = one scannable line (company + stage).\n"
         "revenue = one or two sentences (ranges, 'revenue recognition', etc.) or not-stated message.\n"
-        "employees = one or two sentences (headcount, 'X employees', FTE) or not-stated.\n"
         "business_plain = what they do in plain English, 2-4 sentences max.\n"
         "pool_angle = for an advisor only: how company scale might relate to breadth of exec "
         "households / plan complexity (speculative but grounded; if unknown, say so briefly).\n"

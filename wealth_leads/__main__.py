@@ -26,6 +26,7 @@ from wealth_leads.db import (
     update_filing_director_term_summary,
     update_filing_issuer_industry,
     update_filing_issuer_meta,
+    update_filing_issuer_revenue_text_if_empty,
     update_filing_issuer_summary,
     update_primary_doc_url,
 )
@@ -34,6 +35,7 @@ from wealth_leads.management import (
     extract_executive_officers_from_filing_html,
     extract_issuer_headquarters_from_filing_html,
     extract_issuer_industry_from_filing_html,
+    extract_issuer_revenue_line_from_filing_html,
     extract_issuer_summary_from_filing_html,
     extract_issuer_website_from_filing_html,
     merge_officer_rows,
@@ -153,6 +155,9 @@ def backfill_compensation(
             ind_b = extract_issuer_industry_from_filing_html(s1_html)
             if ind_b:
                 update_filing_issuer_industry(c, fid, ind_b)
+            rev_b = extract_issuer_revenue_line_from_filing_html(s1_html)
+            if rev_b:
+                update_filing_issuer_revenue_text_if_empty(c, fid, rev_b)
             bios_b = extract_management_biographies_from_filing_html(s1_html)
             replace_person_management_narratives(c, fid, bios_b)
             dts_b = extract_director_term_summary_from_filing_html(s1_html)
@@ -319,6 +324,10 @@ def _process_rss_item(
     ind = extract_issuer_industry_from_filing_html(body_html)
     if ind:
         update_filing_issuer_industry(conn, filing_id, ind)
+
+    rev_h = extract_issuer_revenue_line_from_filing_html(body_html)
+    if rev_h:
+        update_filing_issuer_revenue_text_if_empty(conn, filing_id, rev_h)
 
     bios = extract_management_biographies_from_filing_html(body_html)
     replace_person_management_narratives(conn, filing_id, bios)

@@ -56,8 +56,9 @@ from wealth_leads.db import (
     replace_officers,
     replace_person_management_narratives,
     update_filing_director_term_summary,
-    update_filing_issuer_industry,
+    update_filing_issuer_industry_if_empty,
     update_filing_issuer_meta,
+    update_filing_issuer_revenue_text,
     update_filing_issuer_summary,
     update_filing_s1_llm_lead_pack,
 )
@@ -233,6 +234,8 @@ and professional firms—so downstream software can build reviewable lead profil
 Rules:
 - Use ONLY the excerpt; do not invent names, amounts, addresses, titles, or law firms.
 - Where the excerpt is silent, use null or empty arrays (do not guess).
+- issuer.revenue_from_filing: state only what the excerpt explicitly gives (fiscal period,
+  "approximately", revenue line labels); otherwise null.
 - For money in summary_compensation, use numbers (not strings). Use fiscal_year as a number.
 - Person names: plain English as in the filing (avoid ALL CAPS if the filing uses mixed case).
 - lead_intel text fields: concise prose taken from or tightly summarized from the excerpt; cite
@@ -247,7 +250,8 @@ _USER_SCHEMA = """Analyze this S-1 excerpt and return a single JSON object with 
     "headquarters_address": string or null,
     "website": string or null,
     "industry_description": string or null,
-    "business_summary": string or null
+    "business_summary": string or null,
+    "revenue_from_filing": string or null
   },
   "director_term_summary": string or null,
   "executive_officers": [
@@ -301,6 +305,9 @@ Section guidance:
   filing—almost always on the cover page, inside the prospectus summary header, or Item 1 / Business within
   the first pages (street, city, state, ZIP). Do not paste filing dates, effective dates, or "as of" text
   into this field. issuer.website / industry / business_summary: Prospectus summary and Business sections.
+- issuer.revenue_from_filing: latest period total revenue / net revenue (or clearest revenue line)
+  as stated in selected financial data, MD&A, or financial statements in the excerpt — one short
+  sentence with amount, currency if given, and fiscal period/year; null if not in excerpt.
 - summary_compensation: one object per person per fiscal year in Summary Compensation Table(s); "—" → null.
 - management_bios: biographies under Management / Directors (~800 chars per person max).
 - executive_officers: officer / director roster with ages if listed.
@@ -696,6 +703,7 @@ def apply_ai_payload_to_filing(
         "officers": 0,
         "bios": 0,
         "issuer_updates": False,
+        "issuer_revenue_text": False,
         "lead_intel_stored": False,
     }
     issuer = data.get("issuer") if isinstance(data.get("issuer"), dict) else {}
@@ -716,12 +724,17 @@ def apply_ai_payload_to_filing(
             stats["issuer_updates"] = True
         ind = (issuer.get("industry_description") or "").strip()
         if ind:
-            update_filing_issuer_industry(conn, filing_id, ind)
+            update_filing_issuer_industry_if_empty(conn, filing_id, ind)
             stats["issuer_updates"] = True
         summ = (issuer.get("business_summary") or "").strip()
         if summ:
             update_filing_issuer_summary(conn, filing_id, summ[:2000])
             stats["issuer_updates"] = True
+        rev = (issuer.get("revenue_from_filing") or "").strip()
+        if rev:
+            update_filing_issuer_revenue_text(conn, filing_id, rev[:2000])
+            stats["issuer_updates"] = True
+            stats["issuer_revenue_text"] = True
 
     dts = data.get("director_term_summary")
     if isinstance(dts, str) and dts.strip():

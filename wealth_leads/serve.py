@@ -407,6 +407,88 @@ def _desk_sort_tuple(p: dict) -> tuple:
     )
 
 
+def _resolve_issuer_revenue_for_cik(
+    conn: sqlite3.Connection,
+    cik: str,
+    *,
+    head_revenue: str = "",
+) -> str:
+    """Prefer headline filing row; else latest non-empty revenue line for CIK."""
+    ck = (cik or "").strip()
+    rev = (head_revenue or "").strip()
+    if not ck:
+        return rev
+    if rev:
+        return rev
+    r = conn.execute(
+        """
+        SELECT issuer_revenue_text FROM filings
+        WHERE cik = ? AND issuer_revenue_text IS NOT NULL
+          AND TRIM(issuer_revenue_text) != ''
+        ORDER BY COALESCE(filing_date, '') DESC, id DESC
+        LIMIT 1
+        """,
+        (ck,),
+    ).fetchone()
+    return ((r[0] or "").strip()) if r else ""
+
+
+def _roster_individual_dedupe_key(display_name: str) -> str:
+    """
+    Merge variants like "Matthew K. Morrow" vs "Matthew Morrow" for counts only.
+    Uses first + last token of normalized name (same basis as officer matching elsewhere).
+    """
+    n = _norm_person_name(display_name)
+    if not n:
+        return ""
+    first, last = _first_last_name_parts(n)
+    if first and last and first != last:
+        return f"{first}|{last}"
+    return n
+
+
+def management_roster_scale_stats(
+    conn: sqlite3.Connection, cik: str
+) -> Optional[dict[str, int]]:
+    """
+    Officer/director rows for CIK on S-1 filings: raw disclosure lines vs people after
+    first+last dedupe (handles middle initials and spelling variants in the table).
+    """
+    ck = (cik or "").strip()
+    if not ck:
+        return None
+    cur = conn.execute(
+        """
+        SELECT o.name
+        FROM officers o
+        JOIN filings f ON f.id = o.filing_id
+        WHERE f.cik = ? AND UPPER(COALESCE(f.form_type, '')) LIKE 'S-1%'
+          AND LENGTH(TRIM(COALESCE(o.name, ''))) > 0
+          AND LENGTH(TRIM(COALESCE(o.title, ''))) > 0
+        ORDER BY COALESCE(f.filing_date, '') DESC, f.id DESC
+        """,
+        (ck,),
+    )
+    raw_rows = 0
+    keys: set[str] = set()
+    for r in cur.fetchall():
+        raw_nm = (r["name"] or "").strip()
+        display_nm = raw_nm
+        if not is_acceptable_lead_person_name(display_nm):
+            rfn = refine_lead_person_name(raw_nm)
+            if not rfn:
+                continue
+            display_nm = rfn
+        dk = _roster_individual_dedupe_key(display_nm)
+        if not dk:
+            continue
+        raw_rows += 1
+        keys.add(dk)
+    if raw_rows == 0:
+        return None
+    return {"raw_rows": raw_rows, "unique_people": len(keys)}
+
+
 def _fetch_s1_officer_join_rows(conn: sqlite3.Connection) -> list[dict]:
     cur = conn.execute(
         """
@@ -417,6 +499,7 @@ def _fetch_s1_officer_join_rows(conn: sqlite3.Connection) -> list[dict]:
                f.issuer_website AS filing_issuer_website,
                f.issuer_headquarters AS filing_issuer_headquarters,
                f.issuer_industry AS filing_issuer_industry,
+               f.issuer_revenue_text AS filing_issuer_revenue_text,
                f.director_term_summary AS filing_director_term_summary
         FROM officers o
         JOIN filings f ON f.id = o.filing_id
@@ -503,6 +586,12 @@ def _visibility_profile_dict(
             (cik_s,),
         ).fetchone()
         issuer_ind = (rind[0] or "").strip() if rind else ""
+
+    rev_txt = _resolve_issuer_revenue_for_cik(
+        conn,
+        cik_s,
+        head_revenue=str(head.get("filing_issuer_revenue_text") or ""),
+    )
 
     mgmt_nar = narr_map.get((fid, pn))
     if not mgmt_nar and cik_s:
@@ -597,6 +686,7 @@ def _visibility_profile_dict(
         "issuer_headquarters": issuer_hq,
         "issuer_hq_city_state": hq_city_state_display(issuer_hq),
         "issuer_industry": issuer_ind,
+        "issuer_revenue_text": rev_txt,
         "mgmt_bio_role": (mgmt_nar or {}).get("role_heading") or "",
         "mgmt_bio_text": (mgmt_nar or {}).get("bio_text") or "",
         "mgmt_bio_display_name": (mgmt_nar or {}).get("person_name") or "",
@@ -623,6 +713,7 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
                f.issuer_website AS filing_issuer_website,
                f.issuer_headquarters AS filing_issuer_headquarters,
                f.issuer_industry AS filing_issuer_industry,
+               f.issuer_revenue_text AS filing_issuer_revenue_text,
                f.director_term_summary AS filing_director_term_summary
         FROM neo_compensation c
         JOIN filings f ON f.id = c.filing_id
@@ -840,6 +931,12 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
             ).fetchone()
             issuer_ind = (rind[0] or "").strip() if rind else ""
 
+        rev_txt = _resolve_issuer_revenue_for_cik(
+            conn,
+            cik_s,
+            head_revenue=str(head.get("filing_issuer_revenue_text") or ""),
+        )
+
         mgmt_nar = narr_map.get((int(head["filing_id"]), pn))
         if not mgmt_nar and cik_s:
             altn = conn.execute(
@@ -950,6 +1047,7 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
             "issuer_headquarters": issuer_hq,
             "issuer_hq_city_state": hq_city_state_display(issuer_hq),
             "issuer_industry": issuer_ind,
+            "issuer_revenue_text": rev_txt,
             "mgmt_bio_role": (mgmt_nar or {}).get("role_heading") or "",
             "mgmt_bio_text": (mgmt_nar or {}).get("bio_text") or "",
             "mgmt_bio_display_name": (mgmt_nar or {}).get("person_name") or "",
@@ -1098,8 +1196,8 @@ def filter_profiles_geo_industry_text(
     text_sub: str = "",
 ) -> list[dict]:
     """
-    Server-side filters for RIA-style lookup: registrant HQ text, SIC/NAICS/summary keywords,
-    and free-text across person / company / CIK.
+    Server-side filters for RIA-style lookup: registrant HQ text, SIC/NAICS line plus
+    issuer summary keywords, and free-text across person / company / CIK.
     """
     loc = (location_sub or "").lower().strip()
     ind = (industry_sub or "").lower().strip()
@@ -1733,13 +1831,13 @@ def _finder_form(
     return f"""
   <div class="card" style="margin-bottom:1rem">
     <h2 style="margin-top:0">Search</h2>
-    <p class="meta" style="margin-top:0">Filter by <b>registrant location</b> (HQ address text) and <b>industry</b> (parsed SIC/NAICS or business summary keywords from the filing). All matching is substring, case-insensitive.</p>
+    <p class="meta" style="margin-top:0">Filter by <b>registrant location</b> (HQ address text) and <b>SIC/NAICS</b> (parsed code line from the filing, if any) plus issuer summary text. All matching is substring, case-insensitive.</p>
     <form method="get" action="{action_e}" style="max-width:40rem">
       <input type="hidden" name="band" value="{band_e}"/>
       <label class="sr" for="hq">Registrant HQ contains</label>
       <input type="search" id="hq" name="hq" placeholder="e.g. California, Austin, 94105" value="{hq_e}" style="width:100%;max-width:100%;margin-bottom:0.5rem"/>
-      <label class="sr" for="industry">Industry contains</label>
-      <input type="search" id="industry" name="industry" placeholder="e.g. software, NAICS, 7372, pharmaceutical" value="{ind_e}" style="width:100%;max-width:100%;margin-bottom:0.5rem"/>
+      <label class="sr" for="industry">SIC / NAICS or summary contains</label>
+      <input type="search" id="industry" name="industry" placeholder="e.g. NAICS 541, SIC 7372, biotech (also matches issuer summary)" value="{ind_e}" style="width:100%;max-width:100%;margin-bottom:0.5rem"/>
       <label class="sr" for="fq">Person or company contains</label>
       <input type="search" id="fq" name="q" placeholder="Person name, company, or CIK…" value="{q_e}" style="width:100%;max-width:100%;margin-bottom:0.5rem"/>
       <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.8125rem;color:#8b96a3;cursor:pointer;margin:0.5rem 0">
@@ -1806,7 +1904,7 @@ def _page_finder(
     )
     tbl = _finder_table(profiles)
     scope = (
-        f"<p class='meta'>Showing <b>{len(profiles)}</b> row(s) after HQ / industry / text filters and pay-signal band. "
+        f"<p class='meta'>Showing <b>{len(profiles)}</b> row(s) after HQ / SIC·NAICS·summary / text filters and pay-signal band. "
         f"Universe before filters: <b>{base_count}</b> "
         f"({'all in database' if all_neo else 'after lead-desk S-1-context filters'}).</p>"
     )
@@ -1823,7 +1921,7 @@ def _page_finder(
   <h1>WealthPipeline <span class="tag">lead finder · local</span></h1>
   <p class="meta">
     Search people tied to issuers in your database. <b>HQ</b> is the registrant’s principal office line from filings (not a home address).
-    <b>Industry</b> uses parsed SIC/NAICS when available, and otherwise you can match keywords in the issuer business summary.
+    <b>SIC/NAICS</b> matches the parsed code line from the filing when present; you can also match keywords in the issuer business summary.
     <a href="{desk_link_e}">Lead desk</a>
   </p>
   {banner}
@@ -2306,7 +2404,7 @@ def _page_desk(
 <body class="wide">
   <h1>WealthPipeline <span class="tag">lead desk · local</span></h1>
   <p class="meta">
-    <a href="{html.escape('/finder' if nav_base_path == '/' else '/admin/finder')}">Lead finder</a> — filter by registrant HQ and industry.
+    <a href="{html.escape('/finder' if nav_base_path == '/' else '/admin/finder')}">Lead finder</a> — filter by registrant HQ and SIC/NAICS (or summary keywords).
     SEC filing–native timing: <b>S-1</b> from RSS, then <b>10-K</b> for the <b>same CIKs</b> via SEC submissions (cross-reference). Data updates when you run <code>sync</code>.
     Database: <code>{html.escape(str(Path(database_path()).resolve()))}</code>
   </p>
@@ -2426,10 +2524,7 @@ def _json_leaf_display_str(v: object) -> str:
     return s
 
 
-def _issuer_snapshot_card_html(
-    snap: dict, *, omit_keys: Optional[frozenset[str]] = None
-) -> str:
-    skip = omit_keys or frozenset()
+def _issuer_snapshot_card_html(snap: dict) -> str:
     if not snap:
         return (
             '<div class="card advisor-company-snapshot">'
@@ -2442,13 +2537,9 @@ def _issuer_snapshot_card_html(
     parts: list[str] = []
     for key, title in [
         ("headline", "At a glance"),
-        ("revenue", "Revenue"),
-        ("employees", "Employees / scale"),
         ("business_plain", "What they do"),
         ("pool_angle", "Why scale matters for outreach"),
     ]:
-        if key in skip:
-            continue
         v = _json_leaf_display_str(snap.get(key))
         if v:
             parts.append(
@@ -2466,8 +2557,12 @@ def _issuer_snapshot_card_html(
     )
 
 
-def _lead_company_public_card_html(p: dict, issuer_snapshot: dict) -> str:
-    """Structured company block: name, CIK, website (URL as link text), address, employees, industry."""
+def _lead_company_public_card_html(
+    p: dict,
+    *,
+    roster_stats: Optional[dict] = None,
+) -> str:
+    """Company panel: HQ, website, referral breadth (no SIC/NAICS — often blank or noisy)."""
     co = html.escape(p.get("company_name") or "—")
     cik = html.escape(str(p.get("cik") or ""))
     web_raw = (p.get("issuer_website") or "").strip()
@@ -2498,33 +2593,37 @@ def _lead_company_public_card_html(p: dict, issuer_snapshot: dict) -> str:
     else:
         addr_dd = "<span class='dim'>—</span>"
 
-    emp_s = _json_leaf_display_str(
-        issuer_snapshot.get("employees") if issuer_snapshot else None
-    )
-    if emp_s:
-        emp_dd = html.escape(emp_s)
-    else:
-        emp_dd = "<span class='dim' title='Run enrich-client-research for scale from filing/site context'>—</span>"
-
-    ind_txt = (p.get("issuer_industry") or "").strip()
-    ind_dd = html.escape(ind_txt) if ind_txt else "<span class='dim'>—</span>"
+    ref_dd = "<span class='dim'>—</span>"
+    if roster_stats:
+        u = int(roster_stats.get("unique_people") or 0)
+        if u > 0:
+            ref_tip = (
+                "Distinct officer/director names deduped from filing tables — sizing hint only, "
+                "not wealth verification."
+            )
+            ref_dd = (
+                f'<span title="{html.escape(ref_tip, quote=True)}">'
+                f"<strong>{u}</strong> potential high-value referrals</span>"
+            )
 
     rows: list[tuple[str, str]] = [
-        ("Legal name", f"<strong>{co}</strong>"),
+        ("Company", f"<strong>{co}</strong>"),
         ("CIK", f'<span class="cik">{cik}</span>'),
         ("Website", web_dd),
-        ("Principal office", addr_dd),
-        ("Employees / scale", emp_dd),
-        ("Industry (SIC / NAICS)", ind_dd),
+        ("Headquarters", addr_dd),
+        ("Potential referrals", ref_dd),
     ]
     dl_parts = [
         f"<dt>{html.escape(label)}</dt><dd>{inner}</dd>" for label, inner in rows
     ]
     dl = '<dl class="lead-company-dl">' + "".join(dl_parts) + "</dl>"
+    foot = (
+        '<p class="meta dim" style="margin:0.45rem 0 0;font-size:0.72rem;line-height:1.4">'
+        "Filing-based company context for trust, tax, and wealth work—verify in EDGAR.</p>"
+    )
     return (
-        '<div class="card lead-company-card">'
-        '<h2 class="lead-section-h">Issuer</h2>'
-        f"{dl}"
+        '<div class="card lead-company-card" aria-label="Company details">'
+        f"{dl}{foot}"
         "</div>"
     )
 
@@ -2701,6 +2800,7 @@ def _page_lead(
     rendered_at: str,
     client_research: Optional[dict] = None,
     issuer_snapshot: Optional[dict] = None,
+    roster_stats: Optional[dict] = None,
 ) -> str:
     css = _shared_css()
     if profile is None:
@@ -2841,13 +2941,13 @@ def _page_lead(
     age_title_attr = html.escape(age_hero_title, quote=True) if age_hero_title else ""
 
     snap_dict = issuer_snapshot or {}
-    company_intro_card = _lead_company_public_card_html(p, snap_dict)
-    snapshot_card = _issuer_snapshot_card_html(
-        snap_dict, omit_keys=frozenset({"employees"})
+    company_intro_card = _lead_company_public_card_html(
+        p, roster_stats=roster_stats
     )
+    snapshot_card = _issuer_snapshot_card_html(snap_dict)
     snapshot_folded = (
         '<details class="lead-more lead-snapshot-fold">'
-        "<summary>Company snapshot <span class='dim'>(scale &amp; story, if enriched)</span></summary>"
+        "<summary>Company snapshot <span class='dim'>(enriched story, if available)</span></summary>"
         f'<div class="lead-snapshot-inner">{snapshot_card}</div></details>'
     )
 
@@ -3208,12 +3308,16 @@ def _app(environ, start_response):
         filings: list[dict] = []
         cr_dict: Optional[dict] = None
         issuer_snap: Optional[dict] = None
+        roster_stats_out: Optional[dict] = None
         if prof is not None and not stats.get("missing_db"):
             with connect() as conn:
                 filings = _filings_for_profile(conn, cik, norm)
                 cr_row = get_lead_client_research(conn, cik, norm)
                 cr_dict = row_to_client_research_dict(cr_row)
                 issuer_snap = get_issuer_snapshot_dict(conn, cik)
+                roster_stats_out = management_roster_scale_stats(
+                    conn, (cik or "").strip()
+                )
         html_out = _page_lead(
             prof,
             filings,
@@ -3223,6 +3327,7 @@ def _app(environ, start_response):
             rendered_at=rendered_at,
             client_research=cr_dict,
             issuer_snapshot=issuer_snap,
+            roster_stats=roster_stats_out,
         )
     else:
         qs = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)

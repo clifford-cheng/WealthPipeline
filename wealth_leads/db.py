@@ -140,6 +140,14 @@ def _migrate_filings_s1_llm_lead_pack(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE filings ADD COLUMN s1_llm_lead_pack TEXT")
 
 
+def _migrate_filings_issuer_scale_text(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(filings)").fetchall()}
+    if "issuer_revenue_text" not in cols:
+        conn.execute("ALTER TABLE filings ADD COLUMN issuer_revenue_text TEXT")
+    if "issuer_employees_text" not in cols:
+        conn.execute("ALTER TABLE filings ADD COLUMN issuer_employees_text TEXT")
+
+
 def _migrate_app_auth(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -186,6 +194,7 @@ def connect(path: Optional[str] = None) -> Generator[sqlite3.Connection, None, N
         _migrate_filings_director_term(conn)
         _migrate_filings_issuer_industry(conn)
         _migrate_filings_s1_llm_lead_pack(conn)
+        _migrate_filings_issuer_scale_text(conn)
         _migrate_app_auth(conn)
         _migrate_allocation_system(conn)
         _migrate_lead_profile(conn)
@@ -335,6 +344,53 @@ def update_filing_issuer_industry(
         WHERE id = ?
         """,
         (s[:2000], filing_id),
+    )
+
+
+def update_filing_issuer_industry_if_empty(
+    conn: sqlite3.Connection, filing_id: int, industry: str
+) -> None:
+    """LLM / secondary source: do not replace SIC/NAICS already parsed from the filing."""
+    s = (industry or "").strip()
+    if not s:
+        return
+    conn.execute(
+        """
+        UPDATE filings SET issuer_industry = ?
+        WHERE id = ?
+          AND (issuer_industry IS NULL OR TRIM(issuer_industry) = '')
+        """,
+        (s[:2000], filing_id),
+    )
+
+
+def update_filing_issuer_revenue_text(
+    conn: sqlite3.Connection, filing_id: int, revenue: str
+) -> None:
+    """Persist revenue line (LLM or heuristic). Empty string skips."""
+    rev = (revenue or "").strip()
+    if not rev:
+        return
+    conn.execute(
+        "UPDATE filings SET issuer_revenue_text = ? WHERE id = ?",
+        (rev[:2000], filing_id),
+    )
+
+
+def update_filing_issuer_revenue_text_if_empty(
+    conn: sqlite3.Connection, filing_id: int, revenue: str
+) -> None:
+    """Set issuer_revenue_text only when blank (heuristic sync); LLM enrich can fill or replace later."""
+    rev = (revenue or "").strip()
+    if not rev:
+        return
+    conn.execute(
+        """
+        UPDATE filings SET issuer_revenue_text = ?
+        WHERE id = ?
+          AND (issuer_revenue_text IS NULL OR TRIM(issuer_revenue_text) = '')
+        """,
+        (rev[:2000], filing_id),
     )
 
 

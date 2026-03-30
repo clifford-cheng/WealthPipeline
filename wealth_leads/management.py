@@ -811,7 +811,10 @@ _NAICS_LINE = re.compile(
 
 def extract_issuer_industry_from_filing_html(html: str) -> str:
     """
-    Best-effort SIC / NAICS line from filing body text (heuristic; many filers vary wording).
+    SIC / NAICS from registration-statement prose (standard disclosure; wording varies).
+
+    Returns a short line like ``NAICS 541511 — …`` or ``SIC 7372`` when the HTML text
+    matches common patterns; empty string when not found (no narrative guess).
     """
     soup = BeautifulSoup(html, "html.parser")
     flat = re.sub(r"[\s\xa0]+", " ", soup.get_text(" ", strip=True))
@@ -844,6 +847,176 @@ def extract_issuer_industry_from_filing_html(html: str) -> str:
     m3 = _SIC_CODE.search(flat)
     if m3:
         return f"SIC {m3.group(1)}"[:300]
+    return ""
+
+
+def _revenue_amount_plausible(
+    amt: str, *, from_labeled_revenue_row: bool = False
+) -> bool:
+    """Reject obvious per-share / EPS fragments; relax rules for table rows we labeled as revenue."""
+    low = (amt or "").lower()
+    if not amt or "per share" in low or re.search(r"\bper\s+common\s+share\b", low):
+        return False
+    nums = re.sub(r"[^\d.]", "", amt.replace(",", ""))
+    try:
+        v = float(nums) if nums else 0.0
+    except ValueError:
+        return False
+    if any(x in low for x in ("million", "billion", "thousand", " mm", " bn")):
+        return v > 0
+    if from_labeled_revenue_row:
+        # Labeled revenue row: bare $ usually full-year total; avoid tiny false positives
+        return v >= 100_000
+    return v >= 5_000
+
+
+def _row_first_cell_is_revenue_line(label: str) -> bool:
+    """First column of a financial table row — revenue / sales, not cost or subtotal."""
+    t = re.sub(r"\s+", " ", (label or "").strip())
+    t_low = re.sub(r"\[\d+\]|\(\d+\)", "", t.lower()).strip()
+    if not t_low or len(t_low) > 120:
+        return False
+    if any(
+        x in t_low
+        for x in (
+            "cost of revenue",
+            "cost of sales",
+            "cost of goods",
+            "gross profit",
+            "gross margin",
+            "operating expenses",
+            "operating income",
+            "net loss",
+            "net income",
+            "ebitda",
+            "adjusted ebitda",
+            "interest expense",
+            "income tax",
+            "weighted average",
+            "basic and diluted",
+            "per share",
+            "percentage",
+            "not meaningful",
+            "three months",
+            "six months",
+            "nine months",
+        )
+    ):
+        return False
+    if re.match(
+        r"^(?:(?:total|net|gross)\s+)?revenu(?:e|es)?(?:\s*,\s*net)?$",
+        t_low,
+    ):
+        return True
+    if re.match(r"^total\s+revenu", t_low):
+        return True
+    if re.match(r"^net\s+revenu", t_low):
+        return True
+    if re.match(r"^(?:net\s+)?sales$", t_low):
+        return True
+    if re.match(r"^subscription\s+revenu", t_low) and "cost" not in t_low:
+        return True
+    if re.match(r"^(?:product|service)\s+revenu", t_low):
+        return True
+    if re.match(r"^operating\s+revenu", t_low):
+        return True
+    if re.match(r"^contract\s+revenu", t_low):
+        return True
+    return False
+
+
+def _first_currency_amount_in_row(cells: list[str]) -> str:
+    """Prefer the first data column (often most recent fiscal year in SFD)."""
+    for cell in cells[1:]:
+        s = re.sub(r"\[\d+\]", "", cell)
+        s = re.sub(r"\s+", " ", s).strip()
+        if not s or s in ("—", "-", "–", "N/A", "n/a", "*"):
+            continue
+        # Parentheses = negative; still revenue magnitude for young cos — skip negatives
+        if re.match(r"^\([^)]+\)$", s.replace("$", "").strip()):
+            continue
+        m = re.search(
+            r"(\$\s*[\d,]+(?:\.\d+)?(?:\s*(?:million|billion|thousand|M|B))?)",
+            s,
+            re.I,
+        )
+        if m:
+            amt = re.sub(r"\s+", " ", m.group(1).strip())
+            if _revenue_amount_plausible(amt, from_labeled_revenue_row=True):
+                return amt
+    return ""
+
+
+def _extract_revenue_amount_from_s1_tables(soup: BeautifulSoup) -> str:
+    """
+    Selected financial data / statements of operations: row labeled Revenue or Sales with $ in another cell.
+    """
+    for tr in soup.find_all("tr"):
+        cells = [
+            re.sub(r"\s+", " ", td.get_text(" ", strip=True))
+            for td in tr.find_all(["td", "th"])
+        ]
+        if len(cells) < 2:
+            continue
+        if not _row_first_cell_is_revenue_line(cells[0]):
+            continue
+        got = _first_currency_amount_in_row(cells)
+        if got:
+            return got
+    return ""
+
+
+def extract_issuer_revenue_line_from_filing_html(html: str) -> str:
+    """
+    Consolidated annual revenue from S-1 / F-1 HTML without XBRL.
+
+    Order: (1) HTML tables with a revenue/sales row, (2) MD&A and summary prose patterns.
+    Nearly all registration statements disclose revenue in prose and/or selected financial data.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    tab = _extract_revenue_amount_from_s1_tables(soup)
+    if tab:
+        return f"Annual revenue {tab} (per registration filing financial data)."[:400]
+
+    flat = re.sub(r"[\s\xa0]+", " ", soup.get_text(" ", strip=True))
+    if len(flat) < 200:
+        return ""
+    head = flat[: min(len(flat), 620_000)]
+
+    patterns = [
+        r"(?:total\s+)?revenu(?:e|es)\s+(?:was|were)\s+"
+        r"((?:approximately\s+|about\s+)?(?:\$|US\$|USD\s*)?[\d,.]+(?:\s*(?:million|billion|thousand|M|B))?)"
+        r"(?:\s+for\s+the\s+(?:fiscal\s+)?year\s+ended\s+[^,\.]{4,52})?",
+        r"(?:total\s+)?revenu(?:e|es)\s+of\s+"
+        r"((?:approximately\s+|about\s+)?(?:\$|US\$|USD\s*)?[\d,.]+(?:\s*(?:million|billion|thousand))?)",
+        r"(?:generated|recognized|reported)\s+(?:total\s+)?revenu(?:e|es)\s+of\s+"
+        r"((?:\$|US\$|USD\s*)?[\d,.]+(?:\s*(?:million|billion|thousand))?)",
+        r"net\s+revenu(?:e|es)\s+(?:was|were)\s+"
+        r"((?:approximately\s+)?(?:\$|US\$|USD\s*)?[\d,.]+(?:\s*(?:million|billion|thousand))?)",
+        r"operating\s+revenu(?:e|es)\s+(?:was|were)\s+"
+        r"((?:\$|US\$|USD\s*)?[\d,.]+(?:\s*(?:million|billion|thousand))?)",
+        r"(?:net\s+)?sales\s+(?:were|was)\s+"
+        r"((?:approximately\s+)?(?:\$|US\$|USD\s*)?[\d,.]+(?:\s*(?:million|billion|thousand))?)",
+        r"total\s+net\s+revenu(?:e|es)\s+(?:of|were|was)\s+"
+        r"((?:\$|US\$|USD\s*)?[\d,.]+(?:\s*(?:million|billion|thousand))?)",
+        r"(?:recorded|achieved|delivered)\s+(?:total\s+)?revenu(?:e|es)\s+of\s+"
+        r"((?:\$|US\$|USD\s*)?[\d,.]+(?:\s*(?:million|billion|thousand))?)",
+        # "For the year ended ... , revenue totaled $X"
+        r"for\s+the\s+(?:fiscal\s+)?year\s+ended[^$]{6,72}?"
+        r"(?:total\s+)?revenu(?:e|es)\s+(?:of|totaling|totaled|was|were)\s+"
+        r"((?:\$|US\$|USD\s*)?[\d,.]+(?:\s*(?:million|billion|thousand))?)",
+        r"for\s+the\s+years?\s+ended[^$]{8,120}?"
+        r"(?:total\s+)?revenu(?:e|es)\s+of\s+"
+        r"((?:\$|US\$|USD\s*)?[\d,.]+(?:\s*(?:million|billion|thousand))?)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, head, re.I)
+        if not m:
+            continue
+        amt = re.sub(r"\s+", " ", m.group(1).strip())
+        if not _revenue_amount_plausible(amt):
+            continue
+        return f"Annual revenue was {amt} (disclosed in registration filing)."[:400]
     return ""
 
 
