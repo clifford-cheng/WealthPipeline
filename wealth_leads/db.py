@@ -98,6 +98,24 @@ def _migrate_filings_issuer_meta(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE filings ADD COLUMN issuer_headquarters TEXT")
 
 
+def _migrate_filings_issuer_hq_city_state(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(filings)").fetchall()}
+    if "issuer_hq_city_state" not in cols:
+        conn.execute(
+            "ALTER TABLE filings ADD COLUMN issuer_hq_city_state TEXT NOT NULL DEFAULT ''"
+        )
+        from wealth_leads.territory import hq_city_state_display
+
+        for row in conn.execute("SELECT id, issuer_headquarters FROM filings"):
+            hid = int(row["id"])
+            hq = (row["issuer_headquarters"] or "").strip()
+            cs = hq_city_state_display(hq) if hq else ""
+            conn.execute(
+                "UPDATE filings SET issuer_hq_city_state = ? WHERE id = ?",
+                (cs, hid),
+            )
+
+
 def _migrate_officers_age(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(officers)").fetchall()}
     if "age" not in cols:
@@ -163,6 +181,7 @@ def connect(path: Optional[str] = None) -> Generator[sqlite3.Connection, None, N
         _migrate_filings_compensation_column(conn)
         _migrate_filings_issuer_summary(conn)
         _migrate_filings_issuer_meta(conn)
+        _migrate_filings_issuer_hq_city_state(conn)
         _migrate_officers_age(conn)
         _migrate_filings_director_term(conn)
         _migrate_filings_issuer_industry(conn)
@@ -172,6 +191,12 @@ def connect(path: Optional[str] = None) -> Generator[sqlite3.Connection, None, N
         _migrate_lead_profile(conn)
         _migrate_lead_profile_llm_flag(conn)
         _migrate_lead_profile_lead_tier(conn)
+        _migrate_lead_profile_headline_comp(conn)
+        _migrate_lead_profile_hq_materialized(conn)
+        _migrate_lead_client_research(conn)
+        _migrate_issuer_advisor_snapshot(conn)
+        _migrate_lead_client_research_advisor_cols(conn)
+        _migrate_lead_client_research_photo_blob(conn)
         yield conn
         conn.commit()
     finally:
@@ -247,16 +272,54 @@ def update_filing_issuer_meta(
     *,
     website: str = "",
     headquarters: str = "",
+    headquarters_force: bool = False,
 ) -> None:
-    conn.execute(
-        """
-        UPDATE filings SET
-            issuer_website = COALESCE(NULLIF(TRIM(?), ''), issuer_website),
-            issuer_headquarters = COALESCE(NULLIF(TRIM(?), ''), issuer_headquarters)
-        WHERE id = ?
-        """,
-        (website or "", headquarters or "", filing_id),
-    )
+    """
+    Merge website/HQ into filings. Heuristic sync uses headquarters_force=False (never
+    overwrites non-empty HQ with empty). S-1 AI / Ollama uses headquarters_force=True
+    so a model-extracted address replaces a bad prior HTML scrape.
+
+    ``issuer_hq_city_state`` is always derived from the resolved full HQ line (city + state
+    or region, no US ZIP) for pipeline / materialized profiles.
+    """
+    from wealth_leads.territory import hq_city_state_display
+
+    tw = (website or "").strip()
+    th = (headquarters or "").strip()
+    if headquarters_force and th:
+        cs = hq_city_state_display(th)
+        conn.execute(
+            """
+            UPDATE filings SET
+                issuer_website = COALESCE(NULLIF(?, ''), issuer_website),
+                issuer_headquarters = ?,
+                issuer_hq_city_state = ?
+            WHERE id = ?
+            """,
+            (tw, th, cs, filing_id),
+        )
+        return
+    if th:
+        cs = hq_city_state_display(th)
+        conn.execute(
+            """
+            UPDATE filings SET
+                issuer_website = COALESCE(NULLIF(TRIM(?), ''), issuer_website),
+                issuer_headquarters = COALESCE(NULLIF(TRIM(?), ''), issuer_headquarters),
+                issuer_hq_city_state = ?
+            WHERE id = ?
+            """,
+            (tw, th, cs, filing_id),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE filings SET
+                issuer_website = COALESCE(NULLIF(TRIM(?), ''), issuer_website)
+            WHERE id = ?
+            """,
+            (tw, filing_id),
+        )
 
 
 def update_filing_issuer_industry(
@@ -599,6 +662,127 @@ def _migrate_lead_profile_lead_tier(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_lead_profile_headline_comp(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(lead_profile)").fetchall()}
+    if "salary_headline" not in cols:
+        conn.execute("ALTER TABLE lead_profile ADD COLUMN salary_headline REAL")
+    if "bonus_headline" not in cols:
+        conn.execute("ALTER TABLE lead_profile ADD COLUMN bonus_headline REAL")
+    if "other_comp_headline" not in cols:
+        conn.execute("ALTER TABLE lead_profile ADD COLUMN other_comp_headline REAL")
+    if "stock_grants_headline" not in cols:
+        conn.execute("ALTER TABLE lead_profile ADD COLUMN stock_grants_headline REAL")
+    if "total_headline" not in cols:
+        conn.execute("ALTER TABLE lead_profile ADD COLUMN total_headline REAL")
+
+
+def _migrate_lead_profile_hq_materialized(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(lead_profile)").fetchall()}
+    if "issuer_hq_city_state" not in cols:
+        conn.execute(
+            "ALTER TABLE lead_profile ADD COLUMN issuer_hq_city_state "
+            "TEXT NOT NULL DEFAULT ''"
+        )
+    if "issuer_hq_has_detail" not in cols:
+        conn.execute(
+            "ALTER TABLE lead_profile ADD COLUMN issuer_hq_has_detail "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+
+
+def _migrate_lead_client_research(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lead_client_research (
+            cik TEXT NOT NULL,
+            person_norm TEXT NOT NULL,
+            display_name TEXT NOT NULL DEFAULT '',
+            company_name TEXT NOT NULL DEFAULT '',
+            issuer_website TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            bio_website TEXT,
+            photo_url TEXT,
+            leadership_page_url TEXT,
+            linkedin_profile_url TEXT,
+            linkedin_search_url TEXT,
+            research_summary TEXT,
+            source_excerpt TEXT,
+            raw_json TEXT,
+            error_message TEXT,
+            enriched_at TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (cik, person_norm)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_lead_client_research_status ON lead_client_research(status)"
+    )
+
+
+def _migrate_issuer_advisor_snapshot(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS issuer_advisor_snapshot (
+            cik TEXT NOT NULL PRIMARY KEY,
+            snapshot_json TEXT NOT NULL DEFAULT '{}',
+            source_excerpt TEXT,
+            built_at TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+
+
+def _migrate_lead_client_research_advisor_cols(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(lead_client_research)").fetchall()}
+    if "person_story" not in cols:
+        conn.execute("ALTER TABLE lead_client_research ADD COLUMN person_story TEXT")
+    if "outreach_json" not in cols:
+        conn.execute("ALTER TABLE lead_client_research ADD COLUMN outreach_json TEXT")
+
+
+def _migrate_lead_client_research_photo_blob(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(lead_client_research)").fetchall()}
+    if "photo_blob" not in cols:
+        conn.execute("ALTER TABLE lead_client_research ADD COLUMN photo_blob BLOB")
+    if "photo_mime" not in cols:
+        conn.execute("ALTER TABLE lead_client_research ADD COLUMN photo_mime TEXT")
+
+
+def get_lead_client_research(
+    conn: sqlite3.Connection, cik: str, person_norm: str
+) -> Optional[sqlite3.Row]:
+    ck = (cik or "").strip()
+    pn = (person_norm or "").strip()
+    if not ck or not pn:
+        return None
+    try:
+        return conn.execute(
+            "SELECT * FROM lead_client_research WHERE cik = ? AND person_norm = ?",
+            (ck, pn),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+
+
+def get_issuer_website_for_cik(conn: sqlite3.Connection, cik: str) -> str:
+    """Latest non-empty issuer website for CIK (filings)."""
+    ck = (cik or "").strip()
+    if not ck:
+        return ""
+    r = conn.execute(
+        """
+        SELECT issuer_website FROM filings
+        WHERE cik = ? AND issuer_website IS NOT NULL
+          AND TRIM(issuer_website) != ''
+          AND (issuer_website LIKE 'http://%' OR issuer_website LIKE 'https://%')
+        ORDER BY COALESCE(filing_date, '') DESC, id DESC
+        LIMIT 1
+        """,
+        (ck,),
+    ).fetchone()
+    return (r[0] or "").strip() if r else ""
+
+
 def get_allocation_settings(conn: sqlite3.Connection) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM allocation_settings WHERE id = 1").fetchone()
     assert row is not None
@@ -835,6 +1019,8 @@ def list_lead_profiles_for_review(
     cross_only: bool = False,
     s1_only: bool = True,
     months_back: Optional[int] = 6,
+    pay_band: str = "all",
+    us_registrant_hq_only: bool = False,
 ) -> list[sqlite3.Row]:
     """
     Pipeline review rows. By default only NEO rows tied to an S-1-family filing
@@ -844,12 +1030,28 @@ def list_lead_profiles_for_review(
     Sorted newest filing first.
     """
     try:
+        from wealth_leads.config import lead_desk_equity_only_min_usd
+
         sql = "SELECT * FROM lead_profile WHERE 1=1"
         params: list[object] = []
         if s1_only:
             sql += " AND (has_s1_comp = 1 OR lead_tier = 'visibility')"
         if cross_only:
             sql += " AND cross_company_hint = 1"
+        b = (pay_band or "all").strip().lower()
+        if b not in ("", "all"):
+            col = "equity_hwm" if lead_desk_equity_only_min_usd() else "signal_hwm"
+            if b in ("million_plus", "1m", "high"):
+                sql += f" AND COALESCE({col}, 0) >= ?"
+                params.append(1_000_000.0)
+            elif b in ("quarter_to_million", "mid", "250k"):
+                sql += (
+                    f" AND COALESCE({col}, 0) >= ? AND COALESCE({col}, 0) < ?"
+                )
+                params.extend([250_000.0, 1_000_000.0])
+            elif b in ("under_quarter", "low", "rest"):
+                sql += f" AND COALESCE({col}, 0) < ?"
+                params.append(250_000.0)
         if months_back is not None and months_back > 0:
             from datetime import date, timedelta
 
@@ -865,7 +1067,21 @@ def list_lead_profiles_for_review(
             )
             params.extend([pat, pat, pat, pat, pat, pat])
         sql += " ORDER BY filing_date_latest DESC, cik, person_norm LIMIT ?"
-        params.append(max(1, min(int(limit), 5000)))
-        return list(conn.execute(sql, params).fetchall())
+        fetch_cap = max(1, min(int(limit), 5000))
+        if us_registrant_hq_only:
+            fetch_cap = max(1, min(fetch_cap * 5, 5000))
+        params.append(fetch_cap)
+        rows = list(conn.execute(sql, params).fetchall())
+        if us_registrant_hq_only:
+            from wealth_leads.territory import registrant_hq_line_parses_as_united_states
+
+            rows = [
+                r
+                for r in rows
+                if registrant_hq_line_parses_as_united_states(
+                    (r["issuer_headquarters"] or "").strip()
+                )
+            ][: max(1, min(int(limit), 5000))]
+        return rows
     except sqlite3.OperationalError:
         return []

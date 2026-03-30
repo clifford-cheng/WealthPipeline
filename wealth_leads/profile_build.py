@@ -106,8 +106,71 @@ def _neo_row_count(conn: sqlite3.Connection, cik: str, person_norm: str) -> int:
     return n
 
 
+def _opt_float(v: object) -> object:
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _imputed_other_from_total(p: dict) -> object:
+    """When SCT 'All other' cell is missing, derive from reported total minus other components."""
+    t = _opt_float(p.get("total"))
+    if t is None:
+        return None
+    s = 0.0
+    for k in (
+        "salary",
+        "bonus",
+        "stock_awards",
+        "option_awards",
+        "non_equity_incentive",
+        "pension_change",
+    ):
+        v = _opt_float(p.get(k))
+        if v is not None:
+            s += float(v)
+    r = float(t) - s
+    if r < -2.0:
+        return None
+    return max(0.0, r)
+
+
+def _effective_other_comp(p: dict) -> object:
+    direct = _opt_float(p.get("other_comp"))
+    if direct is not None:
+        return direct
+    return _imputed_other_from_total(p)
+
+
+def _headline_comp_columns(p: dict) -> tuple[object, object, object, object]:
+    """
+    Headline FY from SCT: salary, bonus, other compensation, and sum of stock + option awards.
+    """
+    if not p.get("has_summary_comp") or p.get("headline_year") is None:
+        return None, None, None, None
+    sal = _opt_float(p.get("salary"))
+    bonus = _opt_float(p.get("bonus"))
+    other = _effective_other_comp(p)
+    grants = 0.0
+    any_g = False
+    for x in (p.get("stock_awards"), p.get("option_awards")):
+        if x is not None:
+            try:
+                grants += float(x)
+                any_g = True
+            except (TypeError, ValueError):
+                pass
+    stk: object = grants if any_g else None
+    return sal, bonus, other, stk
+
+
 def rebuild_lead_profiles(conn: sqlite3.Connection) -> dict[str, Any]:
+    from wealth_leads.crm_ui import format_headquarters_for_ui
     from wealth_leads.serve import _build_profiles
+    from wealth_leads.territory import hq_city_state_display, hq_has_registrant_address_detail
 
     profiles = _build_profiles(conn)
     if not profiles:
@@ -158,6 +221,16 @@ def rebuild_lead_profiles(conn: sqlite3.Connection) -> dict[str, Any]:
         summ = (p.get("issuer_summary") or "").strip()
         summ_ex = (summ[:600] + "…") if len(summ) > 600 else summ
         llm_comp = 1 if _neo_llm_assisted_for_person(conn, fids, pn) else 0
+        sal_h, bonus_h, other_h, stk_h = _headline_comp_columns(p)
+        tot_h = (
+            _opt_float(p.get("total"))
+            if p.get("has_summary_comp") and p.get("headline_year") is not None
+            else None
+        )
+
+        hq_line = format_headquarters_for_ui((p.get("issuer_headquarters") or ""))[:500]
+        hq_cs = (hq_city_state_display(hq_line)[:120] if hq_line else "") or ""
+        hq_detail = 1 if (hq_line and hq_has_registrant_address_detail(hq_line)) else 0
 
         rows.append(
             (
@@ -180,6 +253,11 @@ def rebuild_lead_profiles(conn: sqlite3.Connection) -> dict[str, Any]:
                 int(p["headline_year"])
                 if p.get("headline_year") is not None
                 else None,
+                tot_h,
+                sal_h,
+                bonus_h,
+                other_h,
+                stk_h,
                 1 if p.get("has_s1_comp") else 0,
                 has_bio,
                 has_off,
@@ -193,6 +271,8 @@ def rebuild_lead_profiles(conn: sqlite3.Connection) -> dict[str, Any]:
                 json.dumps(others),
                 llm_comp,
                 (p.get("lead_tier") or "premium")[:24],
+                hq_cs,
+                hq_detail,
                 built_at,
             )
         )
@@ -205,16 +285,18 @@ def rebuild_lead_profiles(conn: sqlite3.Connection) -> dict[str, Any]:
             filing_date_latest, accession_latest, primary_doc_url, form_type_latest,
             issuer_headquarters, issuer_industry, issuer_website, index_url,
             equity_hwm, total_hwm, signal_hwm, headline_year,
+            total_headline,
+            salary_headline, bonus_headline, other_comp_headline, stock_grants_headline,
             has_s1_comp, has_mgmt_bio, has_officer_row, neo_row_count,
             comp_timeline, issuer_summary_excerpt, why_surfaced,
             neo_filing_ids_json, quality_score, cross_company_hint, other_ciks_json,
-            comp_llm_assisted, lead_tier, built_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            comp_llm_assisted, lead_tier, issuer_hq_city_state, issuer_hq_has_detail, built_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         rows,
     )
     return {
         "profiles_source": len(profiles),
         "rows_written": len(rows),
-        "cross_company_flagged": sum(1 for r in rows if r[26] == 1),
+        "cross_company_flagged": sum(1 for r in rows if r[31] == 1),
     }

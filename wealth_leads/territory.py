@@ -74,8 +74,9 @@ _MONTH_DAY_YEAR = re.compile(
     re.I,
 )
 _SLASH_DATE = re.compile(r"\b\d{1,2}/\d{1,2}/(?:19|20)?\d{2}\b")
+# Use ``fl\.`` only — a bare ``FL`` is almost always a U.S. state, not ``floor``.
 _STREET_NOISE = re.compile(
-    r"\b(suite|ste\.?|unit|floor|fl\.?|bldg|building|attention|attn\.?|"
+    r"\b(suite|ste\.?|unit|floor|fl\.|bldg|building|attention|attn\.?|"
     r"p\.?o\.?\s*box|po\s*box|c/o)\b",
     re.I,
 )
@@ -144,6 +145,19 @@ def extract_territory_keys_from_hq(hq: str) -> list[str]:
     return keys
 
 
+def registrant_hq_line_parses_as_united_states(hq: str | None) -> bool:
+    """
+    True when the registrant principal-office line yields U.S. state and/or ZIP keys
+    (same signals as ``extract_territory_keys_from_hq``).
+
+    U.S. SEC registrants often incorporate in Nevada/Delaware but disclose a **non-U.S.**
+    principal executive office (e.g. Hong Kong). Those addresses usually contain no U.S.
+    ZIP or state name, so this returns False even though the company files U.S. registration
+    statements such as an S-1.
+    """
+    return bool(extract_territory_keys_from_hq((hq or "").strip()))
+
+
 def _strip_leading_calendar_prefixes(s: str) -> str:
     """Remove effective-date clauses often prepended to SEC address blobs (e.g. 'March 30, 2026, ')."""
     s = (s or "").strip()
@@ -193,6 +207,79 @@ def strip_registrant_hq_contact_tail(s: str) -> str:
         flags=re.I,
     )
     return t.rstrip(" ,")
+
+
+_LEASE_OR_RENTAL_CUT = re.compile(
+    r"(?:^|[,;\s])(?:with\s+the\s+lease\s+expiring\b|at\s+a\s+monthly\s+rental\b|"
+    r"monthly\s+rental\s+cost\b|rental\s+cost\s+of\b)",
+    re.I,
+)
+
+
+def strip_hq_lease_and_rental_tail(s: str) -> str:
+    """
+    Cut off lease / rent narrative sometimes concatenated to a principal-office capture
+    (common in foreign subsidiary / facility descriptions). Handles clauses at the start
+    of the string or after a space (no comma).
+    """
+    t = (s or "").strip()
+    for _ in range(16):
+        m = _LEASE_OR_RENTAL_CUT.search(t)
+        if not m:
+            break
+        t = t[: m.start()].strip(" ,")
+    return t
+
+
+def headquarters_looks_like_lease_narrative(hq: str | None) -> bool:
+    """True when the blob is clearly a rental / lease clause, not a registrant street line."""
+    low = (hq or "").lower()
+    if not low.strip():
+        return False
+    return any(
+        x in low
+        for x in (
+            "monthly rental",
+            "lease expiring",
+            "with the lease",
+            "rental cost of rmb",
+            "at a monthly rental",
+            "rental cost of",
+        )
+    )
+
+
+def hq_city_state_looks_like_filing_noise(s: str | None) -> bool:
+    """True when a city/state display string is clearly SEC boilerplate, not a location."""
+    low = (s or "").strip().lower()
+    if not low:
+        return False
+    return any(
+        x in low
+        for x in (
+            "lease expir",
+            "with the lease",
+            "monthly rental",
+            "at a monthly rental",
+            "identification number",
+            "employer identification",
+            "irs employer",
+            "i.r.s. employer",
+            "i.r.s employer",
+            "primary standard industrial",
+            "classification code number",
+        )
+    )
+
+
+def _finalize_city_state_no_zip(display: str) -> str:
+    """Ensure pipeline / DB city-state field never ends with a US ZIP."""
+    t = (display or "").strip()
+    if not t:
+        return ""
+    t = re.sub(r",\s*([A-Z]{2})\s+\d{5}(?:-\d{4})?\s*$", r", \1", t, flags=re.I)
+    t = re.sub(r"\s+\d{5}(?:-\d{4})?\s*$", "", t)
+    return t.strip(" ,")
 
 
 _STREET_TYPE_WORD = re.compile(
@@ -254,6 +341,13 @@ def _segment_is_location_noise(seg: str) -> bool:
         return True
     if "®" in s and len(s) < 6:
         return True
+    if re.search(r"(?i)lease\s+expir|with\s+the\s+lease|monthly\s+rental", s):
+        return True
+    if re.search(
+        r"(?i)employer\s+identification|identification\s+number|i\.?\s*r\.?\s*s\.?\s*employer",
+        s,
+    ):
+        return True
     return False
 
 
@@ -270,18 +364,36 @@ def _us_state_abbr_from_token(tok: str) -> Optional[str]:
 
 def hq_city_state_display(hq: str | None) -> str:
     """
-    City + US state, or city + country / region — never street or ZIP.
-    Parses comma-separated SEC principal-office blobs after scrubbing dates/noise.
+    City + US state (2-letter), or city + country / region — no street, no US ZIP.
+    For materialized ``issuer_hq_city_state`` and pipeline Location column.
     """
-    raw = _scrub_hq_for_location(hq or "")
+    def _emit(line: str) -> str:
+        t = _finalize_city_state_no_zip((line or "").strip())
+        if not t or hq_city_state_looks_like_filing_noise(t):
+            return ""
+        return t
+
+    s0 = strip_hq_lease_and_rental_tail(
+        strip_registrant_hq_contact_tail(hq or "")
+    )
+    raw = _scrub_hq_for_location(s0)
     if not raw:
+        return ""
+    if headquarters_looks_like_lease_narrative(raw) and not re.search(
+        r"(?i)\b(street|st\.|avenue|road|suite|room|floor|building|hong\s+kong)\b",
+        raw,
+    ):
         return ""
     parts = [p.strip() for p in raw.split(",") if p.strip()]
     clean = [p for p in parts if not _segment_is_location_noise(p)]
     if not clean:
         return ""
 
-    last_tok = clean[-1]
+    def _strip_zip_from_seg(seg: str) -> str:
+        return re.sub(r"\s+\d{5}(?:-\d{4})?\s*$", "", (seg or "").strip()).strip()
+
+    # e.g. "Houston, Texas 77056" — strip ZIP before full state name → abbr
+    last_tok = _strip_zip_from_seg(clean[-1])
     st = _us_state_abbr_from_token(last_tok)
     if st:
         i = len(clean) - 2
@@ -293,28 +405,35 @@ def hq_city_state_display(hq: str | None) -> str:
             if len(seg) < 2:
                 i -= 1
                 continue
-            return f"{seg}, {st}"
-        return st
+            return _emit(f"{_strip_zip_from_seg(seg)}, {st}")
 
     if len(clean) >= 2:
         a, b = clean[-2], clean[-1]
-        if not _segment_is_location_noise(a) and not _segment_is_location_noise(b):
-            if len(b) <= 32 and len(a) <= 80:
-                return f"{a}, {b}"
-    one = clean[-1]
+        b2 = _strip_zip_from_seg(b)
+        a2 = _strip_zip_from_seg(a)
+        st_b = _us_state_abbr_from_token(b2)
+        if st_b:
+            return _emit(f"{a2}, {st_b}")
+        if not _segment_is_location_noise(a2) and not _segment_is_location_noise(b2):
+            if len(b2) <= 36 and len(a2) <= 80:
+                return _emit(f"{a2}, {b2}")
+    one = _strip_zip_from_seg(clean[-1])
     if len(one) <= 48 and not re.match(r"^\d", one):
         if _segment_is_location_noise(one) or _MONTH_DAY_ONLY.match(one):
             return ""
-        return one
+        return _emit(one)
     return ""
 
 
 def hq_principal_office_display_line(hq: str | None, *, max_len: int = 800) -> str:
     """
-    Single-line registrant principal office for UI (cleaned filing text; may include street).
-    Use alongside hq_city_state_display for city/state headline.
+    Single-line registrant principal office for UI (cleaned filing text; may include street + ZIP).
+    Use on the lead profile for the full company address; use hq_city_state_display for city/state only.
     """
-    s = _scrub_hq_for_location(hq or "").strip(" ,")
+    s0 = strip_hq_lease_and_rental_tail(
+        strip_registrant_hq_contact_tail(hq or "")
+    )
+    s = _scrub_hq_for_location(s0).strip(" ,")
     if not s:
         return ""
     segs = [p.strip() for p in s.split(",") if p.strip()]
@@ -336,6 +455,8 @@ def is_plausible_registrant_headquarters(hq: str | None) -> bool:
     sanity checks here when selecting among filings.
     """
     s = (hq or "").strip()
+    if headquarters_looks_like_lease_narrative(s):
+        return False
     if len(s) < 8:
         return False
     if re.search(r"\(?zip\s+code\)?", s, re.I) and len(s) <= 48 and not re.search(

@@ -73,6 +73,16 @@ def lead_desk_s1_only() -> bool:
     return v not in ("0", "false", "no", "off")
 
 
+def lead_desk_us_registrant_hq_only() -> bool:
+    """
+    If true, the lead desk and admin pipeline list/CSV hide rows whose registrant HQ line
+    does not parse to a U.S. state or ZIP (see ``registrant_hq_line_parses_as_united_states``).
+    Default on for U.S.-advisor workflows; set WEALTH_LEADS_DESK_US_HQ_ONLY=0 to show all.
+    """
+    v = os.environ.get("WEALTH_LEADS_DESK_US_HQ_ONLY", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
 def lead_desk_min_signal_usd() -> float:
     """
     Minimum "best single fiscal year" pay signal for the desk: max(SCT total, stock+options)
@@ -110,6 +120,30 @@ def app_allow_public_signup() -> bool:
 
 def app_listen_port() -> int:
     return int(os.environ.get("WEALTH_LEADS_APP_PORT", "8080"))
+
+
+def pipeline_blur_comp_columns() -> bool:
+    """
+    When True, pipeline review blurs pay / comp columns (demo of post-pay unlock UX).
+    """
+    return os.environ.get("WEALTH_LEADS_PIPELINE_BLUR_COMP", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def uvicorn_reload_enabled() -> bool:
+    """
+    When True, `py -m wealth_leads serve-app` runs uvicorn with --reload so code edits apply without a manual restart.
+    """
+    return os.environ.get("WEALTH_LEADS_UVICORN_RELOAD", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def require_app_auth() -> bool:
@@ -188,12 +222,80 @@ def ollama_s1_model() -> str:
     return m or "llama3.1"
 
 
+def s1_ai_max_chars() -> int:
+    """Max characters of plain text sent to the LLM for enrich-s1-ai (after HTML strip)."""
+    try:
+        n = int(os.environ.get("WEALTH_LEADS_S1_AI_MAX_CHARS", "100000").strip())
+    except (TypeError, ValueError):
+        n = 100_000
+    return max(24_000, min(n, 500_000))
+
+
+def s1_ai_document_mode() -> str:
+    """
+    How to build the text excerpt for enrich-s1-ai before calling the model:
+
+    - windows (default): merge cover + phrase windows (comp, ownership, HQ, …). Good when
+      the filing is long and the model context is capped.
+
+    - linear / sequential / top / natural: single contiguous slice from the start of the
+      plain filing (cover and prospectus summary first). Lets the model "read forward" like
+      a human; raise WEALTH_LEADS_S1_AI_MAX_CHARS if your model fits more.
+
+    - bookend / headtail: ~72% from the start + ~28% from the end (comp tables often
+      appear later). Middle omitted.
+    """
+    v = os.environ.get("WEALTH_LEADS_S1_AI_DOCUMENT_MODE", "windows").strip().lower()
+    if v in ("linear", "sequential", "top", "natural", "read"):
+        return "linear"
+    if v in ("bookend", "ends", "headtail", "head_tail"):
+        return "bookend"
+    return "windows"
+
+
 def anthropic_api_key() -> str:
     """Anthropic API key for enrich-s1-ai when provider is anthropic."""
     return (
         os.environ.get("WEALTH_LEADS_ANTHROPIC_API_KEY", "").strip()
         or os.environ.get("ANTHROPIC_API_KEY", "").strip()
     )
+
+
+def enrich_client_research_after_sync_enabled() -> bool:
+    """
+    When true, `sync` runs a capped `enrich-client-research` pass after rebuild-profiles
+    (website photos / LinkedIn hints — still no LinkedIn scraping).
+    """
+    return os.environ.get(
+        "WEALTH_LEADS_ENRICH_WEB_AFTER_SYNC", "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def enrich_client_research_after_sync_limit() -> int:
+    """Max lead profiles to enrich per sync when WEALTH_LEADS_ENRICH_WEB_AFTER_SYNC=1."""
+    try:
+        n = int(os.environ.get("WEALTH_LEADS_ENRICH_WEB_AFTER_SYNC_LIMIT", "12"))
+    except (TypeError, ValueError):
+        n = 12
+    return max(1, min(n, 200))
+
+
+def email_smtp_verify_enabled() -> bool:
+    """
+    When true, enrich-client-research may perform SMTP RCPT probes for guessed addresses.
+    Off by default; many networks block outbound port 25; results are often non-authoritative.
+    """
+    return os.environ.get("WEALTH_LEADS_EMAIL_SMTP_VERIFY", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def email_smtp_mail_from() -> str:
+    """Optional MAIL FROM for RCPT probes (some MX require a plausible domain)."""
+    return os.environ.get("WEALTH_LEADS_SMTP_MAIL_FROM", "").strip()
 
 
 def anthropic_s1_model() -> str:

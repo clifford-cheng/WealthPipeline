@@ -6,8 +6,20 @@ from typing import Optional
 from bs4 import BeautifulSoup
 
 from wealth_leads.officers import _clean_name, _clean_title
+from wealth_leads.person_quality import (
+    is_acceptable_lead_person_name,
+    refine_lead_person_name,
+)
+from wealth_leads.territory import (
+    is_plausible_registrant_headquarters,
+    strip_hq_lease_and_rental_tail,
+    strip_registrant_hq_contact_tail,
+)
 
 OfficerRow = tuple[str, str, str, Optional[int]]  # name, title, source, age (management tables)
+
+# Long TOC / inline-XBRL noise can push the cover page past 50k plain-text chars.
+_HQ_EARLY_TEXT_CHARS = 120_000
 
 # Phrases typical of comp/governance pages — not a business description.
 _ISSUER_SUMMARY_SPAM = (
@@ -239,7 +251,28 @@ def extract_executive_officers_from_filing_html(html: str) -> list[OfficerRow]:
                 continue
             name = _clean_name_table(name_raw)
             title = _clean_title_table(title_raw)
+            if (not name or not title) or (
+                bool(name)
+                and bool(title)
+                and not is_acceptable_lead_person_name(name)
+            ):
+                alt_name = _clean_name_table(title_raw)
+                alt_title = _clean_title_table(name_raw)
+                if (
+                    alt_name
+                    and alt_title
+                    and is_acceptable_lead_person_name(alt_name)
+                ):
+                    name, title = alt_name, alt_title
+            if name and not is_acceptable_lead_person_name(name):
+                refined = refine_lead_person_name(name_raw) or refine_lead_person_name(
+                    title_raw
+                )
+                if refined:
+                    name = refined
             if not name or not title:
+                continue
+            if not is_acceptable_lead_person_name(name):
                 continue
             age_val: Optional[int] = None
             if age_i is not None and len(cells) > age_i:
@@ -357,6 +390,11 @@ _HQ_RE = re.compile(
     r"([^.]{3,240})",
     re.I | re.S,
 )
+# Same heading but address immediately after colon on one line (common on cover HTML).
+_HQ_RE_COLON = re.compile(
+    r"(?:our\s+)?principal\s+executive\s+offices?\s*:\s*([^\n]{8,400})",
+    re.I,
+)
 _HQ_PLACE = re.compile(
     r"(?:principal\s+place\s+of\s+business|registered\s+office|"
     r"mailing\s+address\s+of\s+our\s+principal|business\s+address)\s*[:-]?\s*"
@@ -364,7 +402,8 @@ _HQ_PLACE = re.compile(
     re.I | re.S,
 )
 _HQ_LINE_LABEL = re.compile(
-    r"^(?:principal executive offices?|mailing address|business address|"
+    r"^(?:principal executive offices?|our\s+principal\s+executive\s+offices?|"
+    r"corporate\s+headquarters|mailing address|business address|"
     r"address\s+of\s+principal)\s*:?\s*$",
     re.I,
 )
@@ -411,7 +450,278 @@ def _hq_clean(chunk: str) -> str:
         flags=re.I,
     )
     s = re.sub(r"\s+([\.,])", r"\1", s)
-    return s[:240] if len(s) >= 4 else ""
+    # Sentence-style prospectus lines: "…Houston, TX, and our telephone number at that address is …"
+    s = re.sub(
+        r",?\s*and\s+our\s+telephone\s+number\s+at\s+(?:that|this)\s+address\s+is\s+.+$",
+        "",
+        s,
+        flags=re.I,
+    )
+    s = re.sub(r",?\s*and\s+the\s+telephone\s+number\s+(?:at|there)\s+.+$", "", s, flags=re.I)
+    s = strip_hq_lease_and_rental_tail(strip_registrant_hq_contact_tail(s))
+    s = s.rstrip(" ,")
+    return s[:500] if len(s) >= 4 else ""
+
+
+# S-1 cover: street / city / phone first, then this caption (label is *below* the block).
+_HQ_SEC_REGISTRANT_ADDRESS_CAPTION = re.compile(
+    r"\(\s*Address,\s+including\s+zip\s+code[^)]{0,260}"
+    r"principal\s+executive\s+offices?\s*\)",
+    re.I | re.S,
+)
+
+_HQ_COVER_PHONE_ONLY = re.compile(
+    r"^[\s(]*(?:\+?1[\s.-]*)?\(?\d{3}\)?[\s.-]*\d{3}[\s.-]*\d{4}[\s)]*$"
+)
+
+
+def _hq_cover_line_skip(ln: str) -> bool:
+    """Skip phone / fax lines and EIN-like numeric lines on SEC covers (not street numbers)."""
+    s = (ln or "").replace("\xa0", " ").strip()
+    if not s or len(s) <= 1:
+        return True
+    low = s.lower()
+    if _HQ_COVER_PHONE_ONLY.match(s):
+        return True
+    if re.match(
+        r"^(telephone|phone|fax|facsimile|tel\.|toll[\s-]?free)\s*[:.]?\s*",
+        low,
+    ):
+        return True
+    if re.match(r"^\(\s*\d{3}\s*\)\s*$", s):
+        return True
+    # I.R.S. Employer Identification No. value (do not treat as phone)
+    if re.match(r"^\d{2}-\d{7}\s*$", s):
+        return True
+    return False
+
+
+def _hq_cover_line_is_probable_person_name_only(ln: str) -> bool:
+    """Bare 'Firstname Lastname' lines above the street on some covers (no title on same line)."""
+    s = (ln or "").replace("\xa0", " ").strip()
+    if not s or len(s) > 72 or re.search(r"\d", s):
+        return False
+    if re.search(
+        r"\b(street|st\.|avenue|suite|president|director|chief|officer|secretary|treasurer)\b",
+        s.lower(),
+    ):
+        return False
+    return bool(re.match(r"^[A-Z][a-z]+(?:\s+[A-Z][a-z'.-]+){1,4}$", s))
+
+
+def _hq_cover_line_is_officer_filler(ln: str) -> bool:
+    """
+    True for 'Name, President and CEO' lines some S-1s stack above the street on the cover.
+    When scanning upward from the registrant-address caption, stop before those lines.
+    When scanning downward after a 'Principal executive offices' label, skip them.
+    """
+    s = (ln or "").replace("\xa0", " ").strip()
+    if not s:
+        return False
+    low = s.lower()
+    if re.search(r"\d", s):
+        return False
+    if re.search(
+        r"\b(street|st\.|avenue|ave\.|boulevard|blvd|road|rd\.|drive|dr\.|lane|ln\.|suite|ste\.|"
+        r"floor|fl\.|room|rm\.|building|bldg|plaza|highway|hwy|way|circle|cir\.|"
+        r"parkway|route|rt\.|county|region|province)\b",
+        low,
+    ):
+        return False
+    return bool(
+        re.search(
+            r"\b(?:president|chief\s+executive|chief\s+financial|chief\s+accounting|"
+            r"treasurer|secretary|vice\s+president|chief\s+operating|general\s+counsel|"
+            r"chairman|chairperson|director|executive\s+officer)\b",
+            low,
+        )
+    )
+
+
+def _hq_from_sec_registrant_address_caption(head_text: str) -> str:
+    """
+    SEC Form cover often lists the principal office street/city/phone, then the parenthetical
+    '(Address, including zip code, … of registrant's principal executive offices)'.
+    Our 'label above address' heuristics miss that; this reads the lines immediately above the caption.
+    """
+    m = _HQ_SEC_REGISTRANT_ADDRESS_CAPTION.search(head_text)
+    if not m:
+        return ""
+    before = head_text[: m.start()].rstrip()
+    lines = [ln.strip() for ln in before.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    collected: list[str] = []
+    for ln in reversed(lines[-14:]):
+        if _hq_cover_line_skip(ln):
+            continue
+        low = ln.lower()
+        if low in ("(", ")") or len(ln) == 1:
+            continue
+        if re.match(
+            r"^(table of contents|form s-\d|united states|securities and exchange commission)\b",
+            low,
+        ):
+            break
+        if re.match(r"^\(?i\.r\.s\.", low) or "identification no" in low:
+            break
+        if low.startswith("(primary standard") or "classification code number" in low:
+            break
+        if re.match(
+            r"^(exact name of registrant|state or other jurisdiction|of incorporation)\b",
+            low,
+        ):
+            break
+        if _hq_cover_line_is_officer_filler(ln):
+            break
+        if _hq_cover_line_is_probable_person_name_only(ln):
+            continue
+        collected.append(ln)
+        if len(collected) >= 4:
+            break
+    if len(collected) < 2:
+        if len(collected) == 1 and re.search(r"\d", collected[0]) and "," in collected[0]:
+            got = _hq_clean(collected[0])
+            return got if len(got) >= 10 else ""
+        return ""
+    street_city = list(reversed(collected))
+    joined = ", ".join(street_city)
+    got = _hq_clean(joined)
+    if got and len(got) >= 10 and re.search(r"\d", got):
+        return got
+    return ""
+
+
+# iXBRL-heavy S-1 covers: street / city / state lines, then "(Address of principal executive offices)",
+# then ZIP on its own line (no "Address, including zip code…" caption in plain text).
+_ADDR_OF_PRINC_EXEC_COVER = re.compile(
+    r"^\(\s*Address\s+of\s+principal\s+executive\s+offices?\s*\)\s*$",
+    re.I,
+)
+
+
+def _hq_ixbrl_cover_before_address_of_principal(head_text: str) -> str:
+    lines = [ln.strip() for ln in head_text.splitlines() if ln.strip()]
+    for i, ln in enumerate(lines):
+        if not _ADDR_OF_PRINC_EXEC_COVER.match(ln):
+            continue
+        stop = re.compile(
+            r"^(?:\(?(?:Exact\s+Name|I\.R\.S\.|Employer|Identification|Primary\s+Standard)|"
+            r"State\s+or\s+other\s+jurisdiction|of\s+incorporation)",
+            re.I,
+        )
+        chunks: list[str] = []
+        for j in range(i - 1, max(-1, i - 22), -1):
+            x = lines[j].strip()
+            if _hq_cover_line_skip(x):
+                continue
+            if x in (",", "—", "-", "–"):
+                continue
+            if stop.match(x):
+                break
+            low = x.lower()
+            if low.startswith("(exact name") or "as specified in its charter" in low:
+                break
+            if low.startswith("(state or other") or low.startswith("(primary standard"):
+                break
+            if low.startswith("(i.r.s") or "identification no" in low:
+                break
+            if _hq_cover_line_is_officer_filler(x):
+                break
+            if _hq_cover_line_is_probable_person_name_only(x):
+                continue
+            chunks.append(x)
+        if len(chunks) < 2:
+            continue
+        parts = list(reversed(chunks))
+        joined = ", ".join(parts)
+        zip_tail = ""
+        if i + 1 < len(lines) and re.match(r"^\d{5}(?:-\d{4})?$", lines[i + 1]):
+            zip_tail = " " + lines[i + 1]
+        got = _hq_clean(joined + zip_tail)
+        if got and len(got) >= 12 and re.search(r"\d", got):
+            return got
+    return ""
+
+
+_HQ_LABEL_INLINE = re.compile(
+    r"(?im)^(principal\s+executive\s+offices?|our\s+principal\s+executive\s+offices?|"
+    r"corporate\s+headquarters)\s*:\s*(.+)$",
+)
+
+
+def _hq_multiline_after_principal_label(head_text: str) -> str:
+    """
+    Cover / summary pages often use:
+      Principal executive offices
+      123 Main Street
+      City, ST 12345
+    (no 'located at' — our old regex missed that.)
+    """
+    lines = [ln.strip() for ln in head_text.splitlines() if ln.strip()]
+    label_only = re.compile(
+        r"^(principal\s+executive\s+offices?|our\s+principal\s+executive\s+offices?|"
+        r"corporate\s+headquarters|address\s+of\s+principal\s+executive\s+offices?)\s*:?\s*$",
+        re.I,
+    )
+    label_with_value = re.compile(
+        r"^(principal\s+executive\s+offices?|our\s+principal\s+executive\s+offices?|"
+        r"corporate\s+headquarters)\s*:\s*(.+)$",
+        re.I,
+    )
+    stop = re.compile(
+        r"^(telephone|phone|fax|toll[\s-]?free|website|e-?mail|internet\s+address|"
+        r"table\s+of\s+contents|prospectus\s+summary|the\s+offering|risk\s+factors|"
+        r"part\s+i\b|item\s+1\.?\b)",
+        re.I,
+    )
+    for i, ln in enumerate(lines):
+        mv = label_with_value.match(ln)
+        if mv:
+            got = _hq_clean(mv.group(2))
+            if got and len(got) >= 10 and (re.search(r"\d", got) or "," in got):
+                return got
+        if not label_only.match(ln):
+            continue
+        parts: list[str] = []
+        for j in range(i + 1, min(i + 6, len(lines))):
+            nx = lines[j]
+            if stop.match(nx):
+                break
+            if len(nx) < 2:
+                continue
+            if _hq_cover_line_is_officer_filler(nx):
+                continue
+            if nx.isupper() and len(nx) < 50 and not re.search(r"\d", nx):
+                break
+            parts.append(nx)
+        if not parts:
+            continue
+        joined = " ".join(parts)
+        if sum(1 for p in parts if "," in p) >= 1:
+            joined = ", ".join(p.strip() for p in parts)
+        got = _hq_clean(joined)
+        if got and len(got) >= 10 and (re.search(r"\d", got) or "," in got):
+            return got
+    return ""
+
+
+def _hq_from_early_document_text(text_nl: str) -> str:
+    """Early plain text: SEC cover caption block, iXBRL cover, inline label, multiline label + address."""
+    if not text_nl:
+        return ""
+    head = text_nl[: min(len(text_nl), _HQ_EARLY_TEXT_CHARS)]
+    cap = _hq_from_sec_registrant_address_caption(head)
+    if cap:
+        return cap
+    ix = _hq_ixbrl_cover_before_address_of_principal(head)
+    if ix:
+        return ix
+    for m in _HQ_LABEL_INLINE.finditer(head):
+        got = _hq_clean((m.group(2) or "").strip())
+        if got and len(got) >= 10 and (re.search(r"\d", got) or "," in got):
+            return got
+    return _hq_multiline_after_principal_label(head)
 
 
 def _extract_hq_from_cover_tables(soup: BeautifulSoup) -> str:
@@ -431,6 +741,9 @@ def _extract_hq_from_cover_tables(soup: BeautifulSoup) -> str:
             ) or ("headquarters" in label and "address" not in label):
                 if re.search(r"\d", val) or ("," in val and len(val) > 12):
                     return _hq_clean(val)
+            if "corporate" in label and "headquarters" in label:
+                if re.search(r"\d", val) or ("," in val and len(val) > 10):
+                    return _hq_clean(val)
             if "address" in label and "principal" in label:
                 if re.search(r"\d", val) or "," in val:
                     return _hq_clean(val)
@@ -441,22 +754,33 @@ def extract_issuer_headquarters_from_filing_html(html: str) -> str:
     """Short HQ / principal office line from filing text and cover tables (heuristic)."""
     soup = BeautifulSoup(html, "html.parser")
     tab = _extract_hq_from_cover_tables(soup)
-    if tab:
+    if tab and is_plausible_registrant_headquarters(tab):
         return tab
 
     text_nl = soup.get_text("\n", strip=True)
+    early = _hq_from_early_document_text(text_nl)
+    if early and is_plausible_registrant_headquarters(early):
+        return early
+
     flat = re.sub(r"[\s\xa0]+", " ", soup.get_text(" ", strip=True))
+    head_flat = flat[: min(len(flat), _HQ_EARLY_TEXT_CHARS)]
+    mc = _HQ_RE_COLON.search(head_flat)
+    if mc:
+        got = _hq_clean(mc.group(1))
+        if got and (re.search(r"\d", got) or "," in got):
+            if is_plausible_registrant_headquarters(got):
+                return got
 
     for body in (flat, text_nl):
         m = _HQ_RE.search(body)
         if m:
             got = _hq_clean(m.group(1))
-            if got:
+            if got and is_plausible_registrant_headquarters(got):
                 return got
         m2 = _HQ_PLACE.search(body)
         if m2:
             got = _hq_clean(m2.group(1))
-            if got:
+            if got and is_plausible_registrant_headquarters(got):
                 return got
 
     lines = [ln.strip() for ln in text_nl.splitlines() if ln.strip()]
@@ -464,7 +788,9 @@ def extract_issuer_headquarters_from_filing_html(html: str) -> str:
         if _HQ_LINE_LABEL.match(ln):
             nxt = lines[i + 1]
             if len(nxt) >= 8 and (re.search(r"\d", nxt) or "," in nxt):
-                return _hq_clean(nxt)
+                got = _hq_clean(nxt)
+                if is_plausible_registrant_headquarters(got):
+                    return got
     return ""
 
 

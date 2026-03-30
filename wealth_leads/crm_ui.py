@@ -2,9 +2,19 @@
 from __future__ import annotations
 
 import html as html_module
+import math
 import re
 from typing import Any
 from urllib.parse import quote, urlencode
+
+from wealth_leads.serve import _pay_band_nav_html
+from wealth_leads.territory import (
+    hq_city_state_display,
+    hq_city_state_looks_like_filing_noise,
+    strip_hq_lease_and_rental_tail,
+    strip_registrant_hq_contact_tail,
+)
+from wealth_leads.title_badge import advisor_title_badge
 
 
 def _esc(s: Any) -> str:
@@ -19,6 +29,7 @@ def format_headquarters_for_ui(raw: str | None) -> str:
     parts = [p.strip() for p in re.split(r"[\n\r]+", s) if p.strip()]
     one = ", ".join(parts)
     one = re.sub(r"[ \t]{2,}", " ", one).strip()
+    one = strip_hq_lease_and_rental_tail(strip_registrant_hq_contact_tail(one))
     return one
 
 
@@ -317,18 +328,64 @@ def _pipeline_hq_cell(raw: str) -> str:
     return f'<td class="hq"{title}>{_esc(short)}</td>'
 
 
-_FORM_TOOLTIP = (
-    "Registration statement form for the newest filing linked to this NEO row "
-    "(e.g. S-1 vs S-1/A). IPO timing varies; this is disclosure-based routing, not a forecast."
-)
-
-
 def _pipeline_month_label(months: int) -> str:
     if months <= 0:
         return "all filing dates"
     if months == 1:
         return "last 1 month"
     return f"last {months} months"
+
+
+def _profile_row_float(r: Any, key: str) -> float | None:
+    if key not in r.keys():
+        return None
+    v = r[key]
+    if v is None:
+        return None
+    try:
+        x = float(v)
+        if math.isnan(x):
+            return None
+        return x
+    except (TypeError, ValueError):
+        return None
+
+
+def pipeline_hq_city_state(r: Any) -> str:
+    """City, ST (no street) for pipeline — prefer live parse from full HQ so stale DB rows stay correct."""
+    raw_row = (
+        (r["issuer_headquarters"] or "").strip()
+        if "issuer_headquarters" in r.keys()
+        else ""
+    )
+    if raw_row:
+        live = hq_city_state_display(format_headquarters_for_ui(raw_row))
+        if live:
+            return live
+    if "issuer_hq_city_state" in r.keys():
+        v = (r["issuer_hq_city_state"] or "").strip()
+        if v and not hq_city_state_looks_like_filing_noise(v):
+            return v
+    return ""
+
+
+def pipeline_cash_excl_equity_from_row(r: Any) -> float | None:
+    """
+    Cash + non-equity-award bundle for pipeline/CSV: total_headline − stock_grants_headline
+    when both exist; else sum of salary/bonus/other headline cells if any exist.
+    """
+    tot = _profile_row_float(r, "total_headline")
+    stk = _profile_row_float(r, "stock_grants_headline")
+    if tot is not None and stk is not None:
+        return max(0.0, tot - stk)
+    s = 0.0
+    n = 0
+    for k in ("salary_headline", "bonus_headline", "other_comp_headline"):
+        v = _profile_row_float(r, k)
+        if v is not None:
+            s += v
+            n += 1
+    return s if n > 0 else None
 
 
 def render_pipeline_review_page(
@@ -343,13 +400,10 @@ def render_pipeline_review_page(
     msg: str,
     built_hint: str,
     pipeline_path: str = "/admin/pipeline",
+    pay_band: str = "all",
+    blur_comp: bool = False,
 ) -> str:
     msg_html = f'<p class="msg-ok">{_esc(msg)}</p>' if msg else ""
-    form_tt = html_module.escape(_FORM_TOOLTIP, quote=True)
-    pay_tt = html_module.escape(
-        "Largest disclosed pay signal (high-water mark) from NEO / comp tables, in USD.",
-        quote=True,
-    )
     win_label = _pipeline_month_label(months)
     mo_opts: list[tuple[int, str]] = [
         (3, "3 months"),
@@ -366,6 +420,7 @@ def render_pipeline_review_page(
         "Opens full profile page (/lead). Click the row or ›. Enter when focused.",
         quote=True,
     )
+    blur_class = " pl-blur-comp" if blur_comp else ""
     trs: list[str] = []
     for r in rows:
         cross_badge = (
@@ -375,27 +430,75 @@ def render_pipeline_review_page(
         name_for_lead = (r["person_norm"] or "").strip() or (r["display_name"] or "").strip()
         profile_q = urlencode({"cik": cik_s, "name": name_for_lead})
         profile_href = html_module.escape(f"/lead?{profile_q}", quote=True)
-        fform = (r["form_type_latest"] or "").strip() or "—"
+        title_r = (r["title"] or "").strip() or "—"
+        role_badge = advisor_title_badge(title_r)
+        full_title_attr = html_module.escape(title_r, quote=True)
+        fy = r["headline_year"]
+        fy_label = str(int(fy)) if fy is not None else "—"
+        loc_tt = html_module.escape(
+            "City and state from the registrant principal office in the filing (not the person’s home). "
+            "No street or ZIP in this column.",
+            quote=True,
+        )
+        cash_tt = html_module.escape(
+            (
+                f"Cash and bonus (plus other non-equity SCT cash/benefit lines): total minus stock + option "
+                f"award columns when both exist; else salary + bonus + other for FY {fy_label}. "
+                "Full SCT table on profile."
+                if fy is not None
+                else "Cash-side SCT bundle for headline FY; see profile for detail."
+            ),
+            quote=True,
+        )
+        stock_tt = html_module.escape(
+            (
+                f"Sum of stock awards + option awards for FY {fy_label} (grant-date fair value, SCT). "
+                "Illiquid pre-exit; vesting per plan."
+                if fy is not None
+                else "Stock + option awards for headline FY (grant-date value)."
+            ),
+            quote=True,
+        )
+        row_keys = r.keys()
+        cash_v = pipeline_cash_excl_equity_from_row(r)
+        stk_v = r["stock_grants_headline"] if "stock_grants_headline" in row_keys else None
+        loc_s = pipeline_hq_city_state(r)
         trs.append(
             "<tr class=\"pl-row\" tabindex=\"0\" role=\"link\" "
             f'data-profile-href="{profile_href}" title="{row_open_hint}">'
             + f"<td>{cross_badge}<strong>{_esc(r['display_name'])}</strong></td>"
+            + f"<td class='pl-title-cell' title=\"{full_title_attr}\">"
+            + f"<strong>{_esc(role_badge)}</strong>"
+            + "</td>"
             + f"<td>{_esc(r['company_name'])}</td>"
-            + f'<td class="dim mono">{_esc(fform[:28])}</td>'
+            + f'<td class="pl-loc" title="{loc_tt}">{_esc(loc_s or "—")}</td>'
             + f"<td class='num'>{_esc(r['filing_date_latest'])}</td>"
-            + f'<td class="num" title="{pay_tt}">{_money_cell(r["signal_hwm"])}</td>'
+            + f'<td class="num{blur_class}" title="{cash_tt}">{_money_cell(cash_v)}</td>'
+            + f'<td class="num{blur_class}" title="{stock_tt}">{_money_cell(stk_v)}</td>'
             + f"<td class='dim'>{_esc(_pipeline_flags(r))}</td>"
             + f'<td class="pl-row-cue"><a class="pl-row-profile" href="{profile_href}" '
             + 'aria-label="Open full profile">›</a></td>'
             + "</tr>"
         )
-    body = "".join(trs) if trs else "<tr><td colspan='7' class='dim empty'>No rows in this window. Widen the date range, sync SEC data, or run <code>py -m wealth_leads rebuild-profiles</code>.</td></tr>"
+    body = "".join(trs) if trs else "<tr><td colspan='9' class='dim empty'>No rows in this window. Widen the date range, sync SEC data, pay-signal tab, or run <code>py -m wealth_leads rebuild-profiles</code>.</td></tr>"
     cq = " checked" if cross_only else ""
     ins = " checked" if include_non_s1 else ""
     qqs = quote(search)
+    band_q = quote((pay_band or "all").strip() or "all")
     csv_href = (
         f"{_esc(pipeline_path)}.csv?q={qqs}&months={months}&cross_only={1 if cross_only else 0}"
-        f"{'&include_non_s1=1' if include_non_s1 else ''}"
+        f"{'&include_non_s1=1' if include_non_s1 else ''}&band={band_q}"
+    )
+    band_cur = (pay_band or "all").strip() or "all"
+    band_nav = _pay_band_nav_html(
+        current=band_cur,
+        base_path=pipeline_path.split("?")[0],
+        extra_qs={
+            "q": search,
+            "months": str(months),
+            "cross_only": "1" if cross_only else "",
+            "include_non_s1": "1" if include_non_s1 else "",
+        },
     )
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -606,6 +709,37 @@ table.pl-grid {{
   line-height: 1;
 }}
 .pl-row-profile:hover {{ color: #f0b429; background: rgba(226,160,18,0.1); }}
+.pl-title-cell {{ max-width: 14rem; color: #c4c4ca; }}
+.pl-loc {{ max-width: 11rem; color: #b0b0b8; font-size: 0.92em; line-height: 1.35; }}
+.pl-comp-preview {{
+  max-width: 18rem;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: #b8b8be;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}}
+.pay-band-wrap {{ margin: 0.5rem 0 0; max-width: 52rem; }}
+.pay-band-hint {{ font-size: 0.72rem; color: var(--faint); margin: 0 0 0.35rem; line-height: 1.45; }}
+.pay-band-nav {{ display: flex; flex-wrap: wrap; gap: 0.35rem 0.65rem; align-items: center; font-size: 0.78rem; }}
+.pay-band-tab {{
+  color: var(--muted);
+  text-decoration: none;
+  padding: 0.15rem 0.4rem;
+  border-radius: 2px;
+  border: 1px solid transparent;
+}}
+.pay-band-tab:hover {{ color: var(--text); border-color: var(--line); }}
+.pay-band-tab--active {{
+  color: var(--amber);
+  border-color: rgba(226, 160, 18, 0.35);
+  background: rgba(226, 160, 18, 0.06);
+}}
+.pl-blur-comp {{
+  filter: blur(5px);
+  user-select: none;
+}}
 </style></head><body>
 <div class="pl-shell">
 <header class="pl-head">
@@ -619,10 +753,11 @@ table.pl-grid {{
     <a href="{csv_href}">Export CSV</a>
   </div>
 </header>
-<p class="pl-banner">{_esc(built_hint)} · <strong>Thesis:</strong> names and pay from <strong>S-1–family</strong> filings. <strong>Click a row</strong> or <strong>›</strong> to open the <strong>full profile page</strong> (same as Desk/Finder <code>/lead</code>—comp tables, issuer cards, filings, bios). Use the top nav or the browser back button to return. <strong>Multi-CIK</strong> = same person under more than one issuer—verify before outreach. <strong>Data:</strong> sync parses tables into the DB; that is the default. <strong>LLM</strong> (<code>py -m wealth_leads enrich-s1-ai</code>) is optional to fill gaps, then <strong>Rebuild profiles</strong>; <strong>LLM</strong> in flags marks LLM-assisted NEO. Verify HQ on the EDGAR filing—extracted lines can include extra clauses.</p>
+<p class="pl-banner">{_esc(built_hint)} · <strong>Cash and bonus</strong> is the non-equity-award side of SCT (total − stock/option awards when both exist; else salary+bonus+other). <strong>Location</strong> is city + state from the registrant HQ line (no street). <strong>Rebuild profiles</strong> after code updates. <code>WEALTH_LEADS_PIPELINE_BLUR_COMP=1</code> blurs comp.</p>
 {msg_html}
 <div class="pl-toolbar">
   <form id="pl-filters" class="pl-filters" method="get" action="{_esc(pipeline_path)}" autocomplete="off" data-pipeline-path="{_esc(pipeline_path)}">
+    <input type="hidden" name="band" value="{_esc(band_cur)}"/>
     <div class="pl-field">
       <label for="pl-months">Filing window</label>
       <select id="pl-months" name="months">{months_select}</select>
@@ -641,14 +776,17 @@ table.pl-grid {{
     <span>No SEC fetch—rebuilds materialized rows from current DB.</span>
   </form>
 </div>
+{band_nav}
 <div class="pl-table-wrap">
 <table class="pl-grid">
 <thead><tr>
 <th scope="col">Person</th>
+<th scope="col">Role</th>
 <th scope="col">Company</th>
-<th scope="col" title="{form_tt}">Form</th>
+<th scope="col" title="City and state from registrant principal office (no street)">Location</th>
 <th scope="col" class="num">Filed</th>
-<th scope="col" class="num" title="{pay_tt}">Pay signal</th>
+<th scope="col" class="num" title="Non-equity-award SCT bundle (see banner)">Cash and bonus</th>
+<th scope="col" class="num" title="Stock awards + option awards, same FY (grant-date fair value)">Stock + options</th>
 <th scope="col">Sources</th>
 <th scope="col" class="pl-col-profile" title="Open full profile">Profile</th>
 </tr></thead>
@@ -719,6 +857,8 @@ def _money_cell(v: Any) -> str:
         return "—"
     try:
         x = float(v)
+        if math.isnan(x):
+            return "—"
         return f"${x:,.0f}"
     except (TypeError, ValueError):
         return "—"

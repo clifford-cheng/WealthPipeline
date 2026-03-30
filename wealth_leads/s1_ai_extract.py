@@ -17,6 +17,13 @@ Run:  py -m wealth_leads enrich-s1-ai --help
 This does not run automatically on sync (cost + latency). Use after sync or on
 filings where neo_compensation is empty.
 
+Ollama/OpenAI/Anthropic are **not** "fed" the corpus into the model weights each time:
+each run sends a **prompt** (a plain-text excerpt of the filing) and receives **JSON**
+back. By default we build that excerpt with phrase-based **windows** for long S-1s.
+Set ``WEALTH_LEADS_S1_AI_DOCUMENT_MODE=linear`` to send **contiguous text from the
+start** instead (cover first), or ``bookend`` for head+tail; tune
+``WEALTH_LEADS_S1_AI_MAX_CHARS`` to match your model context.
+
 The model returns a structured lead_intel block (offering, principal holders,
 related parties, use of proceeds, auditor/counsel) stored as JSON on the filing
 row for the pipeline drawer—plus NEO/officers/bios/issuer fields written to
@@ -40,6 +47,8 @@ from wealth_leads.config import (
     ollama_s1_model,
     openai_api_key,
     openai_s1_model,
+    s1_ai_document_mode,
+    s1_ai_max_chars,
     s1_ai_provider,
 )
 from wealth_leads.db import (
@@ -55,14 +64,40 @@ from wealth_leads.db import (
 from wealth_leads.serve import _norm_person_name
 
 
-def s1_html_to_document_text(html: str, *, max_chars: int = 100_000) -> str:
-    """Strip HTML to plain text. Long filings: merge prospectus head + compensation / ownership windows."""
+def _s1_html_to_plain(html: str) -> str:
+    """Strip HTML to normalized plain text (full document, not length-capped)."""
     soup = BeautifulSoup(html or "", "html.parser")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
     text = soup.get_text("\n", strip=True)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
+    return text
+
+
+def s1_html_to_linear_document_text(html: str, *, max_chars: int) -> str:
+    """Contiguous excerpt from the beginning: cover page and prospectus flow stay in reading order."""
+    return _s1_html_to_plain(html)[:max_chars]
+
+
+def s1_html_to_bookend_document_text(html: str, *, max_chars: int) -> str:
+    """Head + tail when the filing exceeds max_chars (summary comp often appears later)."""
+    t = _s1_html_to_plain(html)
+    n = len(t)
+    if n <= max_chars:
+        return t
+    sep = "\n\n[ ... middle of filing omitted for length ... ]\n\n"
+    budget = max_chars - len(sep)
+    if budget < 8_000:
+        return t[:max_chars]
+    head_n = int(budget * 0.72)
+    tail_n = budget - head_n
+    return t[:head_n] + sep + t[-tail_n:]
+
+
+def s1_html_to_document_text(html: str, *, max_chars: int = 100_000) -> str:
+    """Strip HTML to plain text. Long filings: merge prospectus head + compensation / ownership windows."""
+    text = _s1_html_to_plain(html)
     n = len(text)
     if n <= max_chars:
         return text
@@ -72,6 +107,11 @@ def s1_html_to_document_text(html: str, *, max_chars: int = 100_000) -> str:
     intervals: list[tuple[int, int]] = [(0, head_len)]
 
     for phrase, back, fwd in (
+        ("principal executive offices", 14_000, 32_000),
+        ("principal executive office", 14_000, 32_000),
+        ("principal place of business", 12_000, 28_000),
+        ("mailing address of our principal", 10_000, 26_000),
+        ("our corporate headquarters", 8_000, 24_000),
         ("summary compensation table", 18_000, 65_000),
         ("summary compensation", 18_000, 60_000),
         ("named executive officer", 14_000, 55_000),
@@ -117,12 +157,28 @@ def s1_html_to_document_text(html: str, *, max_chars: int = 100_000) -> str:
     if len(out) <= max_chars:
         return out
 
-    # Hard cap: keep slices that mention compensation / ownership first.
-    target = max_chars - 100
+    # Hard cap: ALWAYS keep prospectus front matter (cover + registrant HQ), then add
+    # highest-scoring slices. Previously we only ranked comp-heavy windows — the model
+    # often never saw headquarters_address at all on long S-1s.
+    head_keep = min(16_000, n, max(8_000, max_chars // 5))
+    prefix = text[0:head_keep]
+    sep = "\n\n---\n\n"
+    budget = max_chars - len(prefix) - len(sep) - 40
     scored: list[tuple[int, tuple[int, int]]] = []
     for span in merged:
-        slug = text[span[0] : span[1]].casefold()
+        lo, hi = span
+        slug = text[lo:hi].casefold()
         score = 0
+        if lo == 0:
+            score += 14
+        elif lo < 10_000:
+            score += 9
+        if "principal executive" in slug or "principal office" in slug:
+            score += 12
+        if "headquarter" in slug or "mailing address" in slug:
+            score += 8
+        if "registrant" in slug and "address" in slug:
+            score += 5
         if "summary compensation" in slug:
             score += 5
         if "compensation" in slug:
@@ -133,20 +189,40 @@ def s1_html_to_document_text(html: str, *, max_chars: int = 100_000) -> str:
             score += 1
         scored.append((score, span))
     scored.sort(key=lambda x: (-x[0], x[1][0]))
-    acc: list[str] = []
-    used = 0
-    sep = "\n\n---\n\n"
-    for score, (lo, hi) in scored:
+    acc: list[str] = [prefix]
+    used = len(prefix)
+    for _score, (lo, hi) in scored:
+        if hi <= head_keep:
+            continue
+        lo = max(lo, head_keep)
+        if lo >= hi:
+            continue
         chunk = text[lo:hi]
-        need = len(chunk) + (len(sep) if acc else 0)
-        if used + need <= target:
+        need = len(chunk) + len(sep)
+        if used + need <= max_chars - 20:
             acc.append(chunk)
             used += need
-        elif target - used > 12_000:
-            room = target - used - len(sep) - 40
+        elif max_chars - used > 10_000:
+            room = max(2000, max_chars - used - len(sep) - 50)
             acc.append(chunk[:room] + "\n\n[... truncated ...]\n")
             break
     return sep.join(acc)[:max_chars] if acc else text[:max_chars]
+
+
+def html_document_for_s1_llm(html: str) -> str:
+    """
+    Build the plain-text blob sent to the LLM for enrich-s1-ai.
+
+    Controlled by WEALTH_LEADS_S1_AI_DOCUMENT_MODE (windows | linear | bookend) and
+    WEALTH_LEADS_S1_AI_MAX_CHARS.
+    """
+    max_c = s1_ai_max_chars()
+    mode = s1_ai_document_mode()
+    if mode == "linear":
+        return s1_html_to_linear_document_text(html, max_chars=max_c)
+    if mode == "bookend":
+        return s1_html_to_bookend_document_text(html, max_chars=max_c)
+    return s1_html_to_document_text(html, max_chars=max_c)
 
 
 _SYSTEM_PROMPT = """You are an expert at reading U.S. SEC Form S-1 registration statements for
@@ -221,7 +297,10 @@ _USER_SCHEMA = """Analyze this S-1 excerpt and return a single JSON object with 
 }
 
 Section guidance:
-- issuer.* : registrant HQ, URL, industry, business description (Prospectus summary / Business).
+- issuer.headquarters_address: the registrant principal executive office / mailing address exactly as in the
+  filing—almost always on the cover page, inside the prospectus summary header, or Item 1 / Business within
+  the first pages (street, city, state, ZIP). Do not paste filing dates, effective dates, or "as of" text
+  into this field. issuer.website / industry / business_summary: Prospectus summary and Business sections.
 - summary_compensation: one object per person per fiscal year in Summary Compensation Table(s); "—" → null.
 - management_bios: biographies under Management / Directors (~800 chars per person max).
 - executive_officers: officer / director roster with ages if listed.
@@ -354,6 +433,8 @@ def _neo_db_tuples(filing_id: int, comps: list[NeoCompRow]) -> list[tuple]:
 
 
 def _officers_from_ai(data: dict[str, Any]) -> list[tuple[str, str, str, Optional[int]]]:
+    from wealth_leads.person_quality import is_acceptable_lead_person_name
+
     raw = data.get("executive_officers") or []
     if not isinstance(raw, list):
         return []
@@ -364,6 +445,8 @@ def _officers_from_ai(data: dict[str, Any]) -> list[tuple[str, str, str, Optiona
         name = (item.get("name") or "").strip()
         title = (item.get("title") or "").strip()
         if not name or not title:
+            continue
+        if not is_acceptable_lead_person_name(name):
             continue
         age = item.get("age")
         age_i: Optional[int] = None
@@ -617,10 +700,19 @@ def apply_ai_payload_to_filing(
     }
     issuer = data.get("issuer") if isinstance(data.get("issuer"), dict) else {}
     if issuer:
+        from wealth_leads.territory import is_plausible_registrant_headquarters
+
         hq = (issuer.get("headquarters_address") or "").strip()
         web = (issuer.get("website") or "").strip()
-        if hq or web:
-            update_filing_issuer_meta(conn, filing_id, website=web, headquarters=hq)
+        hq_ok = is_plausible_registrant_headquarters(hq) if hq else False
+        if (hq_ok and hq) or web:
+            update_filing_issuer_meta(
+                conn,
+                filing_id,
+                website=web,
+                headquarters=hq if hq_ok else "",
+                headquarters_force=bool(hq_ok and hq),
+            )
             stats["issuer_updates"] = True
         ind = (issuer.get("industry_description") or "").strip()
         if ind:
@@ -701,7 +793,7 @@ def enrich_filing_with_llm(
     replace_bios: bool,
     allow_empty_neo: bool,
 ) -> dict[str, Any]:
-    text = s1_html_to_document_text(html)
+    text = html_document_for_s1_llm(html)
     data = call_llm_extract(text, company_name=company_name, accession=accession)
     stats = apply_ai_payload_to_filing(
         conn,
@@ -721,6 +813,7 @@ def run_enrich_s1_ai(
     limit: int,
     filing_id: Optional[int],
     only_missing_neo: bool,
+    issuer_refresh: bool,
     replace_neo: bool,
     replace_officers: bool,
     replace_bios: bool,
@@ -768,6 +861,13 @@ def run_enrich_s1_ai(
         params.append(filing_id)
     if only_missing_neo:
         q += """ AND (SELECT COUNT(*) FROM neo_compensation c WHERE c.filing_id = f.id) = 0"""
+    if issuer_refresh:
+        q += """ AND (
+            LENGTH(TRIM(COALESCE(f.issuer_headquarters, ''))) < 12
+            OR TRIM(COALESCE(f.issuer_headquarters, '')) = ''
+            OR f.s1_llm_lead_pack IS NULL
+            OR TRIM(COALESCE(f.s1_llm_lead_pack, '')) = ''
+        )"""
     q += " ORDER BY COALESCE(f.filing_date, '') DESC, f.id DESC LIMIT ?"
     lim = 1 if filing_id is not None else max(1, min(limit, 200))
     params.append(lim)
@@ -793,12 +893,17 @@ def run_enrich_s1_ai(
             co = r["company_name"] or ""
             acc = r["accession"] or ""
             print(
-                f"enrich-s1-ai [{s1_ai_provider()}]: filing id={fid} {co} ({acc}) …",
+                f"enrich-s1-ai [{s1_ai_provider()}] mode={s1_ai_document_mode()}: "
+                f"filing id={fid} {co} ({acc}) …",
                 file=sys.stderr,
             )
             if dry_run:
-                text = s1_html_to_document_text(html)
-                print(f"  dry-run: would send ~{len(text)} chars to model", file=sys.stderr)
+                text = html_document_for_s1_llm(html)
+                print(
+                    f"  dry-run: would send ~{len(text)} chars "
+                    f"(max {s1_ai_max_chars()}, mode={s1_ai_document_mode()})",
+                    file=sys.stderr,
+                )
                 n_done += 1
                 continue
             try:

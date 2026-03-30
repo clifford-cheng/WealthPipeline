@@ -4,7 +4,7 @@ Run: uvicorn wealth_leads.web_app:app --host 0.0.0.0 --port 8080
 Or:   python -m wealth_leads serve-app
 
 Env: WEALTH_LEADS_APP_SECRET (required), WEALTH_LEADS_ALLOW_SIGNUP=1 for more accounts,
-     WEALTH_LEADS_APP_PORT (default 8080).
+     WEALTH_LEADS_APP_PORT (default 8080), WEALTH_LEADS_UVICORN_RELOAD=1 to auto-reload on code edits (serve-app).
 """
 from __future__ import annotations
 
@@ -14,9 +14,10 @@ import io
 import json
 import math
 import os
+import re
 import sqlite3
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import quote, urlencode
 
@@ -34,11 +35,15 @@ from wealth_leads.config import (
     app_allow_public_signup,
     app_secret_key,
     database_path,
+    lead_desk_us_registrant_hq_only,
     require_app_auth,
 )
+from wealth_leads.advisor_pack import get_issuer_snapshot_dict
 from wealth_leads.allocation import assign_for_cycle, assignments_to_display_rows
 from wealth_leads.crm_ui import (
     format_headquarters_for_ui,
+    pipeline_cash_excl_equity_from_row,
+    pipeline_hq_city_state,
     render_admin_home,
     render_my_leads_page,
     render_pipeline_review_page,
@@ -52,6 +57,7 @@ from wealth_leads.db import (
     get_allocation_settings,
     get_app_user_by_email,
     get_app_user_by_id,
+    get_lead_client_research,
     get_lead_profile_row,
     insert_app_user,
     list_allocation_clients,
@@ -60,6 +66,7 @@ from wealth_leads.db import (
     update_allocation_settings,
     update_user_allocation_profile,
 )
+from wealth_leads.lead_research import row_to_client_research_dict
 from wealth_leads.password_util import hash_password, verify_password
 from wealth_leads.profile_build import rebuild_lead_profiles
 from wealth_leads.sync_runner import start_sync_subprocess, sync_state
@@ -156,7 +163,14 @@ def _latest_filing_issuer_fallback(
     ).fetchone()
     if not r:
         return None
-    return {k: r[k] for k in r.keys()}
+    from wealth_leads.serve import _resolve_issuer_headquarters_for_profile
+
+    d = {k: r[k] for k in r.keys()}
+    raw_hq = (d.get("issuer_headquarters") or "").strip()
+    d["issuer_headquarters"] = _resolve_issuer_headquarters_for_profile(
+        conn, ck, raw_hq
+    )
+    return d
 
 
 def _officer_snapshot_for_person(
@@ -286,6 +300,10 @@ def _pipeline_row_drawer_enrich(conn: sqlite3.Connection, row: sqlite3.Row) -> d
             fb.get("issuer_headquarters") or ""
         )
         extras["issuer_fallback"] = fb
+    cr = get_lead_client_research(conn, cik, pn)
+    extras["client_research"] = (
+        {k: cr[k] for k in cr.keys()} if cr is not None else None
+    )
     return extras
 
 
@@ -299,6 +317,7 @@ from wealth_leads.serve import (
     _profile_lead_tier,
     _profile_lead_url,
     filter_profiles_geo_industry_text,
+    filter_profiles_pay_band,
     finder_export_csv_bytes,
 )
 
@@ -306,6 +325,8 @@ AUTH_COOKIE = "wl_auth"
 SESSION_MAX_AGE = 60 * 60 * 24 * 14
 
 # Used when WEALTH_LEADS_REQUIRE_AUTH is off (iterate on data without login).
+APP_WEB_BOOT_AT = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
 _SYNTHETIC_REVIEW_USER: dict = {
     "id": 0,
     "email": "Review mode (no login)",
@@ -317,12 +338,15 @@ _SYNTHETIC_REVIEW_USER: dict = {
     "_synthetic": True,
 }
 
-_COMPLIANCE_FOOTER = """
+def _compliance_footer_html() -> str:
+    return f"""
 <footer style="margin:2rem 1rem;font-size:0.72rem;color:#6b7785;max-width:52rem;line-height:1.5;border-top:1px solid #2a3340;padding-top:1rem">
 <strong>Important.</strong> WealthPipeline surfaces public SEC filing text and extracted fields for research workflows.
 It is <strong>not</strong> investment advice, a recommendation, or a solicitation. Filings may be amended; numbers and narratives
 are only as accurate as the underlying parser and your sync time. You are responsible for your own compliance (e.g. RIA marketing
 and recordkeeping). Verify material facts in the official EDGAR filing.
+<p style="margin:0.85rem 0 0;padding-top:0.75rem;border-top:1px solid #2a3340;line-height:1.45"><strong>Server</strong> started <code>{html_module.escape(APP_WEB_BOOT_AT)}</code>.
+Restart the app after editing Python files (or set <code>WEALTH_LEADS_UVICORN_RELOAD=1</code> when running <code>serve-app</code>). Refresh the <strong>Pipeline</strong> materialized table with <strong>Rebuild profiles</strong> or <code>py -m wealth_leads rebuild-profiles</code>.</p>
 </footer>
 """
 
@@ -437,10 +461,18 @@ def _inject_chrome(page_html: str, user: dict) -> str:
         + f'<nav class="wl-top"><div>{center}</div>'
         f'<div class="wl-actions">{right}</div></nav>'
     )
-    out = page_html.replace("<body ", nav + "<body ", 1)
-    if out == page_html:
-        out = page_html.replace("<body>", nav + "<body>", 1)
-    out = out.replace("</body>", _COMPLIANCE_FOOTER + "</body>", 1)
+    # Place nav inside <body>; putting it before <body> is invalid HTML and breaks some clients.
+    # Callable repl avoids interpreting backslashes in `nav` as re group refs.
+    out, n_sub = re.subn(
+        r"(<body\b[^>]*>)",
+        lambda m: m.group(1) + nav,
+        page_html,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    if not n_sub:
+        out = page_html
+    out = out.replace("</body>", _compliance_footer_html() + "</body>", 1)
     return out
 
 
@@ -823,6 +855,7 @@ async def admin_pipeline(request: Request) -> Response:
     except ValueError:
         months_sel = 6
     months_back = None if months_sel <= 0 else months_sel
+    band = (request.query_params.get("band") or "all").strip() or "all"
     with connect() as conn:
         rows = list_lead_profiles_for_review(
             conn,
@@ -831,6 +864,8 @@ async def admin_pipeline(request: Request) -> Response:
             limit=800,
             cross_only=cross_only,
             months_back=months_back,
+            pay_band=band,
+            us_registrant_hq_only=lead_desk_us_registrant_hq_only(),
         )
         total = count_lead_profiles(conn)
         b = conn.execute("SELECT MAX(built_at) FROM lead_profile").fetchone()
@@ -839,6 +874,8 @@ async def admin_pipeline(request: Request) -> Response:
         built = f"Last rebuilt (UTC): {b[0]}"
     else:
         built = "Not built yet — run SEC sync or Rebuild below."
+    from wealth_leads.config import pipeline_blur_comp_columns
+
     body = render_pipeline_review_page(
         rows=rows,
         total_in_db=total,
@@ -850,6 +887,8 @@ async def admin_pipeline(request: Request) -> Response:
         msg=msg,
         built_hint=built,
         pipeline_path=_pipeline_url_path(),
+        pay_band=band,
+        blur_comp=pipeline_blur_comp_columns(),
     )
     return HTMLResponse(_inject_chrome(body, user))
 
@@ -894,6 +933,7 @@ async def admin_pipeline_csv(request: Request) -> Response:
     except ValueError:
         months_sel = 6
     months_back = None if months_sel <= 0 else months_sel
+    band = (request.query_params.get("band") or "all").strip() or "all"
     with connect() as conn:
         rows = list_lead_profiles_for_review(
             conn,
@@ -902,12 +942,15 @@ async def admin_pipeline_csv(request: Request) -> Response:
             limit=5000,
             cross_only=cross_only,
             months_back=months_back,
+            pay_band=band,
+            us_registrant_hq_only=lead_desk_us_registrant_hq_only(),
         )
 
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(
         [
+            "pay_band_filter",
             "cross_company_hint",
             "cik",
             "person_norm",
@@ -918,8 +961,17 @@ async def admin_pipeline_csv(request: Request) -> Response:
             "filing_date_latest",
             "accession_latest",
             "issuer_headquarters",
+            "issuer_hq_city_state",
+            "issuer_hq_has_detail",
             "issuer_industry",
+            "headline_year",
             "signal_hwm",
+            "hq_city_state",
+            "cash_excl_equity_headline",
+            "stock_grants_headline",
+            "salary_headline",
+            "bonus_headline",
+            "other_comp_headline",
             "equity_hwm",
             "has_s1_comp",
             "lead_tier",
@@ -927,6 +979,7 @@ async def admin_pipeline_csv(request: Request) -> Response:
             "has_officer_row",
             "neo_row_count",
             "comp_llm_assisted",
+            "comp_timeline",
             "why_surfaced",
             "primary_doc_url",
             "index_url",
@@ -935,8 +988,10 @@ async def admin_pipeline_csv(request: Request) -> Response:
         ]
     )
     for r in rows:
+        cash_excl = pipeline_cash_excl_equity_from_row(r)
         w.writerow(
             [
+                band,
                 r["cross_company_hint"],
                 r["cik"],
                 r["person_norm"],
@@ -947,8 +1002,20 @@ async def admin_pipeline_csv(request: Request) -> Response:
                 r["filing_date_latest"],
                 r["accession_latest"],
                 format_headquarters_for_ui(r["issuer_headquarters"]),
+                (r["issuer_hq_city_state"] if "issuer_hq_city_state" in r.keys() else "")
+                or "",
+                r["issuer_hq_has_detail"] if "issuer_hq_has_detail" in r.keys() else "",
                 r["issuer_industry"],
+                r["headline_year"] if "headline_year" in r.keys() else "",
                 r["signal_hwm"],
+                pipeline_hq_city_state(r),
+                cash_excl if cash_excl is not None else "",
+                r["stock_grants_headline"]
+                if "stock_grants_headline" in r.keys()
+                else "",
+                r["salary_headline"] if "salary_headline" in r.keys() else "",
+                r["bonus_headline"] if "bonus_headline" in r.keys() else "",
+                r["other_comp_headline"] if "other_comp_headline" in r.keys() else "",
                 r["equity_hwm"],
                 r["has_s1_comp"],
                 r["lead_tier"] if "lead_tier" in r.keys() else "premium",
@@ -956,6 +1023,7 @@ async def admin_pipeline_csv(request: Request) -> Response:
                 r["has_officer_row"],
                 r["neo_row_count"],
                 r["comp_llm_assisted"],
+                r["comp_timeline"],
                 r["why_surfaced"],
                 r["primary_doc_url"],
                 r["index_url"],
@@ -1159,12 +1227,17 @@ async def admin_desk(request: Request) -> Response:
     if not user.get("is_admin"):
         return HTMLResponse("<h1>Forbidden</h1>", status_code=403)
     profiles, _pa, leads, comp, stats = _load_page_data()
+    band = (request.query_params.get("band") or "all").strip() or "all"
+    desk_view = filter_profiles_pay_band(profiles, band)
     body = _page_desk(
-        profiles,
+        desk_view,
         leads,
         comp,
         stats,
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        pay_band=band,
+        nav_base_path="/admin/desk",
+        desk_universe_count=len(profiles),
     )
     return HTMLResponse(_inject_chrome(body, user))
 
@@ -1187,12 +1260,14 @@ async def admin_finder(
     profiles, profiles_all, _leads, _comp, stats = _load_page_data()
     use_all = bool(all_neo)
     base = profiles_all if use_all else profiles
+    band = (request.query_params.get("band") or "all").strip() or "all"
     filtered = filter_profiles_geo_industry_text(
         base,
         location_sub=hq,
         industry_sub=industry,
         text_sub=q,
     )
+    filtered = filter_profiles_pay_band(filtered, band)
     body = _page_finder(
         filtered,
         stats=stats,
@@ -1202,6 +1277,11 @@ async def admin_finder(
         q=q,
         all_neo=use_all,
         base_count=len(base),
+        pay_band=band,
+        nav_base_path="/admin/finder",
+        form_action="/admin/finder",
+        desk_href="/admin/desk",
+        export_path="/export/finder.csv",
     )
     return HTMLResponse(_inject_chrome(body, user))
 
@@ -1252,9 +1332,14 @@ async def lead(
             )
     prof = _find_profile(profiles_all, cik, norm) if not stats.get("missing_db") else None
     filings: list[dict] = []
+    cr_dict: dict[str, Any] | None = None
+    issuer_snap: dict[str, Any] | None = None
     if prof is not None and not stats.get("missing_db"):
         with connect() as conn:
             filings = _filings_for_profile(conn, cik, norm)
+            cr_row = get_lead_client_research(conn, (cik or "").strip(), norm)
+            cr_dict = row_to_client_research_dict(cr_row)
+            issuer_snap = get_issuer_snapshot_dict(conn, (cik or "").strip())
     body = _page_lead(
         prof,
         filings,
@@ -1262,6 +1347,8 @@ async def lead(
         query_name=name,
         stats=stats,
         rendered_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        client_research=cr_dict,
+        issuer_snapshot=issuer_snap,
     )
     return HTMLResponse(_inject_chrome(body, user))
 
@@ -1375,6 +1462,7 @@ async def export_finder_csv(
     industry: str = "",
     q: str = "",
     all_neo: int = 0,
+    band: str = "all",
 ) -> Response:
     redir = _auth_redirect(request)
     if redir is not None:
@@ -1391,6 +1479,7 @@ async def export_finder_csv(
         industry=industry,
         q=q,
         all_neo=bool(all_neo),
+        pay_band=(band or "all").strip() or "all",
     )
 
     def gen():

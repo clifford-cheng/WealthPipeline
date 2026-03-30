@@ -8,6 +8,9 @@ import requests
 
 from wealth_leads.config import (
     database_path,
+    email_smtp_verify_enabled,
+    enrich_client_research_after_sync_enabled,
+    enrich_client_research_after_sync_limit,
     follow_10k_for_s1_ciks,
     submissions_10k_per_cik,
     sync_form_types,
@@ -26,6 +29,7 @@ from wealth_leads.db import (
     update_filing_issuer_summary,
     update_primary_doc_url,
 )
+from wealth_leads.territory import is_plausible_registrant_headquarters
 from wealth_leads.management import (
     extract_executive_officers_from_filing_html,
     extract_issuer_headquarters_from_filing_html,
@@ -138,9 +142,13 @@ def backfill_compensation(
                 update_filing_issuer_summary(c, fid, summ_b)
             web_b = extract_issuer_website_from_filing_html(s1_html)
             hq_b = extract_issuer_headquarters_from_filing_html(s1_html)
-            if web_b or hq_b:
+            hq_ok = is_plausible_registrant_headquarters(hq_b) if hq_b else False
+            if web_b or hq_ok:
                 update_filing_issuer_meta(
-                    c, fid, website=web_b, headquarters=hq_b
+                    c,
+                    fid,
+                    website=web_b,
+                    headquarters=hq_b if hq_ok else "",
                 )
             ind_b = extract_issuer_industry_from_filing_html(s1_html)
             if ind_b:
@@ -164,6 +172,68 @@ def backfill_compensation(
         with connect() as c:
             _work(c)
     return n_done
+
+
+def refresh_issuer_hq_from_primary_docs() -> None:
+    """
+    Re-fetch every stored primary document and re-run website + HQ heuristics.
+    Does not re-parse NEO or officers; use after upgrading extract_issuer_headquarters_from_filing_html.
+    """
+    session = requests.Session()
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, primary_doc_url, company_name, accession, issuer_headquarters
+            FROM filings
+            WHERE primary_doc_url IS NOT NULL AND TRIM(primary_doc_url) != ''
+            ORDER BY filing_date DESC
+            """
+        ).fetchall()
+        total = len(rows)
+        parsed = errors = 0
+        for i, r in enumerate(rows):
+            fid = int(r["id"])
+            url = canonical_filing_document_url(r["primary_doc_url"])
+            if url and url != r["primary_doc_url"]:
+                update_primary_doc_url(conn, fid, url)
+            if not url:
+                continue
+            try:
+                html = get_text(url, session=session)
+            except Exception as e:
+                errors += 1
+                nm = (r["company_name"] or r["accession"] or str(fid)).strip()
+                print(f"[warn] refresh issuer HQ fetch {nm}: {e}", file=sys.stderr)
+                continue
+            web = extract_issuer_website_from_filing_html(html)
+            hq = extract_issuer_headquarters_from_filing_html(html)
+            hq_ok = is_plausible_registrant_headquarters(hq) if hq else False
+            old_hq = (r["issuer_headquarters"] or "").strip()
+            if hq_ok:
+                update_filing_issuer_meta(conn, fid, website=web, headquarters=hq)
+            else:
+                if not is_plausible_registrant_headquarters(old_hq):
+                    conn.execute(
+                        """
+                        UPDATE filings SET
+                            issuer_headquarters = '',
+                            issuer_hq_city_state = ''
+                        WHERE id = ?
+                        """,
+                        (fid,),
+                    )
+                if web:
+                    update_filing_issuer_meta(
+                        conn, fid, website=web, headquarters=""
+                    )
+            parsed += 1
+            if (i + 1) % 25 == 0 or (i + 1) == total:
+                print(f"refresh-issuer-hq: {i + 1}/{total}…", file=sys.stderr)
+        conn.commit()
+    print(
+        f"refresh-issuer-hq: done — parsed {parsed}, fetch errors {errors}, total rows {total}",
+        file=sys.stderr,
+    )
 
 
 def _process_rss_item(
@@ -240,9 +310,10 @@ def _process_rss_item(
 
     web = extract_issuer_website_from_filing_html(body_html)
     hq = extract_issuer_headquarters_from_filing_html(body_html)
-    if web or hq:
+    hq_ok = is_plausible_registrant_headquarters(hq) if hq else False
+    if web or hq_ok:
         update_filing_issuer_meta(
-            conn, filing_id, website=web, headquarters=hq
+            conn, filing_id, website=web, headquarters=hq if hq_ok else ""
         )
 
     ind = extract_issuer_industry_from_filing_html(body_html)
@@ -320,6 +391,28 @@ def sync(*, force_reprocess: bool = False) -> None:
         f"{pr_stats.get('cross_company_flagged', 0)} cross-CIK name hints).",
         file=sys.stderr,
     )
+
+    if enrich_client_research_after_sync_enabled():
+        from wealth_leads.lead_research import run_enrich_client_research
+
+        lim = enrich_client_research_after_sync_limit()
+        with connect() as conn:
+            er = run_enrich_client_research(
+                conn,
+                limit=lim,
+                force=False,
+                use_llm=True,
+                verify_smtp=email_smtp_verify_enabled(),
+            )
+        print(
+            f"Website enrich after sync: enriched={er.get('enriched')} "
+            f"skipped_ok={er.get('skipped_ok')} (cap {lim}; "
+            f"set WEALTH_LEADS_ENRICH_WEB_AFTER_SYNC=0 to disable).",
+            file=sys.stderr,
+        )
+        if er.get("errors"):
+            for line in er["errors"][:5]:
+                print(f"  [enrich] {line}", file=sys.stderr)
 
 
 def export_leads_csv() -> None:
@@ -452,7 +545,10 @@ def main() -> None:
         "SEC_10K_PER_CIK=3, SEC_RSS_COUNT. Set SEC_SYNC_FORMS=S-1,10-K for a global 10-K RSS feed too. "
         "Lead desk: WEALTH_LEADS_LEAD_DESK_S1_ONLY=1 (default), "
         "WEALTH_LEADS_LEAD_DESK_MIN_SIGNAL_USD=300000 (max single-FY of SCT total vs stock+options; 0 disables). "
-        "Legacy equity-only: WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD."
+        "Legacy equity-only: WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD. "
+        "Optional website photos / LinkedIn hints after each sync: WEALTH_LEADS_ENRICH_WEB_AFTER_SYNC=1 "
+        "and WEALTH_LEADS_ENRICH_WEB_AFTER_SYNC_LIMIT=12 (runs enrich-client-research; needs issuer site URL + "
+        "OPENAI for best LLM extraction; or run `enrich-client-research` manually anytime)."
     )
 
     sub.add_parser("export", help="Print leads as CSV to stdout")
@@ -532,6 +628,43 @@ def main() -> None:
         "rebuild-profiles",
         help="Refresh lead_profile table from NEO data (no SEC fetch; run after sync or parser changes)",
     )
+    sub.add_parser(
+        "refresh-issuer-hq",
+        help="Re-fetch primary documents and refresh issuer website + headquarters heuristics (no NEO re-parse)",
+    )
+
+    erc = sub.add_parser(
+        "enrich-client-research",
+        help="Fetch leadership pages on issuer websites → bio, photo URL, LinkedIn hints (stores in lead_client_research)",
+    )
+    erc.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Max profiles to enrich (default 20, cap 500)",
+    )
+    erc.add_argument("--cik", type=str, default="", help="Only this CIK")
+    erc.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run even if status is already ok",
+    )
+    erc.add_argument(
+        "--no-llm",
+        action="store_true",
+        help="Heuristics only (no LLM: no website summary, dossier story, or company snapshot during enrich)",
+    )
+    erc.add_argument(
+        "--smtp",
+        action="store_true",
+        help="Run SMTP RCPT probes on guessed addresses (also WEALTH_LEADS_EMAIL_SMTP_VERIFY=1; outbound port 25 often blocked)",
+    )
+    erc.epilog = (
+        "LLM (company snapshot, website card, executive story): same as enrich-s1-ai — "
+        "WEALTH_LEADS_S1_AI_PROVIDER=ollama (or openai, anthropic), WEALTH_LEADS_OLLAMA_MODEL, "
+        "WEALTH_LEADS_OLLAMA_URL. Downloads headshot bytes into SQLite when a photo URL is found. "
+        "Requires non-empty issuer website on the filing/profile."
+    )
 
     ai = sub.add_parser(
         "enrich-s1-ai",
@@ -553,6 +686,11 @@ def main() -> None:
         "--only-missing-neo",
         action="store_true",
         help="Only filings with zero neo_compensation rows",
+    )
+    ai.add_argument(
+        "--issuer-refresh",
+        action="store_true",
+        help="Only filings with empty/short HQ or no s1_llm_lead_pack (use when NEO exists but address/AI never ran)",
     )
     ai.add_argument(
         "--replace-neo",
@@ -585,6 +723,9 @@ def main() -> None:
         "Anthropic: ANTHROPIC_API_KEY; WEALTH_LEADS_ANTHROPIC_S1_MODEL. "
         "Ollama: run `ollama serve`, pull a model, set WEALTH_LEADS_OLLAMA_MODEL (default llama3.1); "
         "optional WEALTH_LEADS_OLLAMA_URL (default http://127.0.0.1:11434). "
+        "Document excerpt: WEALTH_LEADS_S1_AI_DOCUMENT_MODE=windows (default), linear "
+        "(read from start of plain text), or bookend (head+tail); "
+        "WEALTH_LEADS_S1_AI_MAX_CHARS caps size (default 100000). "
         "Cloud APIs bill per token; local uses your RAM/GPU. Output includes lead_intel "
         "(offering, ownership, related parties, etc.) stored on the filing row and shown in the pipeline drawer. "
         "Then: py -m wealth_leads rebuild-profiles"
@@ -616,7 +757,7 @@ def main() -> None:
     elif args.cmd == "serve-app":
         import uvicorn
 
-        from wealth_leads.config import app_listen_port
+        from wealth_leads.config import app_listen_port, uvicorn_reload_enabled
 
         port = getattr(args, "port", None) or app_listen_port()
         uvicorn.run(
@@ -624,6 +765,7 @@ def main() -> None:
             host=args.host,
             port=port,
             log_level="info",
+            reload=uvicorn_reload_enabled(),
         )
     elif args.cmd == "allocate":
         from wealth_leads.allocation import run_allocation_from_db
@@ -639,6 +781,22 @@ def main() -> None:
         with connect() as conn:
             st = rebuild_lead_profiles(conn)
         print(st, file=sys.stderr)
+    elif args.cmd == "refresh-issuer-hq":
+        refresh_issuer_hq_from_primary_docs()
+    elif args.cmd == "enrich-client-research":
+        from wealth_leads.lead_research import run_enrich_client_research
+
+        with connect() as conn:
+            st = run_enrich_client_research(
+                conn,
+                limit=int(getattr(args, "limit", 20) or 20),
+                cik=(getattr(args, "cik", None) or "").strip() or None,
+                force=bool(getattr(args, "force", False)),
+                use_llm=not bool(getattr(args, "no_llm", False)),
+                verify_smtp=bool(getattr(args, "smtp", False))
+                or email_smtp_verify_enabled(),
+            )
+        print(st, file=sys.stderr)
     elif args.cmd == "enrich-s1-ai":
         from wealth_leads.s1_ai_extract import run_enrich_s1_ai
 
@@ -646,6 +804,7 @@ def main() -> None:
             limit=int(getattr(args, "limit", 5) or 5),
             filing_id=getattr(args, "filing_id", None),
             only_missing_neo=bool(getattr(args, "only_missing_neo", False)),
+            issuer_refresh=bool(getattr(args, "issuer_refresh", False)),
             replace_neo=bool(getattr(args, "replace_neo", False)),
             replace_officers=bool(getattr(args, "replace_officers", False)),
             replace_bios=bool(getattr(args, "replace_bios", False)),

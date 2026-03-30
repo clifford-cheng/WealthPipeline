@@ -6,6 +6,11 @@ from typing import Optional
 
 from bs4 import BeautifulSoup
 
+from wealth_leads.person_quality import (
+    is_acceptable_lead_person_name,
+    refine_lead_person_name,
+)
+
 _YEAR_RE = re.compile(r"^20[12]\d$")
 _MONEY_CLEAN = re.compile(r"[\$,]")
 _DASH = frozenset({"—", "–", "-", "―", "\u2014", "\u2013", "\u00a0"})
@@ -239,6 +244,15 @@ def _parse_comp_table(table) -> list[NeoCompRow]:
             role_hint = role_for_last
             role_for_last = None
         else:
+            continue
+
+        if not is_acceptable_lead_person_name(name):
+            refined = refine_lead_person_name(name_cell) or (
+                refine_lead_person_name(role_hint) if role_hint else None
+            )
+            if refined:
+                name = refined
+        if not is_acceptable_lead_person_name(name):
             continue
 
         money_raw: list[Optional[float]] = []
