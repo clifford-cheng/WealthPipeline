@@ -296,8 +296,8 @@ from wealth_leads.serve import (
     _page_desk,
     _page_finder,
     _page_lead,
+    _profile_lead_tier,
     _profile_lead_url,
-    company_sidebar_for_lead,
     filter_profiles_geo_industry_text,
     finder_export_csv_bytes,
 )
@@ -922,6 +922,7 @@ async def admin_pipeline_csv(request: Request) -> Response:
             "signal_hwm",
             "equity_hwm",
             "has_s1_comp",
+            "lead_tier",
             "has_mgmt_bio",
             "has_officer_row",
             "neo_row_count",
@@ -950,6 +951,7 @@ async def admin_pipeline_csv(request: Request) -> Response:
                 r["signal_hwm"],
                 r["equity_hwm"],
                 r["has_s1_comp"],
+                r["lead_tier"] if "lead_tier" in r.keys() else "premium",
                 r["has_mgmt_bio"],
                 r["has_officer_row"],
                 r["neo_row_count"],
@@ -1250,11 +1252,9 @@ async def lead(
             )
     prof = _find_profile(profiles_all, cik, norm) if not stats.get("missing_db") else None
     filings: list[dict] = []
-    company_sidebar = None
     if prof is not None and not stats.get("missing_db"):
         with connect() as conn:
             filings = _filings_for_profile(conn, cik, norm)
-            company_sidebar = company_sidebar_for_lead(conn, (cik or "").strip())
     body = _page_lead(
         prof,
         filings,
@@ -1262,7 +1262,6 @@ async def lead(
         query_name=name,
         stats=stats,
         rendered_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        company_sidebar=company_sidebar,
     )
     return HTMLResponse(_inject_chrome(body, user))
 
@@ -1430,6 +1429,7 @@ async def export_desk_csv(request: Request) -> Response:
             "max_equity_usd",
             "headline_fy",
             "filing_date",
+            "lead_tier",
             "profile_path",
         ]
     )
@@ -1445,6 +1445,7 @@ async def export_desk_csv(request: Request) -> Response:
                 p.get("equity_hwm") if p.get("equity_hwm") is not None else "",
                 p.get("headline_year") or "",
                 p.get("filing_date") or "",
+                p.get("lead_tier") or _profile_lead_tier(p),
                 _profile_lead_url(p),
             ]
         )

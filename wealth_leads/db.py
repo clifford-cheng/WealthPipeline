@@ -171,6 +171,7 @@ def connect(path: Optional[str] = None) -> Generator[sqlite3.Connection, None, N
         _migrate_allocation_system(conn)
         _migrate_lead_profile(conn)
         _migrate_lead_profile_llm_flag(conn)
+        _migrate_lead_profile_lead_tier(conn)
         yield conn
         conn.commit()
     finally:
@@ -590,6 +591,14 @@ def _migrate_lead_profile_llm_flag(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_lead_profile_lead_tier(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(lead_profile)").fetchall()}
+    if "lead_tier" not in cols:
+        conn.execute(
+            "ALTER TABLE lead_profile ADD COLUMN lead_tier TEXT NOT NULL DEFAULT 'premium'"
+        )
+
+
 def get_allocation_settings(conn: sqlite3.Connection) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM allocation_settings WHERE id = 1").fetchone()
     assert row is not None
@@ -838,7 +847,7 @@ def list_lead_profiles_for_review(
         sql = "SELECT * FROM lead_profile WHERE 1=1"
         params: list[object] = []
         if s1_only:
-            sql += " AND has_s1_comp = 1"
+            sql += " AND (has_s1_comp = 1 OR lead_tier = 'visibility')"
         if cross_only:
             sql += " AND cross_company_hint = 1"
         if months_back is not None and months_back > 0:

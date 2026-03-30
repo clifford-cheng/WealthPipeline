@@ -726,6 +726,12 @@ def _money_cell(v: Any) -> str:
 
 def _pipeline_flags(r: Any) -> str:
     parts: list[str] = []
+    try:
+        lt = (r["lead_tier"] or "").strip().lower()
+    except (KeyError, TypeError, IndexError):
+        lt = ""
+    if lt in ("standard", "visibility"):
+        parts.append(lt[:3])
     if int(r["has_s1_comp"] or 0):
         parts.append("S-1")
     if int(r["has_mgmt_bio"] or 0):

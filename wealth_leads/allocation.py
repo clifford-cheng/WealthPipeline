@@ -78,7 +78,7 @@ def seniority_tier(title: str) -> tuple[int, str]:
 
 def liquidity_stage_for_profile(p: dict) -> str:
     ft = (p.get("filing_form_type") or "").upper()
-    if _is_s1_form_type(ft) or p.get("has_s1_comp"):
+    if _is_s1_form_type(ft) or p.get("has_s1_comp") or p.get("has_s1_officer"):
         return "S-1 filed (registration / pre-IPO disclosure)"
     if "10-K" in ft:
         return "Public company (10-K / ongoing disclosure)"
@@ -88,7 +88,7 @@ def liquidity_stage_for_profile(p: dict) -> str:
 def build_tags(p: dict) -> list[str]:
     tags: list[str] = []
     ft = (p.get("filing_form_type") or "").upper()
-    if _is_s1_form_type(ft) or p.get("has_s1_comp"):
+    if _is_s1_form_type(ft) or p.get("has_s1_comp") or p.get("has_s1_officer"):
         tags.append(_TAG_S1)
     eq = _safe_float(p.get("equity_hwm"))
     tot = _safe_float(p.get("total"))

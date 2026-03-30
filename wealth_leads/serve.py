@@ -4,7 +4,6 @@ import csv
 import html
 import io
 import json
-import math
 import os
 import re
 import sqlite3
@@ -31,8 +30,6 @@ from wealth_leads.management import issuer_summary_looks_spammy, why_surfaced_li
 from wealth_leads.management_bios import extract_age_from_bio_text
 
 _SERVE_CHILD_ENV = "WEALTH_LEADS_SERVE_CHILD"
-# Below this high-water SCT total, label comp as "minimal" (typical director fees, etc.).
-_ROSTER_MEANINGFUL_COMP_USD = 25_000.0
 # New value each process start so the tab reloads after you restart the server (picks up code changes).
 _DEV_BOOT = f"{time.time_ns()}-{os.getpid()}"
 
@@ -288,6 +285,259 @@ def _money(v: object) -> str:
         return "—"
 
 
+def _profile_lead_tier(p: dict) -> str:
+    """
+    premium — summary comp on file and meets desk pay bar (or bar is 0).
+    standard — summary comp but below desk pay bar (e.g. director SCT).
+    visibility — S-1 officer/director table only; no NEO/SCT rows in DB.
+    """
+    if p.get("has_summary_comp"):
+        min_bar = lead_desk_min_signal_usd()
+        equity_only = lead_desk_equity_only_min_usd()
+        v = float(p.get("equity_hwm") or 0) if equity_only else float(p.get("signal_hwm") or 0)
+        if min_bar <= 0 or v >= min_bar:
+            return "premium"
+        return "standard"
+    return "visibility"
+
+
+def _annotate_lead_tier_fields(p: dict) -> None:
+    tier = _profile_lead_tier(p)
+    p["lead_tier"] = tier
+    base = (p.get("why_surfaced") or "").strip()
+    if tier == "premium":
+        return
+    if tier == "standard":
+        suffix = (
+            " — Not premium: disclosed S-1 summary comp is below the desk pay-signal bar; "
+            "still useful for smaller RIAs / lower minimums."
+        )
+    else:
+        suffix = (
+            " — Not premium: S-1 officer/director listing only (no summary comp row in DB); "
+            "visibility / referral-tier prospect."
+        )
+    p["why_surfaced"] = (base + suffix).strip()
+
+
+def _desk_sort_tuple(p: dict) -> tuple:
+    tier = p.get("lead_tier") or _profile_lead_tier(p)
+    tr = {"premium": 2, "standard": 1, "visibility": 0}.get(tier, 0)
+    fy = p.get("headline_year")
+    try:
+        fy_i = int(fy) if fy is not None else 0
+    except (TypeError, ValueError):
+        fy_i = 0
+    try:
+        tot = float(p.get("total") or 0)
+    except (TypeError, ValueError):
+        tot = 0.0
+    return (
+        tr,
+        float(p.get("signal_hwm") or 0),
+        _filing_date_sort_key(p.get("filing_date") or ""),
+        fy_i,
+        tot,
+    )
+
+
+def _fetch_s1_officer_join_rows(conn: sqlite3.Connection) -> list[dict]:
+    cur = conn.execute(
+        """
+        SELECT o.name AS person_name, o.title, o.age, o.filing_id,
+               f.company_name, f.cik, f.filing_date, f.index_url, f.primary_doc_url,
+               f.form_type AS filing_form_type,
+               f.issuer_summary AS filing_issuer_summary,
+               f.issuer_website AS filing_issuer_website,
+               f.issuer_headquarters AS filing_issuer_headquarters,
+               f.issuer_industry AS filing_issuer_industry,
+               f.director_term_summary AS filing_director_term_summary
+        FROM officers o
+        JOIN filings f ON f.id = o.filing_id
+        WHERE LENGTH(TRIM(COALESCE(o.title, ''))) > 0
+        """
+    )
+    out: list[dict] = []
+    for r in cur.fetchall():
+        d = dict(r)
+        if _is_s1_form_type(str(d.get("filing_form_type") or "")):
+            out.append(d)
+    return out
+
+
+def _visibility_profile_dict(
+    conn: sqlite3.Connection,
+    head: dict,
+    officer_rows_by_cik: dict[str, list[tuple[str, str, Optional[int], int, str]]],
+    narr_map: dict[tuple[int, str], dict],
+) -> dict:
+    pn = _norm_person_name(head["person_name"] or "")
+    fid = int(head["filing_id"])
+    cik_s = str(head["cik"] or "").strip()
+    off_t, officer_age, officer_age_filing_date = _resolve_officer_extras_for_person(
+        officer_rows_by_cik.get(cik_s, []),
+        pref_filing_id=fid,
+        person_norm=pn,
+    )
+    title_guess = (head.get("title") or "").strip() or off_t or "—"
+
+    iss_raw = (head.get("filing_issuer_summary") or "").strip()
+    if iss_raw and issuer_summary_looks_spammy(iss_raw):
+        iss_raw = ""
+    if not iss_raw:
+        alt_rows = conn.execute(
+            """
+            SELECT issuer_summary FROM filings
+            WHERE cik = ? AND issuer_summary IS NOT NULL
+              AND TRIM(issuer_summary) != ''
+            ORDER BY COALESCE(filing_date, '') DESC, id DESC
+            LIMIT 25
+            """,
+            (cik_s,),
+        ).fetchall()
+        for row in alt_rows:
+            cand = (row[0] or "").strip()
+            if cand and not issuer_summary_looks_spammy(cand):
+                iss_raw = cand
+                break
+
+    issuer_web = (head.get("filing_issuer_website") or "").strip()
+    issuer_hq = (head.get("filing_issuer_headquarters") or "").strip()
+    if not issuer_web and cik_s:
+        rw = conn.execute(
+            """
+            SELECT issuer_website FROM filings
+            WHERE cik = ? AND issuer_website IS NOT NULL
+              AND TRIM(issuer_website) != ''
+            ORDER BY COALESCE(filing_date, '') DESC LIMIT 1
+            """,
+            (cik_s,),
+        ).fetchone()
+        issuer_web = (rw[0] or "").strip() if rw else ""
+    if not issuer_hq and cik_s:
+        rhq = conn.execute(
+            """
+            SELECT issuer_headquarters FROM filings
+            WHERE cik = ? AND issuer_headquarters IS NOT NULL
+              AND TRIM(issuer_headquarters) != ''
+            ORDER BY COALESCE(filing_date, '') DESC LIMIT 1
+            """,
+            (cik_s,),
+        ).fetchone()
+        issuer_hq = (rhq[0] or "").strip() if rhq else ""
+
+    issuer_ind = (head.get("filing_issuer_industry") or "").strip()
+    if not issuer_ind and cik_s:
+        rind = conn.execute(
+            """
+            SELECT issuer_industry FROM filings
+            WHERE cik = ? AND issuer_industry IS NOT NULL
+              AND TRIM(issuer_industry) != ''
+            ORDER BY COALESCE(filing_date, '') DESC LIMIT 1
+            """,
+            (cik_s,),
+        ).fetchone()
+        issuer_ind = (rind[0] or "").strip() if rind else ""
+
+    mgmt_nar = narr_map.get((fid, pn))
+    if not mgmt_nar and cik_s:
+        altn = conn.execute(
+            """
+            SELECT m.person_name, m.role_heading, m.bio_text
+            FROM person_management_narrative m
+            JOIN filings f ON f.id = m.filing_id
+            WHERE f.cik = ? AND m.person_name_norm = ?
+            ORDER BY COALESCE(f.filing_date, '') DESC, f.id DESC
+            LIMIT 1
+            """,
+            (cik_s, pn),
+        ).fetchone()
+        mgmt_nar = (
+            {
+                "person_name": altn["person_name"],
+                "role_heading": altn["role_heading"],
+                "bio_text": altn["bio_text"],
+            }
+            if altn
+            else None
+        )
+
+    dts = (head.get("filing_director_term_summary") or "").strip()
+    if not dts and cik_s:
+        rd = conn.execute(
+            """
+            SELECT director_term_summary FROM filings
+            WHERE cik = ? AND director_term_summary IS NOT NULL
+              AND TRIM(director_term_summary) != ''
+            ORDER BY COALESCE(filing_date, '') DESC, id DESC
+            LIMIT 1
+            """,
+            (cik_s,),
+        ).fetchone()
+        dts = (rd[0] or "").strip() if rd else ""
+
+    why = why_surfaced_line(
+        str(head.get("filing_form_type") or ""),
+        head.get("filing_date"),
+    )
+
+    bio_text_for_age = (mgmt_nar or {}).get("bio_text") or ""
+    narrative_age = (
+        extract_age_from_bio_text(bio_text_for_age) if bio_text_for_age else None
+    )
+    age_stated = officer_age if officer_age is not None else narrative_age
+    age_anchor = (
+        (officer_age_filing_date or (head["filing_date"] or "")).strip()
+        if officer_age is not None
+        else (head["filing_date"] or "").strip()
+    )
+    display_age, _ = _age_estimated_for_today(age_stated, age_anchor)
+
+    return {
+        "norm_name": pn,
+        "display_name": head["person_name"] or "—",
+        "company_name": head["company_name"] or "",
+        "cik": head["cik"] or "",
+        "title": title_guess,
+        "headline_year": None,
+        "salary": None,
+        "bonus": None,
+        "stock_awards": None,
+        "option_awards": None,
+        "total": None,
+        "equity": None,
+        "filing_date": head["filing_date"] or "",
+        "index_url": head["index_url"] or "",
+        "primary_doc_url": head["primary_doc_url"] or "",
+        "filing_form_type": head.get("filing_form_type") or "",
+        "issuer_summary": iss_raw,
+        "why_surfaced": why,
+        "years_count": 0,
+        "comp_timeline": "—",
+        "sum_year_totals": None,
+        "year_breakdown": [],
+        "equity_hwm": 0.0,
+        "total_hwm": 0.0,
+        "signal_hwm": 0.0,
+        "has_s1_comp": False,
+        "has_summary_comp": False,
+        "has_s1_officer": True,
+        "source_filing_ids": [fid],
+        "officer_age": display_age,
+        "age_stated_in_filing": age_stated,
+        "age_anchor_date": age_anchor,
+        "officer_age_from_table": officer_age,
+        "narrative_age": narrative_age,
+        "issuer_website": issuer_web,
+        "issuer_headquarters": issuer_hq,
+        "issuer_industry": issuer_ind,
+        "mgmt_bio_role": (mgmt_nar or {}).get("role_heading") or "",
+        "mgmt_bio_text": (mgmt_nar or {}).get("bio_text") or "",
+        "mgmt_bio_display_name": (mgmt_nar or {}).get("person_name") or "",
+        "director_term_summary": dts,
+    }
+
+
 def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
     """One row per (CIK, person): headline = latest fiscal year; sums + per-year breakdown for drill-down."""
     if not conn.execute(
@@ -312,31 +562,44 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
         """
     )
     raw = [dict(r) for r in cur.fetchall()]
-    if not raw:
+    groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for row in raw:
+        groups[_profile_key(row["cik"], row["person_name"])].append(row)
+
+    s1_officer_rows = _fetch_s1_officer_join_rows(conn)
+    s1_officer_keys = {
+        _profile_key(r["cik"], r["person_name"]) for r in s1_officer_rows
+    }
+    ciks_neo = {
+        str(r["cik"] or "").strip() for r in raw if str(r.get("cik") or "").strip()
+    }
+    ciks_s1 = {
+        str(r["cik"] or "").strip()
+        for r in s1_officer_rows
+        if str(r.get("cik") or "").strip()
+    }
+    ciks = ciks_neo | ciks_s1
+    if not groups and not s1_officer_rows:
         return []
 
     narr_map: dict[tuple[int, str], dict] = {}
     fids_neo = {int(r["filing_id"]) for r in raw}
-    if fids_neo and conn.execute(
+    fids_vis = {int(r["filing_id"]) for r in s1_officer_rows}
+    fids_narr = fids_neo | fids_vis
+    if fids_narr and conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='person_management_narrative'"
     ).fetchone():
-        qm = ",".join("?" * len(fids_neo))
+        qm = ",".join("?" * len(fids_narr))
         ncur = conn.execute(
             f"""
             SELECT filing_id, person_name_norm, person_name, role_heading, bio_text
             FROM person_management_narrative
             WHERE filing_id IN ({qm})
             """,
-            tuple(fids_neo),
+            tuple(fids_narr),
         )
         for nr in ncur.fetchall():
             narr_map[(int(nr["filing_id"]), nr["person_name_norm"] or "")] = dict(nr)
-
-    groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
-    for row in raw:
-        groups[_profile_key(row["cik"], row["person_name"])].append(row)
-
-    ciks = {str(r["cik"] or "").strip() for r in raw if str(r.get("cik") or "").strip()}
     officer_rows_by_cik: dict[str, list[tuple[str, str, Optional[int], int, str]]] = (
         defaultdict(list)
     )
@@ -572,86 +835,87 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
         )
         display_age, _ = _age_estimated_for_today(age_stated, age_anchor)
 
-        profiles.append(
-            {
-                "norm_name": key[1],
-                "display_name": head["person_name"] or "—",
-                "company_name": head["company_name"] or "",
-                "cik": head["cik"] or "",
-                "title": title_guess or "—",
-                "headline_year": head["fiscal_year"],
-                "salary": head["salary"],
-                "bonus": head["bonus"],
-                "stock_awards": head["stock_awards"],
-                "option_awards": head.get("option_awards"),
-                "total": head["total"],
-                "equity": head["equity_comp_disclosed"],
-                "filing_date": head["filing_date"] or "",
-                "index_url": head["index_url"] or "",
-                "primary_doc_url": head["primary_doc_url"] or "",
-                "filing_form_type": head.get("filing_form_type") or "",
-                "issuer_summary": iss_raw,
-                "why_surfaced": why,
-                "years_count": len(by_year),
-                "comp_timeline": timeline,
-                "sum_year_totals": sum_year_totals,
-                "year_breakdown": year_breakdown,
-                "equity_hwm": equity_hwm,
-                "total_hwm": total_hwm,
-                "signal_hwm": signal_hwm,
-                "has_s1_comp": has_s1_comp,
-                "officer_age": display_age,
-                "age_stated_in_filing": age_stated,
-                "age_anchor_date": age_anchor,
-                "officer_age_from_table": officer_age,
-                "narrative_age": narrative_age,
-                "issuer_website": issuer_web,
-                "issuer_headquarters": issuer_hq,
-                "issuer_industry": issuer_ind,
-                "mgmt_bio_role": (mgmt_nar or {}).get("role_heading") or "",
-                "mgmt_bio_text": (mgmt_nar or {}).get("bio_text") or "",
-                "mgmt_bio_display_name": (mgmt_nar or {}).get("person_name") or "",
-                "director_term_summary": dts,
-            }
-        )
+        prof = {
+            "norm_name": key[1],
+            "display_name": head["person_name"] or "—",
+            "company_name": head["company_name"] or "",
+            "cik": head["cik"] or "",
+            "title": title_guess or "—",
+            "headline_year": head["fiscal_year"],
+            "salary": head["salary"],
+            "bonus": head["bonus"],
+            "stock_awards": head["stock_awards"],
+            "option_awards": head.get("option_awards"),
+            "total": head["total"],
+            "equity": head["equity_comp_disclosed"],
+            "filing_date": head["filing_date"] or "",
+            "index_url": head["index_url"] or "",
+            "primary_doc_url": head["primary_doc_url"] or "",
+            "filing_form_type": head.get("filing_form_type") or "",
+            "issuer_summary": iss_raw,
+            "why_surfaced": why,
+            "years_count": len(by_year),
+            "comp_timeline": timeline,
+            "sum_year_totals": sum_year_totals,
+            "year_breakdown": year_breakdown,
+            "equity_hwm": equity_hwm,
+            "total_hwm": total_hwm,
+            "signal_hwm": signal_hwm,
+            "has_s1_comp": has_s1_comp,
+            "officer_age": display_age,
+            "age_stated_in_filing": age_stated,
+            "age_anchor_date": age_anchor,
+            "officer_age_from_table": officer_age,
+            "narrative_age": narrative_age,
+            "issuer_website": issuer_web,
+            "issuer_headquarters": issuer_hq,
+            "issuer_industry": issuer_ind,
+            "mgmt_bio_role": (mgmt_nar or {}).get("role_heading") or "",
+            "mgmt_bio_text": (mgmt_nar or {}).get("bio_text") or "",
+            "mgmt_bio_display_name": (mgmt_nar or {}).get("person_name") or "",
+            "director_term_summary": dts,
+        }
+        prof["source_filing_ids"] = sorted({int(r["filing_id"]) for r in items})
+        prof["has_summary_comp"] = True
+        prof["has_s1_officer"] = key in s1_officer_keys
+        _annotate_lead_tier_fields(prof)
+        profiles.append(prof)
 
-    profiles.sort(
-        key=lambda p: (p["filing_date"] or "", p["headline_year"] or 0, p["total"] or 0),
-        reverse=True,
-    )
+    vis_buckets: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for r in s1_officer_rows:
+        vis_buckets[_profile_key(r["cik"], r["person_name"])].append(r)
+    for vkey, vrows in vis_buckets.items():
+        if vkey in groups:
+            continue
+        vrows.sort(
+            key=lambda d: (
+                _filing_date_sort_key(d.get("filing_date") or ""),
+                int(d.get("filing_id") or 0),
+            ),
+            reverse=True,
+        )
+        vhead = vrows[0]
+        vprof = _visibility_profile_dict(conn, vhead, officer_rows_by_cik, narr_map)
+        _annotate_lead_tier_fields(vprof)
+        profiles.append(vprof)
+
+    profiles.sort(key=_desk_sort_tuple, reverse=True)
     return profiles
 
 
 def _lead_desk_filter_profiles(profiles: list[dict]) -> list[dict]:
     """
-    Narrow desk to S-1-linked NEO rows and a minimum pay bar (configurable).
-    Default: best single FY max(SCT total, stock+options) >= threshold.
-    Legacy: if WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD is set, only stock+options are compared.
+    Desk list: S-1 context (summary comp and/or S-1 officer/director table).
+    Premium pay bar no longer drops rows — low-signal SCT and officer-only profiles
+    stay on the desk as standard / visibility tiers (see lead_tier).
     """
     s1_only = lead_desk_s1_only()
-    min_bar = lead_desk_min_signal_usd()
-    equity_only = lead_desk_equity_only_min_usd()
     out: list[dict] = []
     for p in profiles:
-        if s1_only and not p.get("has_s1_comp"):
+        if s1_only and not (p.get("has_s1_comp") or p.get("has_s1_officer")):
             continue
-        if min_bar > 0:
-            if equity_only:
-                v = float(p.get("equity_hwm") or 0)
-            else:
-                v = float(p.get("signal_hwm") or 0)
-            if v < min_bar:
-                continue
         out.append(p)
-    out.sort(
-        key=lambda p: (
-            float(p.get("signal_hwm") or 0),
-            p.get("filing_date") or "",
-            p.get("headline_year") or 0,
-            p.get("total") or 0,
-        ),
-        reverse=True,
-    )
+    out.sort(key=_desk_sort_tuple, reverse=True)
     return out
 
 
@@ -733,6 +997,7 @@ def finder_export_csv_bytes(
             "filing_date",
             "latest_total_usd",
             "max_equity_usd",
+            "lead_tier",
             "profile_path",
             "index_url",
             "primary_doc_url",
@@ -750,6 +1015,7 @@ def finder_export_csv_bytes(
                 p.get("filing_date") or "",
                 p.get("total") if p.get("total") is not None else "",
                 p.get("equity_hwm") if p.get("equity_hwm") is not None else "",
+                p.get("lead_tier") or _profile_lead_tier(p),
                 _profile_lead_url(p),
                 p.get("index_url") or "",
                 p.get("primary_doc_url") or "",
@@ -762,10 +1028,12 @@ def _profile_breakdown_table(p: dict) -> str:
     yb = p.get("year_breakdown") or []
     if not yb:
         return "<p class='bd-note'>No fiscal-year rows.</p>"
+    headline_fy = p.get("headline_year")
     parts: list[str] = [
-        "<p class='bd-note'><strong>Year-by-year</strong> — from the filing summary compensation table. "
-        "Each FY uses the row from the <b>latest amendment</b> in your DB if duplicates exist. "
-        "Equity columns are usually grant-date fair value, not cash. <strong>Total</strong> is the issuer’s SCT total for that year.</p>",
+        "<p class='bd-note'>Summary compensation table — one row per fiscal year in your DB "
+        "(latest amendment wins if duplicates). "
+        "<strong>Latest headline FY</strong> for this profile is highlighted. "
+        "Equity is usually grant-date fair value. <strong>Total</strong> is the issuer SCT total.</p>",
         "<table class='inner-comp'><thead><tr>",
         "<th>FY</th><th>Salary</th><th>Bonus</th><th>Stock</th><th>Options</th><th>Other</th>",
         "<th>Equity Σ</th><th>Total</th><th>Filing</th><th>Doc</th>",
@@ -774,9 +1042,17 @@ def _profile_breakdown_table(p: dict) -> str:
     for y in yb:
         doc = html.escape(y.get("primary_doc_url") or "")
         doc_l = f'<a href="{doc}" target="_blank" rel="noopener">S-1</a>' if doc else "—"
+        fy = y.get("fiscal_year")
+        is_headline = False
+        if headline_fy is not None and fy is not None:
+            try:
+                is_headline = int(headline_fy) == int(fy)
+            except (TypeError, ValueError):
+                is_headline = False
+        tr_cls = ' class="comp-row-latest"' if is_headline else ""
         parts.append(
-            "<tr>"
-            f"<td class='num'>{y['fiscal_year']}</td>"
+            f"<tr{tr_cls}>"
+            f"<td class='num'>{html.escape(str(fy) if fy is not None else '—')}</td>"
             f"<td class='num'>{_money(y.get('salary'))}</td>"
             f"<td class='num'>{_money(y.get('bonus'))}</td>"
             f"<td class='num'>{_money(y.get('stock_awards'))}</td>"
@@ -814,133 +1090,6 @@ def _hq_one_line_for_maps(raw: str | None) -> str:
     parts = [p.strip() for p in re.split(r"[\n\r]+", s) if p.strip()]
     one = ", ".join(parts)
     return re.sub(r"[ \t]{2,}", " ", one).strip()
-
-
-def _title_suggests_director_role(title: str) -> bool:
-    """Rough heuristic: title text skews toward outside / independent directors."""
-    t = re.sub(r"\s+", " ", (title or "").strip().lower())
-    if not t:
-        return False
-    needles = (
-        "director",
-        "board member",
-        "audit committee",
-        "compensation committee",
-        "nominating committee",
-        "chair of the board",
-        "chairman of the board",
-        "vice chair",
-        "lead director",
-    )
-    if "independent" in t and "director" in t:
-        return True
-    return any(n in t for n in needles)
-
-
-def _neo_stats_by_norm_for_cik(
-    conn: sqlite3.Connection, cik: str
-) -> dict[str, dict[str, Any]]:
-    """Per normalized person name: NEO row count, high-water total, latest FY (any filing for CIK)."""
-    ck = (cik or "").strip()
-    out: dict[str, dict[str, Any]] = {}
-    if not ck:
-        return out
-    if not conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='neo_compensation'"
-    ).fetchone():
-        return out
-    for r in conn.execute(
-        """
-        SELECT c.person_name, c.fiscal_year, c.total
-        FROM neo_compensation c
-        JOIN filings f ON f.id = c.filing_id
-        WHERE f.cik = ?
-        """,
-        (ck,),
-    ).fetchall():
-        pn = _norm_person_name(r["person_name"] or "")
-        if not pn:
-            continue
-        if pn not in out:
-            out[pn] = {"max_total": None, "row_count": 0, "latest_fy": None}
-        st = out[pn]
-        st["row_count"] += 1
-        fy = r["fiscal_year"]
-        if fy is not None:
-            try:
-                fy_i = int(fy)
-                if st["latest_fy"] is None or fy_i > st["latest_fy"]:
-                    st["latest_fy"] = fy_i
-            except (TypeError, ValueError):
-                pass
-        tot = r["total"]
-        if tot is None:
-            continue
-        try:
-            fv = float(tot)
-            if math.isnan(fv):
-                continue
-        except (TypeError, ValueError):
-            continue
-        if st["max_total"] is None or fv > st["max_total"]:
-            st["max_total"] = fv
-    return out
-
-
-def company_sidebar_for_lead(conn: sqlite3.Connection, cik: str) -> dict[str, Any]:
-    """
-    Company column context: officer roster from the registrant's newest filing in DB.
-    (Proxy for \"who else is named\" — not full company headcount.)
-    """
-    ck = (cik or "").strip()
-    empty: dict[str, Any] = {"officer_roster": [], "roster_source": "", "roster_filing_id": None}
-    if not ck:
-        return empty
-    fr = conn.execute(
-        """
-        SELECT id, filing_date, form_type FROM filings
-        WHERE cik = ?
-        ORDER BY COALESCE(filing_date, '') DESC, id DESC
-        LIMIT 1
-        """,
-        (ck,),
-    ).fetchone()
-    if not fr:
-        return empty
-    fid = int(fr["id"])
-    fd = (fr["filing_date"] or "").strip()
-    ft = (fr["form_type"] or "").strip()
-    bits = [x for x in (fd, ft) if x]
-    src = " · ".join(bits) if bits else f"filing #{fid}"
-    neo_by_norm = _neo_stats_by_norm_for_cik(conn, ck)
-    roster: list[dict[str, Any]] = []
-    for r in conn.execute(
-        """
-        SELECT name, title FROM officers
-        WHERE filing_id = ?
-        ORDER BY name COLLATE NOCASE
-        """,
-        (fid,),
-    ).fetchall():
-        name = (r["name"] or "").strip()
-        title = (r["title"] or "").strip()
-        pn = _norm_person_name(name)
-        ns = neo_by_norm.get(pn) if pn else None
-        roster.append(
-            {
-                "name": name,
-                "title": title,
-                "person_norm": pn,
-                "neo_max_total": ns["max_total"] if ns else None,
-                "neo_row_count": int(ns["row_count"]) if ns else 0,
-                "neo_latest_fy": ns["latest_fy"] if ns else None,
-            }
-        )
-    return {
-        "officer_roster": roster,
-        "roster_source": src,
-        "roster_filing_id": fid,
-    }
 
 
 def _filings_for_profile(conn: sqlite3.Connection, cik: str, _norm_name: str) -> list[dict]:
@@ -982,17 +1131,15 @@ def _desk_table(profiles: list[dict], stats: dict) -> str:
         hidden = n_all > 0
         extra = ""
         if hidden:
-            min_e = float(stats.get("lead_desk_min_signal_usd") or 0)
-            leg = bool(stats.get("lead_desk_equity_only_legacy"))
             s1 = bool(stats.get("lead_desk_s1_only"))
-            bar = "max-year stock+options only" if leg else "max(SCT total, stock+options) in a single FY"
+            min_e = float(stats.get("lead_desk_min_signal_usd") or 0)
             extra = (
-                f"<p class='meta'><b>{n_all}</b> NEO profile(s) are hidden by desk filters"
-                f" ({'S-1 only; ' if s1 else ''}{bar} <b>${min_e:,.0f}</b>). "
-                f"Open a saved <code>/lead?…</code> link to view anyone still in the DB. "
-                f"To widen: set <code>WEALTH_LEADS_LEAD_DESK_MIN_SIGNAL_USD=0</code> (or lower the number), "
-                f"and/or <code>WEALTH_LEADS_LEAD_DESK_S1_ONLY=0</code>. "
-                f"Legacy equity-only: <code>WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD</code>.</p>"
+                f"<p class='meta'><b>{n_all}</b> profile(s) in DB but not on the desk "
+                f"({'S-1 context only (SCT or S-1 officer listing); ' if s1 else ''}"
+                f"or outside your snapshot). Pay bar <b>${min_e:,.0f}</b> is used for "
+                f"<b>premium</b> vs <b>standard</b> tiering only — it does not hide rows. "
+                f"Open a saved <code>/lead?…</code> link for any profile. "
+                f"To include non–S-1: <code>WEALTH_LEADS_LEAD_DESK_S1_ONLY=0</code>.</p>"
             )
         return f"""
   <h2>Lead desk</h2>
@@ -1010,14 +1157,23 @@ def _desk_table(profiles: list[dict], stats: dict) -> str:
         doc = html.escape(p["primary_doc_url"] or "")
         idx_l = f'<a href="{idx}" target="_blank" rel="noopener" onclick="event.stopPropagation()">EDGAR</a>' if idx else "—"
         doc_l = f'<a href="{doc}" target="_blank" rel="noopener" onclick="event.stopPropagation()">Doc</a>' if doc else "—"
-        ft_raw = (p.get("filing_form_type") or "EDGAR").strip()
-        ft_u = ft_raw.upper()
-        if "10-K" in ft_u:
-            badge = "10-K · NEO"
-        elif "S-1" in ft_u:
-            badge = "S-1 · NEO"
-        else:
-            badge = f"{html.escape(ft_raw[:14])} · NEO" if ft_raw else "EDGAR · NEO"
+        tier = p.get("lead_tier") or _profile_lead_tier(p)
+        tier_lbl = {"premium": "Premium", "standard": "Standard", "visibility": "Visibility"}.get(
+            tier, tier
+        )
+        tier_title = (
+            "Full SCT disclosure meets desk pay-signal bar (or bar is off)."
+            if tier == "premium"
+            else (
+                "S-1 summary comp below desk pay bar — still a sellable lead."
+                if tier == "standard"
+                else "S-1 officer/director table only — no SCT row in DB; referral-tier."
+            )
+        )
+        badge = (
+            f'<span class="badge badge-tier-{html.escape(tier)}" '
+            f'title="{html.escape(tier_title)}">{html.escape(tier_lbl)}</span>'
+        )
         why_s = html.escape((p.get("why_surfaced") or "")[:160])
         why_cell = f'<span class="lead-why">{why_s}</span>' if why_s else ""
         oa_row = p.get("officer_age")
@@ -1086,7 +1242,7 @@ def _desk_table(profiles: list[dict], stats: dict) -> str:
     return f"""
   <h2>Lead desk</h2>
   <p class="meta">
-    <b>Person-first pre-IPO leads.</b> Desk = <b>S-1 / S-1/A NEO</b> plus a configurable pay bar (<code>WEALTH_LEADS_LEAD_DESK_MIN_SIGNAL_USD</code>). <b>Company</b> links to the issuer website when we parsed one from the filing, otherwise the primary EDGAR doc.     <b>Latest total</b> = headline fiscal year SCT; <b>Max equity</b> = best single-year stock+options.
+    <b>Person-first pre-IPO leads.</b> Desk = <b>S-1 family</b> profiles: <b>Premium</b> (SCT meets pay bar), <b>Standard</b> (SCT below bar, e.g. many directors), and <b>Visibility</b> (officer/director on S-1, no SCT row in DB). Pay bar (<code>WEALTH_LEADS_LEAD_DESK_MIN_SIGNAL_USD</code>) tiers only — it does not remove rows. <b>Company</b> links to issuer site when parsed, else filing doc. <b>Latest total</b> = headline FY SCT (— if none); <b>Max equity</b> = best single-year stock+options.
     <b>Age</b> = stated in the filing, then + full calendar years to today (no birthday in EDGAR text); hover a row for <b>bio + age detail</b>.
     Full narrative + HQ on the profile page.
     <b>Click the row</b> for detail. Raw rows: <b>Source rows</b> below.
@@ -1095,7 +1251,7 @@ def _desk_table(profiles: list[dict], stats: dict) -> str:
   <table id="desk">
     <thead>
       <tr>
-        <th title="Stated age in the filing, plus full calendar years to today (birthday not disclosed)">Age</th><th>Person</th><th>Role</th><th>Company</th><th>Form</th>
+        <th title="Stated age in the filing, plus full calendar years to today (birthday not disclosed)">Age</th><th>Person</th><th>Role</th><th>Company</th><th title="Premium vs standard vs visibility (see desk note)">Tier</th>
         <th>Latest total</th><th title='Max single-FY stock + options (SCT)'>Max equity</th>
         <th>FY</th><th>Filing</th><th>CIK</th><th>Quick source</th>
       </tr>
@@ -1195,7 +1351,7 @@ def _finder_form(
       <input type="search" id="fq" name="q" placeholder="Person name, company, or CIK…" value="{q_e}" style="width:100%;max-width:100%;margin-bottom:0.5rem"/>
       <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.8125rem;color:#8b96a3;cursor:pointer;margin:0.5rem 0">
         <input type="checkbox" name="all_neo" value="1"{' checked' if all_neo else ''}/>
-        All NEO profiles (ignore lead-desk S-1 / pay-bar filters)
+        All profiles in DB (ignore lead-desk S-1-context filter; includes every tier)
       </label>
       <button type="submit" style="margin-top:0.35rem;padding:0.45rem 0.9rem;border-radius:4px;border:1px solid #238636;background:#238636;color:#fff;cursor:pointer;font:inherit">Apply filters</button>
       <a href="{html.escape(export_href)}" style="margin-left:0.75rem;font-size:0.8125rem">Download CSV</a>
@@ -1235,8 +1391,8 @@ def _page_finder(
     )
     tbl = _finder_table(profiles)
     scope = (
-        f"<p class='meta'>Universe: <b>{base_count}</b> NEO profile(s) "
-        f"({'all in database' if all_neo else 'after lead-desk filters'}), then location / industry / text filters.</p>"
+        f"<p class='meta'>Universe: <b>{base_count}</b> profile(s) "
+        f"({'all in database' if all_neo else 'after lead-desk S-1-context filters'}), then location / industry / text filters.</p>"
     )
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1469,6 +1625,10 @@ def _shared_css() -> str:
       display: inline-block; font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.04em;
       padding: 0.15rem 0.4rem; border-radius: 4px; background: #1a2634; color: #8b96a3; border: 1px solid #2a3340;
     }
+    .badge-tier-premium { background: #15251c; color: #56d364; border-color: #2a6a3f; }
+    .badge-tier-standard { background: #1e2515; color: #d4a72c; border-color: #5c4f2a; }
+    .badge-tier-visibility { background: #22252c; color: #a8b0ba; border-color: #3d424d; }
+    p.lead-tier-strip { margin-top: 0.35rem; margin-bottom: 0.5rem; }
     .lead-why {
       display: block; font-size: 0.68rem; color: #7a8796; line-height: 1.35;
       margin-top: 0.28rem; max-width: 24rem; font-weight: 400;
@@ -1495,7 +1655,17 @@ def _shared_css() -> str:
       background: #121820; border: 1px solid #2a3340; border-radius: 6px; padding: 0.85rem 1rem; margin-bottom: 1rem;
     }
     .card.bio-placeholder { border-style: dashed; border-color: #3d4a5c; }
-    table.comp-head td { font-size: 0.8rem; }
+    tr.comp-row-latest td {
+      background: #151f2a;
+      box-shadow: inset 3px 0 0 #58a6ff;
+    }
+    .lead-comp-block { margin-bottom: 0.25rem; }
+    .lead-mgmt-bio-wrap { margin-top: 2.25rem; }
+    table.related-leads-table td.related-title {
+      max-width: 14rem;
+      font-size: 0.72rem;
+      line-height: 1.35;
+    }
     details.audit { margin-top: 1.5rem; border-top: 1px solid #2a3340; padding-top: 1rem; }
     details.audit summary {
       cursor: pointer; color: #8b96a3; font-size: 0.8125rem; user-select: none;
@@ -1547,33 +1717,6 @@ def _shared_css() -> str:
       margin: 0 0 0.85rem;
     }
     .lead-col .hero { grid-template-columns: 1fr 1fr; }
-    table.roster-grid { font-size: 0.74rem; }
-    table.roster-grid td.roster-comp-col { white-space: nowrap; vertical-align: top; }
-    table.roster-grid td.roster-note-col {
-      font-size: 0.68rem;
-      color: #8b96a3;
-      line-height: 1.4;
-      max-width: 17rem;
-      vertical-align: top;
-    }
-    table.roster-grid td.roster-title { max-width: 13rem; vertical-align: top; }
-    .roster-pill-row { display: flex; flex-wrap: wrap; gap: 0.25rem; margin-top: 0.3rem; }
-    .roster-pill {
-      display: inline-block;
-      font-size: 0.58rem;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-      padding: 0.08rem 0.35rem;
-      border-radius: 3px;
-      font-weight: 600;
-    }
-    .roster-pill-lead { background: #1e2d3d; color: #79c0ff; border: 1px solid #316d9a; }
-    .roster-pill-neo { background: #15251c; color: #56d364; border: 1px solid #2a6a3f; }
-    .roster-pill-soft { background: #22252c; color: #a8b0ba; border: 1px solid #3d424d; }
-    .roster-comp-num { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
-    .roster-comp-strong { font-weight: 600; color: #e8ecf0; }
-    .roster-comp-min { color: #a8b5c4; }
-    .roster-note { color: #8b96a3; }
     """
 
 
@@ -1673,149 +1816,6 @@ def _filings_table_html(filings: list[dict]) -> str:
     )
 
 
-def _roster_money_float(v: object) -> Optional[float]:
-    if v is None:
-        return None
-    try:
-        x = float(v)
-        if math.isnan(x):
-            return None
-        return x
-    except (TypeError, ValueError):
-        return None
-
-
-def _lead_roster_comp_cell(o: dict[str, Any]) -> str:
-    nrows = int(o.get("neo_row_count") or 0)
-    mx = _roster_money_float(o.get("neo_max_total"))
-    fy = o.get("neo_latest_fy")
-    if nrows == 0 or mx is None:
-        return "<span class='dim'>No SCT row</span>"
-    fy_l = f"FY {fy}" if fy is not None else "FY in DB"
-    if mx < _ROSTER_MEANINGFUL_COMP_USD:
-        return (
-            f"<span class='roster-comp-num roster-comp-min'>{html.escape(_money(mx))}</span>"
-            f" <span class='dim'>({html.escape(fy_l)}, minimal)</span>"
-        )
-    return (
-        f"<span class='roster-comp-num roster-comp-strong'>{html.escape(_money(mx))}</span>"
-        f" <span class='dim'>({html.escape(fy_l)} high-water)</span>"
-    )
-
-
-def _lead_roster_note_cell(o: dict[str, Any]) -> str:
-    title = o.get("title") or ""
-    dirish = _title_suggests_director_role(title)
-    nrows = int(o.get("neo_row_count") or 0)
-    mx = _roster_money_float(o.get("neo_max_total"))
-    if dirish and nrows == 0:
-        txt = (
-            "Director / board role — often no NEO line in SCT; cash fees may be elsewhere "
-            "in the filing."
-        )
-    elif dirish and mx is not None and mx < _ROSTER_MEANINGFUL_COMP_USD:
-        txt = "Director — small SCT totals are common (fees, retainers vs. executive pay)."
-    elif nrows > 0 and mx is not None and mx >= _ROSTER_MEANINGFUL_COMP_USD:
-        txt = (
-            "Summary comp table in DB with larger totals — comparable executive signal to "
-            "pipeline NEO profiles (confirm title and duties in the filing)."
-        )
-    elif nrows > 0:
-        txt = "SCT row exists but amounts are low—may be director fees or partial parse."
-    else:
-        txt = (
-            "Signature-table name only in our DB—no matching NEO row for this person "
-            "on this CIK (not necessarily a non-executive; check parse / filing)."
-        )
-    return f"<span class='roster-note'>{html.escape(txt)}</span>"
-
-
-def _officer_roster_html(
-    roster: list[dict[str, Any]],
-    roster_source: str,
-    *,
-    lead_norm: str,
-) -> str:
-    if not roster:
-        return (
-            "<p class='meta' style='margin-bottom:0'>"
-            "<span class='dim'>No officer rows in DB for the latest filing on this CIK. "
-            "Sync / parse may not have captured the signature table.</span>"
-            "</p>"
-        )
-
-    def sort_key(o: dict[str, Any]) -> tuple:
-        pn = (o.get("person_norm") or "") or _norm_person_name(o.get("name") or "")
-        is_lead = bool(lead_norm and pn == lead_norm)
-        nrows = int(o.get("neo_row_count") or 0)
-        mx = _roster_money_float(o.get("neo_max_total"))
-        has_any_neo = nrows > 0
-        meaningful = has_any_neo and mx is not None and mx >= _ROSTER_MEANINGFUL_COMP_USD
-        if is_lead:
-            tier = 0
-        elif meaningful:
-            tier = 1
-        elif has_any_neo:
-            tier = 2
-        else:
-            tier = 3
-        sub = -(mx if mx is not None else 0.0) if tier <= 2 else 0.0
-        return (tier, sub, (o.get("name") or "").lower())
-
-    sorted_roster = sorted(roster, key=sort_key)
-    body_rows: list[str] = []
-    for o in sorted_roster[:60]:
-        nm = o.get("name") or "—"
-        tl = o.get("title") or "—"
-        pn = (o.get("person_norm") or "") or _norm_person_name(nm)
-        nrows = int(o.get("neo_row_count") or 0)
-        mx = _roster_money_float(o.get("neo_max_total"))
-        pills: list[str] = []
-        if lead_norm and pn == lead_norm:
-            pills.append("<span class='roster-pill roster-pill-lead'>This page</span>")
-        if nrows > 0 and mx is not None and mx >= _ROSTER_MEANINGFUL_COMP_USD:
-            pills.append("<span class='roster-pill roster-pill-neo'>NEO</span>")
-        elif nrows > 0:
-            pills.append("<span class='roster-pill roster-pill-soft'>SCT</span>")
-        pill_html = (
-            "<div class='roster-pill-row'>" + "".join(pills) + "</div>"
-        ) if pills else ""
-        body_rows.append(
-            "<tr>"
-            f"<td class='profile-name'>{html.escape(nm)}{pill_html}</td>"
-            f"<td class='roster-title'>{html.escape(tl)}</td>"
-            f"<td class='roster-comp-col'>{_lead_roster_comp_cell(o)}</td>"
-            f"<td class='roster-note-col'>{_lead_roster_note_cell(o)}</td>"
-            "</tr>"
-        )
-    cap = ""
-    if len(roster) > 60:
-        cap = f"<p class='meta dim' style='margin:0.35rem 0 0;font-size:0.72rem'>Showing 60 of {len(roster)} names.</p>"
-    src = html.escape(roster_source) if roster_source else "latest filing"
-    expl = (
-        "<strong>How to read this:</strong> The left column is everyone named on the "
-        "<em>latest</em> officer/signature table we parsed. "
-        "<strong>Comp (DB)</strong> is our match to a <em>summary compensation (NEO)</em> row "
-        "for this CIK anywhere in your database—not every director gets an SCT line, and "
-        "many only show modest fees. "
-        f"High-water totals below {_money(_ROSTER_MEANINGFUL_COMP_USD)} are labeled "
-        "<em>minimal</em> (common for director fees). "
-        "Sort order: this profile first, then larger NEO totals, then small or missing SCT."
-    )
-    return (
-        "<p class='meta roster-explainer' style='margin-top:0.25rem;margin-bottom:0.65rem;font-size:0.78rem;line-height:1.5;color:#9aa3b0'>"
-        f"{expl}</p>"
-        f"<p class='meta' style='margin-top:0;margin-bottom:0.4rem;font-size:0.72rem;color:#7a8796'>"
-        f"Officer table source: <strong>{src}</strong> · not total company headcount.</p>"
-        "<div class='table-wrap'><table class='roster-grid'><thead><tr>"
-        "<th>Name</th><th>Title</th><th>Comp in DB</th><th>Context</th>"
-        "</tr></thead><tbody>"
-        + "".join(body_rows)
-        + "</tbody></table></div>"
-        + cap
-    )
-
-
 def _page_lead(
     profile: Optional[dict],
     filings: list[dict],
@@ -1824,7 +1824,6 @@ def _page_lead(
     query_name: str,
     stats: dict,
     rendered_at: str,
-    company_sidebar: Optional[dict[str, Any]] = None,
 ) -> str:
     css = _shared_css()
     banner = _stats_banner(stats, rendered_at)
@@ -1859,21 +1858,23 @@ def _page_lead(
         else ""
     )
 
-    headline_tbl = f"""
-    <div class="table-wrap"><table class="comp-head">
-      <thead><tr>
-        <th>FY</th><th>Salary</th><th>Bonus</th><th>Stock</th><th>Options</th><th>Equity Σ</th><th>Total</th>
-      </tr></thead>
-      <tbody><tr>
-        <td class="num">{html.escape(str(p.get('headline_year') or '—'))}</td>
-        <td class="num">{_money(p.get('salary'))}</td>
-        <td class="num">{_money(p.get('bonus'))}</td>
-        <td class="num">{_money(p.get('stock_awards'))}</td>
-        <td class="num">{_money(p.get('option_awards'))}</td>
-        <td class="num">{_money(p.get('equity'))}</td>
-        <td class="num strong">{_money(p.get('total'))}</td>
-      </tr></tbody>
-    </table></div>"""
+    lt = p.get("lead_tier") or _profile_lead_tier(p)
+    if lt == "premium":
+        tier_hdr = (
+            '<p class="meta lead-tier-strip"><span class="badge badge-tier-premium">Premium</span> '
+            "Summary comp meets the desk pay-signal bar (or the bar is set to $0).</p>"
+        )
+    elif lt == "standard":
+        tier_hdr = (
+            '<p class="meta lead-tier-strip"><span class="badge badge-tier-standard">Standard</span> '
+            "S-1 summary comp is below the desk pay bar — still a typical director / smaller-RIA lead.</p>"
+        )
+    else:
+        tier_hdr = (
+            '<p class="meta lead-tier-strip"><span class="badge badge-tier-visibility">Visibility</span> '
+            "Named on the S-1 officer/director table with no summary comp row in this database — "
+            "referral / outreach tier, not premium disclosure.</p>"
+        )
 
     dts_body = (p.get("director_term_summary") or "").strip()
     director_card = f"""
@@ -1951,7 +1952,7 @@ def _page_lead(
             )
     else:
         age_line = (
-            "<strong>Age:</strong> <span class='dim'>Not found in roster table or narrative — "
+            "<strong>Age:</strong> <span class='dim'>Not found in the filing officers table or narrative — "
             "run <code>backfill-comp --force</code> after parser updates.</span><br/>"
         )
     hq_txt = (p.get("issuer_headquarters") or "").strip()
@@ -2001,14 +2002,6 @@ def _page_lead(
       <p class="meta" style="margin-top:0.35rem; margin-bottom:0">{summ_html}</p>
     </div>"""
 
-    sb = company_sidebar or {}
-    roster = list(sb.get("officer_roster") or [])
-    roster_src = (sb.get("roster_source") or "").strip()
-    lead_norm = _norm_person_name(
-        (p.get("display_name") or "").strip() or query_name
-    )
-    roster_block = _officer_roster_html(roster, roster_src, lead_norm=lead_norm)
-
     hq_one = _hq_one_line_for_maps(hq_txt)
     co_nm = (p.get("company_name") or "").strip()
     map_query = hq_one or (f"{co_nm} headquarters" if co_nm else "")
@@ -2028,16 +2021,9 @@ def _page_lead(
         "<div class='lead-data-note'>"
         "<strong>Revenue &amp; headcount:</strong> Not stored as numbers in WealthPipeline yet. "
         "They often appear in Business / MD&amp;A in the filing—use the business summary here "
-        "or the primary document link in the header. The officer table lists <strong>named executives</strong> "
-        "from the filing, not total employees—useful for referral paths inside the company."
+        "or the primary document link in the header."
         "</div>"
     )
-
-    roster_card = f"""
-    <div class="card">
-      <h2 style="margin-top:0">Officer roster &amp; SCT coverage</h2>
-      {roster_block}
-    </div>"""
 
     why_card = f"""
     <div class="card">
@@ -2054,11 +2040,10 @@ def _page_lead(
     col_company = f"""
     <aside class="lead-col lead-col-company" aria-labelledby="lead-col-company">
       <div class="lead-col-title" id="lead-col-company">Company</div>
-      <p class="lead-col-hint">Registrant facts, map, business text, board terms, filing list, and who else is named—context for referrals and outreach.</p>
+      <p class="lead-col-hint">High-level registrant context only—facts, map, business summary, board terms, and filings. No other named executives are listed here.</p>
       {company_card}
       {maps_row}
       {data_note}
-      {roster_card}
       {director_card}
       {filings_block}
     </aside>"""
@@ -2075,11 +2060,13 @@ def _page_lead(
         <div class="stat-card"><div class="lbl">Σ SCT (years in DB)</div><div class="val">{sum_disp}</div></div>
         <div class="stat-card"><div class="lbl">Fiscal years w/ comp</div><div class="val">{int(p.get('years_count') or 0)}</div></div>
       </div>
-      <h2>Headline compensation (latest fiscal year)</h2>
-      {headline_tbl}
-      <h2>Year-by-year (summary comp table)</h2>
+      <div class="lead-comp-block">
+      <h2>Compensation (summary comp table)</h2>
       {_profile_breakdown_table(p)}
+      </div>
+      <div class="lead-mgmt-bio-wrap">
       {mgmt_narrative_card}
+      </div>
     </main>"""
 
     return f"""<!DOCTYPE html>
@@ -2103,6 +2090,7 @@ def _page_lead(
       <a href="{html.escape(p.get('index_url') or '')}" target="_blank" rel="noopener">EDGAR index</a>
       {(' · ' + doc_link) if doc_link else ''}
     </p>
+    {tier_hdr}
   </header>
   <div class="lead-split" role="presentation">
     {col_company}
@@ -2333,11 +2321,9 @@ def _app(environ, start_response):
         norm = _norm_person_name(name_decoded)
         prof = _find_profile(profiles_all, cik, norm) if not stats.get("missing_db") else None
         filings: list[dict] = []
-        company_sidebar = None
         if prof is not None and not stats.get("missing_db"):
             with connect() as conn:
                 filings = _filings_for_profile(conn, cik, norm)
-                company_sidebar = company_sidebar_for_lead(conn, cik)
         html_out = _page_lead(
             prof,
             filings,
@@ -2345,7 +2331,6 @@ def _app(environ, start_response):
             query_name=name_decoded,
             stats=stats,
             rendered_at=rendered_at,
-            company_sidebar=company_sidebar,
         )
     else:
         html_out = _page_desk(profiles, leads, comp, stats, rendered_at)
