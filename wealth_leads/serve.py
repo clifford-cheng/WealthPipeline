@@ -1232,31 +1232,102 @@ def _reported_other_cell(y: dict) -> str:
     return _money(r) + "<span class='dim'> *</span>"
 
 
-def _profile_headline_comp_summary(p: dict) -> str:
-    """Advisor preview: filing total, equity awards, and cash/benefit remainder — not 4-column spread."""
+def _headline_year_row_from_profile(p: dict) -> Optional[dict]:
+    """Single fiscal-year row for headline comp (SCT), preferring headline_year in year_breakdown."""
+    yb = p.get("year_breakdown") or []
+    hy = p.get("headline_year")
+    hi: Optional[int] = None
+    if hy is not None and str(hy).strip() != "":
+        try:
+            hi = int(hy)
+        except (TypeError, ValueError):
+            hi = None
+    if hi is not None:
+        for y in yb:
+            if y.get("fiscal_year") == hi:
+                return y
+    if yb:
+        return yb[0]
     if not p.get("has_summary_comp"):
-        return """<div class="lead-comp-summary card"><p class="meta" style="margin:0;line-height:1.55">
-<strong>No summary compensation in the database for this person yet</strong> (officer / director visibility profile, or NEO not parsed).
-The preview below appears after sync extracts summary comp. Try a lead with an SCT row from the pipeline, or run <code>py -m wealth_leads rebuild-profiles</code> after backfilling.
-</p></div>"""
-    fy = p.get("headline_year")
+        return None
+    return {
+        "fiscal_year": p.get("headline_year"),
+        "salary": p.get("salary"),
+        "bonus": p.get("bonus"),
+        "stock_awards": p.get("stock_awards"),
+        "option_awards": p.get("option_awards"),
+        "non_equity_incentive": p.get("non_equity_incentive"),
+        "pension_change": p.get("pension_change"),
+        "other_comp": p.get("other_comp"),
+        "equity_comp_disclosed": p.get("equity"),
+        "total": p.get("total"),
+        "filing_date": p.get("filing_date"),
+        "primary_doc_url": p.get("primary_doc_url"),
+    }
+
+
+def _profile_headline_comp_breakout_html(p: dict) -> str:
+    """One-row SCT breakout for the headline fiscal year — primary advisor comp view."""
+    if not p.get("has_summary_comp"):
+        return (
+            '<div class="lead-comp-breakout-wrap card">'
+            "<h2 class=\"lead-section-h\">Compensation</h2>"
+            "<p class=\"meta dim\" style=\"margin:0\">No summary comp row in the database for this person yet "
+            "(visibility-only profile or NEO not parsed). Use an S-1 SCT lead or run sync / backfill.</p>"
+            "</div>"
+        )
+    row = _headline_year_row_from_profile(p)
+    if not row:
+        return (
+            '<div class="lead-comp-breakout-wrap card">'
+            "<h2 class=\"lead-section-h\">Compensation</h2>"
+            "<p class=\"meta dim\" style=\"margin:0\">No fiscal-year breakdown available.</p>"
+            "</div>"
+        )
+    fy = row.get("fiscal_year")
     try:
         fy_s = str(int(fy)) if fy is not None and str(fy).strip() != "" else "—"
     except (TypeError, ValueError):
         fy_s = str(fy).strip() if fy not in (None, "") else "—"
-    tot_m = _money(p.get("total"))
-    eq_sum = _equity_awards_sum_profile(p)
-    stk_m = _money(eq_sum) if eq_sum is not None else "—"
-    cash_m = _money(_cash_ex_equity_awards(p))
-    return f"""<div class="lead-comp-summary card">
-  <h3 style="margin:0 0 0.75rem 0;font-size:0.95rem">Comp preview · FY {html.escape(fy_s)} <span class="dim">(what advisors see first)</span></h3>
-  <dl class="lead-comp-dl">
-    <dt>All-in disclosed comp</dt><dd class="lead-comp-dd">{tot_m} <span class="dim">SCT &quot;Total&quot; column</span></dd>
-    <dt>Cash and bonus</dt><dd class="lead-comp-dd">{cash_m} <span class="dim">Non-equity-award side: total minus stock &amp; option <strong>award</strong> columns when math ties; else sum of cash-line cells</span></dd>
-    <dt>Equity awards (grant value)</dt><dd class="lead-comp-dd">{stk_m} <span class="dim">Stock + option awards; grant-date fair value — illiquid until vest / exit</span></dd>
-  </dl>
-  <p class="meta dim" style="margin:0.65rem 0 0;line-height:1.45">Line-by-line salary / bonus / other is in the filing table below (expand). This is filing math, not household wealth or your price — set your own unlock fee.</p>
-</div>"""
+    doc = html.escape(row.get("primary_doc_url") or "")
+    doc_l = f'<a href="{doc}" target="_blank" rel="noopener">Filing doc</a>' if doc else "—"
+    tbl = (
+        "<div class=\"table-wrap lead-comp-table-wrap\"><table class=\"inner-comp lead-comp-breakout\">"
+        "<thead><tr>"
+        '<th scope="col" title="Fiscal year">FY</th>'
+        '<th scope="col" title="Salary">Salary</th>'
+        '<th scope="col" title="Bonus">Bonus</th>'
+        '<th scope="col" title="Stock awards">Stock</th>'
+        '<th scope="col" title="Option awards">Opt.</th>'
+        '<th scope="col" title="Non-equity incentive plan comp">Non-eq.</th>'
+        '<th scope="col" title="Change in pension value">Pens.</th>'
+        '<th scope="col" title="All other compensation">Other</th>'
+        '<th scope="col" title="Total">Total</th>'
+        "</tr></thead><tbody><tr>"
+        f"<td class=\"num strong\">{html.escape(fy_s)}</td>"
+        f"<td class=\"num\">{_money(row.get('salary'))}</td>"
+        f"<td class=\"num\">{_money(row.get('bonus'))}</td>"
+        f"<td class=\"num\">{_money(row.get('stock_awards'))}</td>"
+        f"<td class=\"num\">{_money(row.get('option_awards'))}</td>"
+        f"<td class=\"num\">{_money(row.get('non_equity_incentive'))}</td>"
+        f"<td class=\"num\">{_money(row.get('pension_change'))}</td>"
+        f"<td class=\"num\">{_reported_other_cell(row)}</td>"
+        f"<td class=\"num strong\">{_money(row.get('total'))}</td>"
+        "</tr></tbody></table></div>"
+        f"<p class=\"meta dim lead-comp-foot\">Grant-date / filing-disclosed SCT values — not liquid or household wealth. "
+        f"Filing date <b>{html.escape(row.get('filing_date') or '—')}</b> · {doc_l}</p>"
+    )
+    return (
+        '<div class="lead-comp-breakout-wrap card">'
+        '<h2 class="lead-section-h">Compensation</h2>'
+        f"{tbl}"
+        "</div>"
+    )
+
+
+def _profile_headline_comp_summary(p: dict) -> str:
+    """Deprecated for lead page; kept for any legacy callers — delegates to breakout."""
+    return _profile_headline_comp_breakout_html(p)
 
 
 def _profile_breakdown_table(p: dict) -> str:
@@ -1292,6 +1363,48 @@ def _profile_breakdown_table(p: dict) -> str:
         )
     parts.append("</tbody></table>")
     return "".join(parts)
+
+
+def _profile_lead_compensation_card_html(p: dict) -> str:
+    """
+    Lead profile: show every stored fiscal year by default (full SCT history).
+    Falls back to the single headline row when year_breakdown is empty but comp exists.
+    """
+    if not p.get("has_summary_comp"):
+        return _profile_headline_comp_breakout_html(p)
+    yb = p.get("year_breakdown") or []
+    if not yb:
+        return _profile_headline_comp_breakout_html(p)
+    top = yb[0]
+    doc_u = (top.get("primary_doc_url") or "").strip()
+    doc_e = html.escape(doc_u)
+    doc_l = (
+        f'<a href="{doc_e}" target="_blank" rel="noopener">Open filing</a>' if doc_u else ""
+    )
+    fd = html.escape(top.get("filing_date") or "—")
+    foot_bits = [
+        "Grant-date / filing-disclosed summary comp (SCT) — not liquid wealth.",
+        f"Newest fiscal year first · latest row filing <b>{fd}</b>",
+    ]
+    if doc_l:
+        foot_bits.append(doc_l)
+    foot = (
+        "<p class=\"meta dim lead-comp-foot\">"
+        + " · ".join(foot_bits)
+        + "</p>"
+    )
+    tbl = _profile_breakdown_table(p)
+    return (
+        '<div class="lead-comp-breakout-wrap card">'
+        '<h2 class="lead-section-h">Compensation</h2>'
+        '<p class="meta dim" style="margin:0 0 0.5rem;font-size:0.78rem">'
+        "All fiscal years in the database for this person (summary comp table).</p>"
+        '<div class="table-wrap lead-comp-table-wrap lead-comp-history-wrap">'
+        f"{tbl}"
+        "</div>"
+        f"{foot}"
+        "</div>"
+    )
 
 
 def _profile_lead_url(p: dict) -> str:
@@ -1936,8 +2049,12 @@ def _shared_css() -> str:
     p.lead-tier-strip { margin-top: 0.35rem; margin-bottom: 0.5rem; }
     .client-research-card { border-color: #316d9a; background: linear-gradient(180deg, #141c24 0%, #121820 100%); }
     .client-research-card h2 { color: #79c0ff; }
-    .research-photo-wrap { float: right; margin: 0 0 0.75rem 1rem; max-width: 140px; }
-    .research-photo { width: 100%; max-height: 180px; object-fit: cover; border-radius: 8px; border: 1px solid #2a3340; }
+    .lead-outreach-panel { display: flow-root; }
+    .research-photo-wrap { float: right; margin: 0 0 0.75rem 1rem; max-width: 160px; }
+    .research-photo { width: 100%; max-height: 200px; object-fit: cover; border-radius: 8px; border: 1px solid #2a3340; }
+    @media (max-width: 520px) {
+      .lead-outreach-panel .research-photo-wrap { float: none; margin: 0 0 0.75rem 0; max-width: 100%; }
+    }
     .client-research-links { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; margin-top: 0.5rem; font-size: 0.8125rem; }
     .advisor-subh { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em; color: #8b96a3; margin: 0.85rem 0 0.2rem; font-weight: 600; }
     .advisor-company-snapshot { border-color: #3d4d60; }
@@ -2006,6 +2123,72 @@ def _shared_css() -> str:
     details.audit summary:hover { color: #c5ccd4; }
     body.lead-profile-page { max-width: 1180px; }
     .lead-page-header { margin-bottom: 1rem; padding-bottom: 0.85rem; border-bottom: 1px solid #2a3340; }
+    .lead-section-h {
+      font-size: 0.95rem; font-weight: 600; margin: 0 0 0.5rem 0; color: #e8ecf0; letter-spacing: -0.01em;
+    }
+    .lead-hero-line { font-size: 0.92rem; line-height: 1.5; color: #c5ccd4; margin: 0.25rem 0 0.65rem; }
+    .lead-hero-sep { color: #5c6570; margin: 0 0.35rem; }
+    .lead-hero-kv {
+      display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.5rem 1rem;
+      margin: 0.35rem 0 0.25rem; padding: 0.65rem 0.75rem;
+      background: #101820; border: 1px solid #2a3340; border-radius: 6px;
+    }
+    @media (min-width: 640px) { .lead-hero-kv { grid-template-columns: repeat(4, 1fr); } }
+    .lead-kv { min-width: 0; }
+    .lead-kv-l {
+      display: block; font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.06em;
+      color: #6b7785; margin-bottom: 0.15rem;
+    }
+    .lead-kv-v { font-size: 0.88rem; color: #e8ecf0; line-height: 1.35; word-break: break-word; }
+    .lead-hero-links { margin: 0.45rem 0 0; font-size: 0.84rem; }
+    .lead-comp-fullwidth {
+      width: 100%;
+      margin: 0 0 1.1rem 0;
+    }
+    .lead-comp-fullwidth .lead-comp-block { margin-bottom: 0; }
+    .lead-comp-fullwidth .lead-comp-table-wrap {
+      overflow-x: visible;
+      max-width: 100%;
+    }
+    .lead-comp-fullwidth div.table-wrap.lead-comp-table-wrap {
+      overflow-x: visible;
+    }
+    .lead-comp-fullwidth table.lead-comp-breakout {
+      width: 100%;
+      table-layout: fixed;
+    }
+    .lead-comp-fullwidth table.lead-comp-breakout th,
+    .lead-comp-fullwidth table.lead-comp-breakout td {
+      font-size: 0.72rem;
+      padding: 0.4rem 0.28rem;
+      white-space: normal;
+      word-break: normal;
+      overflow-wrap: anywhere;
+      vertical-align: top;
+    }
+    .lead-comp-fullwidth table.lead-comp-breakout .num {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .lead-comp-fullwidth table.lead-comp-breakout th:first-child,
+    .lead-comp-fullwidth table.lead-comp-breakout td:first-child { width: 2.5rem; }
+    @media (max-width: 480px) {
+      .lead-comp-fullwidth table.lead-comp-breakout th,
+      .lead-comp-fullwidth table.lead-comp-breakout td { font-size: 0.62rem; padding: 0.3rem 0.12rem; }
+    }
+    .lead-comp-history-wrap {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      max-width: 100%;
+    }
+    table.lead-comp-breakout th, table.lead-comp-breakout td { font-size: 0.78rem; padding: 0.4rem 0.45rem; }
+    table.lead-comp-breakout .num { text-align: right; font-variant-numeric: tabular-nums; }
+    .lead-comp-foot { margin: 0.5rem 0 0; font-size: 0.75rem; }
+    .lead-comp-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 0; }
+    .lead-snapshot-inner .card { margin-bottom: 0; }
+    .lead-snapshot-inner { margin-top: 0.35rem; }
+    details.lead-snapshot-fold { margin-bottom: 0.85rem; }
     .lead-split {
       display: grid;
       gap: 1.25rem;
@@ -2023,6 +2206,37 @@ def _shared_css() -> str:
       color: #9aa3b0;
       margin: 0 0 0.25rem;
       font-weight: 700;
+    }
+    .lead-company-card .lead-company-dl {
+      display: grid;
+      grid-template-columns: minmax(6.5rem, max-content) 1fr;
+      gap: 0.45rem 1rem;
+      margin: 0;
+      font-size: 0.8125rem;
+      line-height: 1.5;
+    }
+    .lead-company-card .lead-company-dl dt {
+      margin: 0;
+      color: #8b96a3;
+      font-weight: 600;
+    }
+    .lead-company-card .lead-company-dl dd {
+      margin: 0;
+      color: #c5ccd4;
+      word-break: break-word;
+      min-width: 0;
+    }
+    .lead-company-card .lead-company-dl dd a {
+      word-break: break-all;
+    }
+    @media (max-width: 420px) {
+      .lead-company-card .lead-company-dl {
+        grid-template-columns: 1fr;
+        gap: 0.15rem 0;
+      }
+      .lead-company-card .lead-company-dl dt { margin-top: 0.45rem; }
+      .lead-company-card .lead-company-dl dt:first-child { margin-top: 0; }
+      .lead-company-card .lead-company-dl dd { margin-bottom: 0.1rem; }
     }
     .lead-col-hint {
       font-size: 0.72rem;
@@ -2212,18 +2426,17 @@ def _json_leaf_display_str(v: object) -> str:
     return s
 
 
-def _issuer_snapshot_card_html(snap: dict) -> str:
+def _issuer_snapshot_card_html(
+    snap: dict, *, omit_keys: Optional[frozenset[str]] = None
+) -> str:
+    skip = omit_keys or frozenset()
     if not snap:
         return (
             '<div class="card advisor-company-snapshot">'
-            '<h2 style="margin-top:0">Company profile (readable)</h2>'
+            '<h3 class="advisor-subh" style="margin-top:0">At a glance (enriched)</h3>'
             '<p class="meta" style="margin-bottom:0">'
             "<span class='dim'>Not generated yet.</span> Run "
-            "<code>python -m wealth_leads enrich-client-research --force</code> "
-            "after filings have an <strong>issuer summary</strong> "
-            "(use <code>enrich-s1-ai</code> or parser backfill). "
-            "LLM uses <code>WEALTH_LEADS_S1_AI_PROVIDER</code> (Ollama / OpenAI / Anthropic) — same as S-1 AI. "
-            "No invented revenue or headcount."
+            "<code>enrich-client-research</code> after issuer summary exists."
             "</p></div>"
         )
     parts: list[str] = []
@@ -2234,6 +2447,8 @@ def _issuer_snapshot_card_html(snap: dict) -> str:
         ("business_plain", "What they do"),
         ("pool_angle", "Why scale matters for outreach"),
     ]:
+        if key in skip:
+            continue
         v = _json_leaf_display_str(snap.get(key))
         if v:
             parts.append(
@@ -2246,8 +2461,70 @@ def _issuer_snapshot_card_html(snap: dict) -> str:
     body = "".join(parts) if parts else "<p class='meta dim'>Snapshot empty — re-run enrichment.</p>"
     return (
         '<div class="card advisor-company-snapshot">'
-        '<h2 style="margin-top:0">Company profile (readable)</h2>'
         f"{body}"
+        "</div>"
+    )
+
+
+def _lead_company_public_card_html(p: dict, issuer_snapshot: dict) -> str:
+    """Structured company block: name, CIK, website (URL as link text), address, employees, industry."""
+    co = html.escape(p.get("company_name") or "—")
+    cik = html.escape(str(p.get("cik") or ""))
+    web_raw = (p.get("issuer_website") or "").strip()
+    web_canon = _canonical_external_url(web_raw)
+    if web_canon:
+        web_dd = (
+            f'<a href="{html.escape(web_canon)}" target="_blank" rel="noopener">'
+            f"{html.escape(web_canon)}</a>"
+        )
+    else:
+        web_dd = "<span class='dim'>—</span>"
+
+    hq_txt = (p.get("issuer_headquarters") or "").strip()
+    hq_loc = hq_city_state_display(hq_txt)
+    if not hq_loc:
+        mat = (p.get("issuer_hq_city_state") or "").strip()
+        if mat and not hq_city_state_looks_like_filing_noise(mat):
+            hq_loc = mat
+    hq_detail_line = hq_principal_office_display_line(hq_txt)
+    if hq_detail_line:
+        addr_dd = html.escape(hq_detail_line)
+    elif hq_loc:
+        addr_dd = html.escape(hq_loc)
+    elif hq_txt:
+        addr_dd = (
+            "<span class='dim'>Unclear from filing text — verify in the linked SEC filing.</span>"
+        )
+    else:
+        addr_dd = "<span class='dim'>—</span>"
+
+    emp_s = _json_leaf_display_str(
+        issuer_snapshot.get("employees") if issuer_snapshot else None
+    )
+    if emp_s:
+        emp_dd = html.escape(emp_s)
+    else:
+        emp_dd = "<span class='dim' title='Run enrich-client-research for scale from filing/site context'>—</span>"
+
+    ind_txt = (p.get("issuer_industry") or "").strip()
+    ind_dd = html.escape(ind_txt) if ind_txt else "<span class='dim'>—</span>"
+
+    rows: list[tuple[str, str]] = [
+        ("Legal name", f"<strong>{co}</strong>"),
+        ("CIK", f'<span class="cik">{cik}</span>'),
+        ("Website", web_dd),
+        ("Principal office", addr_dd),
+        ("Employees / scale", emp_dd),
+        ("Industry (SIC / NAICS)", ind_dd),
+    ]
+    dl_parts = [
+        f"<dt>{html.escape(label)}</dt><dd>{inner}</dd>" for label, inner in rows
+    ]
+    dl = '<dl class="lead-company-dl">' + "".join(dl_parts) + "</dl>"
+    return (
+        '<div class="card lead-company-card">'
+        '<h2 class="lead-section-h">Issuer</h2>'
+        f"{dl}"
         "</div>"
     )
 
@@ -2293,14 +2570,10 @@ def _client_research_card_html(
 ) -> str:
     if cr is None:
         return (
-            '<div class="card client-research-card">'
-            '<h2 style="margin-top:0">Executive dossier</h2>'
+            '<div class="card client-research-card lead-outreach-panel">'
+            '<h2 class="lead-section-h">Background &amp; outreach</h2>'
             '<p class="meta" style="margin-bottom:0">'
-            "<span class='dim'>Not generated yet.</span> Run "
-            "<code>python -m wealth_leads enrich-client-research --limit 25</code>. "
-            "Uses <code>WEALTH_LEADS_S1_AI_PROVIDER=ollama</code> (or OpenAI/Anthropic) like <code>enrich-s1-ai</code>. "
-            "Pulls website photo (stored in DB), bio, dossier story, company snapshot; suggests email patterns. "
-            "Optional: <code>WEALTH_LEADS_EMAIL_SMTP_VERIFY=1</code> or <code>--smtp</code> for RCPT probes."
+            "<span class='dim'>Not generated yet.</span> Run <code>enrich-client-research</code> for photo, story, links, and email hints."
             "</p></div>"
         )
     st = (cr.get("status") or "").strip()
@@ -2411,8 +2684,8 @@ def _client_research_card_html(
         )
 
     return (
-        '<div class="card client-research-card">'
-        '<h2 style="margin-top:0">Executive dossier</h2>'
+        '<div class="card client-research-card lead-outreach-panel">'
+        '<h2 class="lead-section-h">Background &amp; outreach</h2>'
         f"{inner}"
         "</div>"
     )
@@ -2460,26 +2733,25 @@ def _page_lead(
 
     lt = p.get("lead_tier") or _profile_lead_tier(p)
     if lt == "premium":
-        tier_hdr = (
-            '<p class="meta lead-tier-strip"><span class="badge badge-tier-premium">Premium</span> '
-            "Summary comp meets the desk pay-signal bar (or the bar is set to $0).</p>"
+        tier_badge = (
+            '<span class="badge badge-tier-premium" title="Summary comp meets the desk pay-signal bar '
+            '(or the bar is set to $0).">Premium</span>'
         )
     elif lt == "standard":
-        tier_hdr = (
-            '<p class="meta lead-tier-strip"><span class="badge badge-tier-standard">Standard</span> '
-            "S-1 summary comp is below the desk pay bar — still a typical director / smaller-RIA lead.</p>"
+        tier_badge = (
+            '<span class="badge badge-tier-standard" title="S-1 summary comp is below the desk pay bar.">'
+            "Standard</span>"
         )
     else:
-        tier_hdr = (
-            '<p class="meta lead-tier-strip"><span class="badge badge-tier-visibility">Visibility</span> '
-            "Named on the S-1 officer/director table with no summary comp row in this database — "
-            "referral / outreach tier, not premium disclosure.</p>"
+        tier_badge = (
+            '<span class="badge badge-tier-visibility" title="Officer/director table; no summary comp row '
+            "in this database.\">Visibility</span>"
         )
 
     dts_body = (p.get("director_term_summary") or "").strip()
     director_card = f"""
     <div class="card">
-      <h2 style="margin-top:0">Director and board terms</h2>
+      <h2 class="lead-section-h">Director &amp; board terms</h2>
       <p class="meta" style="margin-bottom:0">{html.escape(dts_body) if dts_body else "<span class='dim'>Not extracted yet — run <code>backfill-comp --force</code> after updating the parser.</span>"}</p>
     </div>"""
 
@@ -2497,14 +2769,14 @@ def _page_lead(
         role_suffix = f" — {html.escape(mb_role)}" if mb_role else ""
         mgmt_narrative_card = f"""
     <div class="card">
-      <h2 style="margin-top:0">Management biography (from filing)</h2>
+      <h2 class="lead-section-h">Management biography</h2>
       <p class="meta" style="margin-bottom:0"><strong>{html.escape(heading_line)}</strong>{role_suffix}</p>
       {paras_html}
     </div>"""
     else:
         mgmt_narrative_card = f"""
     <div class="card bio-placeholder">
-      <h2 style="margin-top:0">Management biography (from filing)</h2>
+      <h2 class="lead-section-h">Management biography</h2>
       <p class="meta" style="margin-bottom:0">
         <span class='dim'>No narrative block stored for this executive yet.</span>
         Re-sync or run <code>backfill-comp --force</code> to re-parse the <b>Executive Officers and Directors</b> prose (name, role, age context, prior positions in narrative form).
@@ -2521,40 +2793,36 @@ def _page_lead(
     anchor = (p.get("age_anchor_date") or "").strip()
     oat = p.get("officer_age_from_table")
     nar = p.get("narrative_age")
+    age_hero_val = "—"
+    age_hero_title = ""
     if oa is not None:
         try:
             age_n = int(oa)
+            age_hero_val = str(age_n)
             if oat is not None:
-                src = "executive officers table"
+                src = "Officers table"
             elif nar is not None:
-                src = "Management narrative (prose)"
+                src = "Management narrative"
             else:
-                src = "filing-derived"
-            esc_a = html.escape(anchor) if anchor else ""
-            bits = [src]
+                src = "Filing-derived"
+            age_hero_title = src
             if stated is not None and anchor:
                 try:
                     st_i = int(stated)
+                    esc_a = html.escape(anchor)
                     if age_n != st_i:
-                        bits.append(
-                            f"filing stated <b>{st_i}</b> as of <b>{esc_a}</b>; "
-                            f"<b>{age_n}</b> adds full calendar years to today (birthday not in filing)"
+                        age_hero_title = (
+                            f"{src}. Filing stated {st_i} as of {esc_a}; {age_n} adds calendar years to today."
                         )
                     else:
-                        bits.append(f"as of filing date <b>{esc_a}</b>")
+                        age_hero_title = f"{src}. As of filing date {esc_a}."
                 except (TypeError, ValueError):
                     pass
-            detail = "<span class='dim'>(" + "; ".join(bits) + ")</span>"
-            age_line = f"<strong>Age:</strong> {age_n} {detail}<br/>"
         except (TypeError, ValueError):
-            age_line = (
-                "<strong>Age:</strong> <span class='dim'>—</span><br/>"
-            )
+            age_hero_val = "—"
+            age_hero_title = ""
     else:
-        age_line = (
-            "<strong>Age:</strong> <span class='dim'>Not found in the filing officers table or narrative — "
-            "run <code>backfill-comp --force</code> after parser updates.</span><br/>"
-        )
+        age_hero_title = "Not in officers table or narrative — run backfill if missing."
     hq_txt = (p.get("issuer_headquarters") or "").strip()
     hq_loc = hq_city_state_display(hq_txt)
     if not hq_loc:
@@ -2562,15 +2830,7 @@ def _page_lead(
         if mat and not hq_city_state_looks_like_filing_noise(mat):
             hq_loc = mat
     hq_loc_esc = html.escape(hq_loc) if hq_loc else ""
-    hq_detail_line = hq_principal_office_display_line(hq_txt)
-    hq_detail_esc = html.escape(hq_detail_line) if hq_detail_line else ""
     web_raw = (p.get("issuer_website") or "").strip()
-    web_canon = _canonical_external_url(web_raw)
-    web_link = (
-        f'<a href="{html.escape(web_canon)}" target="_blank" rel="noopener">Company website</a>'
-        if web_canon
-        else ""
-    )
     summ_body = (p.get("issuer_summary") or "").strip()
     summ_html = (
         html.escape(summ_body)
@@ -2578,65 +2838,67 @@ def _page_lead(
         else "<span class='dim'>Not extracted — run <code>sync</code> or <code>backfill-comp --force</code>.</span>"
     )
 
-    person_card = f"""
-    <div class="card">
-      <h2 style="margin-top:0">Filing demographics</h2>
-      <p class="meta" style="margin-bottom:0">
-        {age_line}
-        <span class='dim'>We do not have a home address or personal phone from SEC data; use the dossier for outreach paths.</span>
-      </p>
-    </div>"""
+    age_title_attr = html.escape(age_hero_title, quote=True) if age_hero_title else ""
 
-    company_bits = [
-        f"<strong>{html.escape(p.get('company_name') or '—')}</strong>",
-        f"CIK <span class='cik'>{html.escape(str(p.get('cik') or ''))}</span>",
-    ]
-    if web_link:
-        company_bits.append(web_link)
-    if hq_loc_esc:
-        company_bits.append(f"Location: {hq_loc_esc}")
-    elif hq_txt:
-        company_bits.append(
-            "Location: <span class='dim'>Unclear from filing text — verify in the linked SEC doc</span>"
-        )
-    ind_txt = (p.get("issuer_industry") or "").strip()
-    if ind_txt:
-        company_bits.append(f"SIC/NAICS: {html.escape(ind_txt)}")
-    company_intro = " · ".join(company_bits)
-
-    hq_address_details = ""
-    if hq_detail_esc:
-        hq_address_details = f"""
-    <details class="lead-hq-full" style="margin-top:0.55rem">
-      <summary style="cursor:pointer;color:#8b96a3;font-size:0.8125rem;user-select:none">Full company address (principal office)</summary>
-      <p class="meta" style="margin:0.4rem 0 0;font-size:0.78rem;line-height:1.45;word-break:break-word">{hq_detail_esc}</p>
-    </details>"""
-
-    company_intro_card = f"""
-    <div class="card">
-      <h2 style="margin-top:0">Registrant</h2>
-      <p class="meta" style="margin-bottom:0">{company_intro}</p>{hq_address_details}
-    </div>"""
-    snapshot_card = _issuer_snapshot_card_html(issuer_snapshot or {})
+    snap_dict = issuer_snapshot or {}
+    company_intro_card = _lead_company_public_card_html(p, snap_dict)
+    snapshot_card = _issuer_snapshot_card_html(
+        snap_dict, omit_keys=frozenset({"employees"})
+    )
+    snapshot_folded = (
+        '<details class="lead-more lead-snapshot-fold">'
+        "<summary>Company snapshot <span class='dim'>(scale &amp; story, if enriched)</span></summary>"
+        f'<div class="lead-snapshot-inner">{snapshot_card}</div></details>'
+    )
 
     hq_one = _hq_one_line_for_maps(hq_txt)
     co_nm = (p.get("company_name") or "").strip()
     map_query = (hq_loc or hq_one or (f"{co_nm} headquarters" if co_nm else ""))
-    maps_row = ""
+    maps_link = ""
     if map_query.strip():
         maps_url = "https://www.google.com/maps/search/?api=1&query=" + quote(
             map_query, safe=""
         )
-        maps_row = (
-            "<div class='lead-map-row'>"
-            f'<a href="{html.escape(maps_url)}" target="_blank" rel="noopener">Open map</a>'
-            "<span class='dim'>Maps prefers city/state; full cleaned HQ line is above. Verify on the filing.</span>"
-            "</div>"
+        maps_link = (
+            f'<a href="{html.escape(maps_url)}" target="_blank" rel="noopener">Map</a>'
         )
 
+    idx_u = (p.get("index_url") or "").strip()
+    idx_link = (
+        f'<a href="{html.escape(idx_u)}" target="_blank" rel="noopener">EDGAR index</a>'
+        if idx_u
+        else ""
+    )
+    quick_links = " · ".join(
+        x for x in (idx_link, doc_link, maps_link) if x
+    )
+
+    loc_display = (
+        hq_loc_esc
+        if hq_loc_esc
+        else "<span class='dim'>—</span>"
+    )
+    age_ttl = f' title="{age_title_attr}"' if age_title_attr else ""
+    age_inner = (
+        html.escape(age_hero_val)
+        if age_hero_val != "—"
+        else "<span class='dim'>—</span>"
+    )
+    hero_kv = f"""
+    <div class="lead-hero-kv" role="group" aria-label="Key facts">
+      <div class="lead-kv"><span class="lead-kv-l">Age</span>
+        <span class="lead-kv-v"{age_ttl}>{age_inner}</span></div>
+      <div class="lead-kv"><span class="lead-kv-l">HQ location</span>
+        <span class="lead-kv-v">{loc_display}</span></div>
+      <div class="lead-kv"><span class="lead-kv-l">Latest filing</span>
+        <span class="lead-kv-v">{html.escape(p.get('filing_date') or '—')}</span></div>
+      <div class="lead-kv"><span class="lead-kv-l">Desk tier</span>
+        <span class="lead-kv-v">{tier_badge}</span></div>
+    </div>"""
+
     why_card = f"""
-    <div class="card">
-      <h2 style="margin-top:0">Why this lead</h2>
+    <div class="card lead-why-card">
+      <h2 class="lead-section-h">Why surfaced</h2>
       <p class="meta" style="margin-bottom:0">{html.escape(p.get('why_surfaced') or '—')}</p>
     </div>"""
 
@@ -2645,15 +2907,15 @@ def _page_lead(
     )
 
     filings_block = f"""
-    <h2>Issuer filings (S-1 / 10-K)</h2>
-    <p class="meta">Same <b>CIK</b> — registration statements and annual reports in your DB (newest first, up to 50).</p>
+    <h3 class="lead-section-h" style="margin-top:0.75rem">Issuer filings</h3>
+    <p class="meta dim" style="font-size:0.78rem">S-1 / 10-K for this CIK in your DB (newest first).</p>
     {_filings_table_html(filings)}
     """
 
     source_details = f"""
     <details class="lead-more">
-      <summary>Source material — raw filing summary, board terms, EDGAR index</summary>
-      <p class="meta" style="margin-top:0.65rem; margin-bottom:0"><strong>Issuer summary (as extracted)</strong></p>
+      <summary>More SEC source detail</summary>
+      <p class="meta" style="margin-top:0.65rem; margin-bottom:0"><strong>Issuer summary (extracted)</strong></p>
       <p class="meta" style="margin-top:0.35rem">{summ_html}</p>
       {director_card}
       {filings_block}
@@ -2662,32 +2924,26 @@ def _page_lead(
     col_company = f"""
     <aside class="lead-col lead-col-company" aria-labelledby="lead-col-company">
       <div class="lead-col-title" id="lead-col-company">Company</div>
-      <p class="lead-col-hint">Advisor-readable scale (revenue, headcount, narrative) from your stored filing text + LLM. Raw SEC excerpt below.</p>
       {company_intro_card}
-      {snapshot_card}
-      {maps_row}
+      {snapshot_folded}
       {source_details}
     </aside>"""
+
+    comp_fullwidth = f"""
+    <section class="lead-comp-fullwidth" aria-label="Summary compensation from filing">
+      <div class="lead-comp-block">
+      {_profile_lead_compensation_card_html(p)}
+      </div>
+    </section>"""
 
     col_person = f"""
     <main class="lead-col lead-col-person" aria-labelledby="lead-col-person">
       <div class="lead-col-title" id="lead-col-person">Person</div>
-      <p class="lead-col-hint">Why they surfaced, dossier (photo, story, LinkedIn, email hypotheses), compensation. No personal address or phone from filings.</p>
+      <p class="lead-data-note">Filings give registrant address only — not a personal home address or phone.</p>
       {why_card}
       {research_card}
-      {person_card}
-      <div class="lead-comp-block">
-      <h2>Compensation</h2>
-      {_profile_headline_comp_summary(p)}
-      <details class="lead-comp-details">
-        <summary>Line-by-line summary compensation (filing table)</summary>
-        <div style="margin-top:0.65rem">
-      {_profile_breakdown_table(p)}
-        </div>
-      </details>
-      </div>
       <details class="lead-more">
-        <summary>Full management biography (SEC filing text)</summary>
+        <summary>Management biography (filing text)</summary>
         <div class="lead-mgmt-bio-wrap" style="margin-top:0.5rem">
       {mgmt_narrative_card}
         </div>
@@ -2706,22 +2962,22 @@ def _page_lead(
   <header class="lead-page-header">
     <nav class="top"><a href="/">← Lead desk</a> · <a href="/finder">Lead finder</a></nav>
     <h1>{html.escape(p.get('display_name') or '—')}</h1>
-    <p class="meta">
-      <b title="{html.escape((p.get('title') or '—').strip() or '—', quote=True)}">{html.escape(advisor_title_badge((p.get('title') or '').strip() or '—'))}</b> · {html.escape(p.get('company_name') or '')}
-      · CIK <span class="cik">{html.escape(str(p.get('cik') or ''))}</span>
+    <p class="lead-hero-line">
+      <strong title="{html.escape((p.get('title') or '—').strip() or '—', quote=True)}">{html.escape(advisor_title_badge((p.get('title') or '').strip() or '—'))}</strong>
+      <span class="lead-hero-sep">·</span>
+      <span>{html.escape(p.get('company_name') or '—')}</span>
+      <span class="lead-hero-sep">·</span>
+      <span class="cik">CIK {html.escape(str(p.get('cik') or ''))}</span>
     </p>
-    <p class="meta">
-      Latest filing in profile: <b>{html.escape(p.get('filing_date') or '—')}</b>.
-      <a href="{html.escape(p.get('index_url') or '')}" target="_blank" rel="noopener">EDGAR index</a>
-      {(' · ' + doc_link) if doc_link else ''}
-    </p>
-    {tier_hdr}
+    {hero_kv}
+    <p class="lead-hero-links meta">{quick_links if quick_links else "<span class='dim'>No EDGAR links on file</span>"}</p>
   </header>
+  {comp_fullwidth}
   <div class="lead-split" role="presentation">
     {col_company}
     {col_person}
   </div>
-  <p class="meta">Bookmark this page: <code>/lead?{html.escape(bookmark_q)}</code></p>
+  <p class="meta dim" style="font-size:0.78rem;margin-top:1rem">Bookmark: <code>/lead?{html.escape(bookmark_q)}</code></p>
   {_live_reload_snippet()}
 </body>
 </html>"""
