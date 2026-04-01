@@ -73,6 +73,20 @@ def lead_desk_s1_only() -> bool:
     return v not in ("0", "false", "no", "off")
 
 
+def lead_desk_include_beneficial_only_leads() -> bool:
+    """
+    If true, the lead desk includes **major-shareholder** profiles built only from
+    S-1 beneficial-ownership parsing (no NEO / named officer row). Those rows are easy to
+    misread after splits, distress, or fraud — **default is off** so the product stays
+    exec / NEO–quality focused.
+
+    Set ``WEALTH_LEADS_LEAD_DESK_INCLUDE_BENEFICIAL_ONLY=1`` to also surface beneficial-only
+    holders. Anyone who is both an officer and a beneficial holder is always included.
+    """
+    v = os.environ.get("WEALTH_LEADS_LEAD_DESK_INCLUDE_BENEFICIAL_ONLY", "0").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
 def lead_desk_us_registrant_hq_only() -> bool:
     """
     If true, the lead desk and admin pipeline list/CSV hide rows whose registrant HQ line
@@ -81,6 +95,17 @@ def lead_desk_us_registrant_hq_only() -> bool:
     """
     v = os.environ.get("WEALTH_LEADS_DESK_US_HQ_ONLY", "1").strip().lower()
     return v not in ("0", "false", "no", "off")
+
+
+def profile_stale_warning_days() -> int:
+    """
+    If ``lead_profile`` max(built_at) is older than this many days (UTC), the pipeline banner
+    shows a stale warning. Set WEALTH_LEADS_PROFILE_STALE_DAYS=0 to disable.
+    """
+    try:
+        return max(0, int(os.environ.get("WEALTH_LEADS_PROFILE_STALE_DAYS", "10")))
+    except ValueError:
+        return 10
 
 
 def lead_desk_min_signal_usd() -> float:
@@ -282,15 +307,36 @@ def enrich_client_research_after_sync_limit() -> int:
 
 def email_smtp_verify_enabled() -> bool:
     """
-    When true, enrich-client-research may perform SMTP RCPT probes for guessed addresses.
-    Off by default; many networks block outbound port 25; results are often non-authoritative.
+    When true (default), ``enrich-client-research`` and the lead page run SMTP RCPT probes
+    (up to ``email_smtp_probe_max_candidates``) on guessed addresses when checks are still
+    ``skipped``.
+
+    Set ``WEALTH_LEADS_EMAIL_SMTP_VERIFY=0`` if outbound port 25 is blocked. Many MX
+    return 250 for any RCPT (``uncertain``)—a hint only, not proof an inbox exists.
     """
-    return os.environ.get("WEALTH_LEADS_EMAIL_SMTP_VERIFY", "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    v = os.environ.get("WEALTH_LEADS_EMAIL_SMTP_VERIFY", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def email_smtp_probe_max_candidates() -> int:
+    """Max guessed addresses to RCPT-probe per lead view or enrich pass (cap latency)."""
+    try:
+        n = int(os.environ.get("WEALTH_LEADS_EMAIL_SMTP_MAX_PROBES", "8"))
+    except (TypeError, ValueError):
+        n = 8
+    return max(1, min(n, 20))
+
+
+def email_hypothesis_top_n() -> int:
+    """
+    How many guessed corporate addresses to store and show per person (default 2).
+    Advisors get a short shortlist, not a long permutation list.
+    """
+    try:
+        n = int(os.environ.get("WEALTH_LEADS_EMAIL_TOP_PICKS", "2"))
+    except (TypeError, ValueError):
+        n = 2
+    return max(1, min(n, 5))
 
 
 def email_smtp_mail_from() -> str:

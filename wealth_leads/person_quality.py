@@ -96,6 +96,65 @@ _TITLE_LEAD_WORDS = frozenset(
     }
 )
 
+# Table cells that are roles / placeholders, not personal names (two-token patterns).
+_MEMBER_ROLE_FIRST = frozenset(
+    {
+        "faculty",
+        "staff",
+        "board",
+        "audit",
+        "compensation",
+        "nominating",
+        "governance",
+        "independent",
+        "executive",
+        "advisory",
+        "special",
+        "honorary",
+    }
+)
+
+_DISALLOWED_NAME_PHRASES = frozenset(
+    {
+        "faculty member",
+        "staff member",
+        "board member",
+        "committee member",
+        "team member",
+        "independent director",
+        "class i director",
+        "class ii director",
+        "class iii director",
+        "class 1 director",
+        "class 2 director",
+        "class 3 director",
+    }
+)
+
+# Appear anywhere in the string after lowercasing + collapsing whitespace (SEC cells often
+# include prefixes/suffixes: "Dr. Faculty Member", "Faculty Member [1]", etc.).
+_DISALLOWED_NAME_SUBSTRINGS = (
+    "faculty member",
+    "staff member",
+    "board member",
+    "committee member",
+    "team member",
+    "trustee member",
+    "shareholder nominee",
+    "blank check",
+)
+
+
+def name_contains_placeholder_label(s: str) -> bool:
+    """True when the text is (or embeds) a generic roster placeholder, not a person's name."""
+    n = " ".join((s or "").lower().split())
+    if not n:
+        return False
+    for frag in _DISALLOWED_NAME_SUBSTRINGS:
+        if frag in n:
+            return True
+    return False
+
 
 def is_acceptable_lead_person_name(s: str) -> bool:
     """
@@ -106,11 +165,23 @@ def is_acceptable_lead_person_name(s: str) -> bool:
     t = " ".join((s or "").split())
     if len(t) < 3 or len(t) > 72:
         return False
+    if name_contains_placeholder_label(t):
+        return False
     if looks_like_prose_or_narrative_name_field(t):
+        return False
+
+    low_phrase = t.lower().strip()
+    if low_phrase in _DISALLOWED_NAME_PHRASES:
         return False
 
     parts = t.split()
     p0 = parts[0].lower().rstrip(".")
+    if (
+        len(parts) == 2
+        and parts[1].lower().rstrip(".") == "member"
+        and p0 in _MEMBER_ROLE_FIRST
+    ):
+        return False
 
     # Multi-word title blobs ("Chief Financial Officer", long EVP lines)
     if looks_like_role_only_line(t):

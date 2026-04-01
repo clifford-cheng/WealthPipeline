@@ -8,7 +8,6 @@ import requests
 
 from wealth_leads.config import (
     database_path,
-    email_smtp_verify_enabled,
     enrich_client_research_after_sync_enabled,
     enrich_client_research_after_sync_limit,
     follow_10k_for_s1_ciks,
@@ -16,10 +15,15 @@ from wealth_leads.config import (
     sync_form_types,
 )
 from wealth_leads.compensation import NeoCompRow, extract_neo_compensation_from_s1
+from wealth_leads.beneficial_ownership import (
+    STAKE_PARSE_REVISION,
+    beneficial_owner_rows_for_db,
+)
 from wealth_leads.db import (
     connect,
     get_filing_by_accession,
     insert_filing,
+    replace_beneficial_owner_stakes,
     replace_neo_compensation,
     replace_officers,
     replace_person_management_narratives,
@@ -108,8 +112,25 @@ def backfill_compensation(
             WHERE f.primary_doc_url IS NOT NULL
             """
         if not force:
-            q += """
-            AND (SELECT COUNT(*) FROM neo_compensation WHERE filing_id = f.id) = 0
+            # Re-fetch when NEO is missing, or when S-1 beneficial stakes were never filled (parser upgrades).
+            q += f"""
+            AND (
+              (SELECT COUNT(*) FROM neo_compensation WHERE filing_id = f.id) = 0
+              OR (
+                UPPER(COALESCE(f.form_type, '')) LIKE 'S-1%'
+                AND NOT EXISTS (
+                  SELECT 1 FROM beneficial_owner_stake b WHERE b.filing_id = f.id
+                )
+              )
+              OR (
+                UPPER(COALESCE(f.form_type, '')) LIKE 'S-1%'
+                AND EXISTS (
+                  SELECT 1 FROM beneficial_owner_stake b
+                  WHERE b.filing_id = f.id
+                    AND COALESCE(TRIM(b.beneficial_parse_build), '') != '{STAKE_PARSE_REVISION}'
+                )
+              )
+            )
             """
         q += " ORDER BY f.filing_date DESC"
         rows = c.execute(q).fetchall()
@@ -164,6 +185,9 @@ def backfill_compensation(
             update_filing_director_term_summary(c, fid, dts_b)
             comps = extract_neo_compensation_from_s1(s1_html)
             replace_neo_compensation(c, fid, _neo_comp_db_rows(fid, comps))
+            replace_beneficial_owner_stakes(
+                c, fid, beneficial_owner_rows_for_db(s1_html)
+            )
             n_done += 1
             if not comps:
                 print(
@@ -336,6 +360,9 @@ def _process_rss_item(
 
     comps = extract_neo_compensation_from_s1(body_html)
     replace_neo_compensation(conn, filing_id, _neo_comp_db_rows(filing_id, comps))
+    replace_beneficial_owner_stakes(
+        conn, filing_id, beneficial_owner_rows_for_db(body_html)
+    )
     if not comps:
         print(
             f"[warn] No NEO summary comp table: {item.company_name} "
@@ -397,7 +424,10 @@ def sync(*, force_reprocess: bool = False) -> None:
     print(
         f"Lead profiles materialized: {pr_stats['rows_written']} rows "
         f"(from {pr_stats['profiles_source']} NEO profiles; "
-        f"{pr_stats.get('cross_company_flagged', 0)} cross-CIK name hints).",
+        f"{pr_stats.get('cross_company_flagged', 0)} cross-CIK name hints). "
+        f"Email outreach rows: +{pr_stats.get('email_outreach_inserted', 0)} inserted, "
+        f"{pr_stats.get('email_outreach_updated', 0)} updated empty outreach, "
+        f"{pr_stats.get('email_outreach_unchanged', 0)} already had outreach.",
         file=sys.stderr,
     )
 
@@ -411,7 +441,7 @@ def sync(*, force_reprocess: bool = False) -> None:
                 limit=lim,
                 force=False,
                 use_llm=True,
-                verify_smtp=email_smtp_verify_enabled(),
+                verify_smtp=None,
             )
         print(
             f"Website enrich after sync: enriched={er.get('enriched')} "
@@ -572,7 +602,8 @@ def main() -> None:
     bf.add_argument(
         "--force",
         action="store_true",
-        help="Re-parse compensation for every filing (slow; use after parser upgrades)",
+        help="Re-fetch primary HTML for every filing with a doc URL (slow). Use after NEO or "
+        "beneficial-ownership parser upgrades (writes beneficial_owner_stake + neo_compensation).",
     )
 
     srv = sub.add_parser(
@@ -666,7 +697,12 @@ def main() -> None:
     erc.add_argument(
         "--smtp",
         action="store_true",
-        help="Run SMTP RCPT probes on guessed addresses (also WEALTH_LEADS_EMAIL_SMTP_VERIFY=1; outbound port 25 often blocked)",
+        help="Force SMTP RCPT probes on even if WEALTH_LEADS_EMAIL_SMTP_VERIFY=0",
+    )
+    erc.add_argument(
+        "--no-smtp",
+        action="store_true",
+        help="Skip SMTP RCPT probes (default is on unless WEALTH_LEADS_EMAIL_SMTP_VERIFY=0)",
     )
     erc.epilog = (
         "LLM (company snapshot, website card, executive story): same as enrich-s1-ai — "
@@ -769,12 +805,15 @@ def main() -> None:
         from wealth_leads.config import app_listen_port, uvicorn_reload_enabled
 
         port = getattr(args, "port", None) or app_listen_port()
+        reload_on = uvicorn_reload_enabled()
         uvicorn.run(
             "wealth_leads.web_app:app",
             host=args.host,
             port=port,
             log_level="info",
-            reload=uvicorn_reload_enabled(),
+            reload=reload_on,
+            # Extra beat so the old worker releases SQLite on Windows before the new one migrates.
+            reload_delay=1.0 if reload_on else 0.25,
         )
     elif args.cmd == "allocate":
         from wealth_leads.allocation import run_allocation_from_db
@@ -795,6 +834,18 @@ def main() -> None:
     elif args.cmd == "enrich-client-research":
         from wealth_leads.lead_research import run_enrich_client_research
 
+        if getattr(args, "no_smtp", False) and getattr(args, "smtp", False):
+            print(
+                "[warn] --no-smtp wins over --smtp for enrich-client-research",
+                file=sys.stderr,
+            )
+        vs_enrich: bool | None
+        if getattr(args, "no_smtp", False):
+            vs_enrich = False
+        elif getattr(args, "smtp", False):
+            vs_enrich = True
+        else:
+            vs_enrich = None
         with connect() as conn:
             st = run_enrich_client_research(
                 conn,
@@ -802,8 +853,7 @@ def main() -> None:
                 cik=(getattr(args, "cik", None) or "").strip() or None,
                 force=bool(getattr(args, "force", False)),
                 use_llm=not bool(getattr(args, "no_llm", False)),
-                verify_smtp=bool(getattr(args, "smtp", False))
-                or email_smtp_verify_enabled(),
+                verify_smtp=vs_enrich,
             )
         print(st, file=sys.stderr)
     elif args.cmd == "enrich-s1-ai":

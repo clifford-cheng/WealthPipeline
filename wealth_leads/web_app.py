@@ -16,6 +16,7 @@ import math
 import os
 import re
 import sqlite3
+import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -35,7 +36,9 @@ from wealth_leads.config import (
     app_allow_public_signup,
     app_secret_key,
     database_path,
+    lead_desk_include_beneficial_only_leads,
     lead_desk_us_registrant_hq_only,
+    profile_stale_warning_days,
     require_app_auth,
 )
 from wealth_leads.advisor_pack import get_issuer_snapshot_dict
@@ -61,6 +64,8 @@ from wealth_leads.db import (
     get_lead_profile_row,
     insert_app_user,
     list_allocation_clients,
+    list_beneficial_owner_gems_for_filing_ids,
+    list_beneficial_owner_outreach_targets_for_cik,
     list_lead_profiles_for_review,
     list_user_watchlist,
     update_allocation_settings,
@@ -77,11 +82,19 @@ except ImportError:  # pragma: no cover
     requests = None  # type: ignore[misc, assignment]
 
 
+def _profile_display_name_for_quality_gate(p: dict[str, Any]) -> str:
+    d = (p.get("display_name") or "").strip()
+    if d:
+        return d
+    pn = (p.get("person_norm") or "").strip()
+    return " ".join(w.title() for w in pn.split()) if pn else ""
+
+
 def _lead_profile_row_dict(row: sqlite3.Row) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for k in row.keys():
         v = row[k]
-        if isinstance(v, float) and math.isnan(v):
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
             out[k] = None
         else:
             out[k] = v
@@ -91,9 +104,27 @@ def _lead_profile_row_dict(row: sqlite3.Row) -> dict[str, Any]:
 def _json_safe_num(v: Any) -> Any:
     if v is None:
         return None
-    if isinstance(v, float) and math.isnan(v):
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
         return None
     return v
+
+
+def _json_sanitize_for_response(obj: Any) -> Any:
+    """``JSONResponse`` cannot encode bytes, NaN, or Inf — strip before returning API JSON."""
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in obj.items():
+            if k == "photo_blob":
+                continue
+            if isinstance(v, (bytes, bytearray, memoryview)):
+                continue
+            out[str(k)] = _json_sanitize_for_response(v)
+        return out
+    if isinstance(obj, list):
+        return [_json_sanitize_for_response(x) for x in obj]
+    if isinstance(obj, float):
+        return _json_safe_num(obj)
+    return obj
 
 
 def _neo_comp_rows_for_drawer(
@@ -305,23 +336,42 @@ def _pipeline_row_drawer_enrich(conn: sqlite3.Connection, row: sqlite3.Row) -> d
     extras["client_research"] = (
         {k: cr[k] for k in cr.keys()} if cr is not None else None
     )
+    extras["beneficial_owner_gems"] = []
+    if fids_i:
+        try:
+            gems = list_beneficial_owner_gems_for_filing_ids(
+                conn, fids_i, min_gem=30, limit=10
+            )
+            extras["beneficial_owner_gems"] = [
+                {k: row[k] for k in row.keys()} for row in gems
+            ]
+        except sqlite3.Error:
+            pass
     return extras
 
 
+from wealth_leads.person_quality import is_acceptable_lead_person_name
 from wealth_leads.serve import (
+    _build_profiles,
     _filings_for_profile,
     _find_profile,
+    _latest_filing_snapshot_caveats_for_cik,
+    _latest_important_people_from_s1_llm_pack,
+    _lead_page_db_stats,
     _load_page_data,
     _page_desk,
     _page_finder,
     _page_lead,
     _profile_lead_tier,
     _profile_lead_url,
+    beneficial_stake_detail_for_profile,
     filter_profiles_geo_industry_text,
+    filter_profiles_listing_stage,
     filter_profiles_pay_band,
     finder_export_csv_bytes,
-    management_roster_scale_stats,
+    normalize_listing_stage_query,
 )
+from wealth_leads.territory import registrant_hq_line_parses_as_united_states
 
 AUTH_COOKIE = "wl_auth"
 SESSION_MAX_AGE = 60 * 60 * 24 * 14
@@ -425,7 +475,7 @@ def _pipeline_url_path() -> str:
 
 
 def _inject_chrome(page_html: str, user: dict) -> str:
-    email = html_module.escape(user["email"])
+    email = html_module.escape(str(user.get("email") or ""))
     if user.get("_synthetic"):
         pp = _pipeline_url_path()
         center = (
@@ -858,6 +908,7 @@ async def admin_pipeline(request: Request) -> Response:
         months_sel = 6
     months_back = None if months_sel <= 0 else months_sel
     band = (request.query_params.get("band") or "all").strip() or "all"
+    listing = normalize_listing_stage_query(request.query_params.get("listing"))
     with connect() as conn:
         rows = list_lead_profiles_for_review(
             conn,
@@ -868,15 +919,40 @@ async def admin_pipeline(request: Request) -> Response:
             months_back=months_back,
             pay_band=band,
             us_registrant_hq_only=lead_desk_us_registrant_hq_only(),
+            listing_stage=listing,
         )
         total = count_lead_profiles(conn)
         b = conn.execute("SELECT MAX(built_at) FROM lead_profile").fetchone()
     built = ""
     if b and b[0]:
         built = f"Last rebuilt (UTC): {b[0]}"
+        warn_days = profile_stale_warning_days()
+        if warn_days > 0:
+            try:
+                raw_ts = str(b[0]).replace("Z", "").strip()[:19]
+                bt = datetime.strptime(raw_ts, "%Y-%m-%d %H:%M:%S").replace(
+                    tzinfo=timezone.utc
+                )
+                if (datetime.now(timezone.utc) - bt).total_seconds() > warn_days * 86400:
+                    built += (
+                        f" — materialized profiles are older than {warn_days} day(s); "
+                        "consider Rebuild profiles."
+                    )
+            except ValueError:
+                pass
     else:
         built = "Not built yet — run SEC sync or Rebuild below."
     from wealth_leads.config import pipeline_blur_comp_columns
+
+    if lead_desk_us_registrant_hq_only():
+        policy_hint = (
+            "U.S. registrant HQ filter is on (WEALTH_LEADS_DESK_US_HQ_ONLY): rows whose principal-office line "
+            "does not parse as a U.S. state or ZIP are hidden here, on the desk, and in desk CSV exports."
+        )
+    else:
+        policy_hint = (
+            "U.S. registrant HQ filter is off — non-U.S. registrant offices are included when they pass other gates."
+        )
 
     body = render_pipeline_review_page(
         rows=rows,
@@ -888,8 +964,10 @@ async def admin_pipeline(request: Request) -> Response:
         months=months_sel,
         msg=msg,
         built_hint=built,
+        policy_hint=policy_hint,
         pipeline_path=_pipeline_url_path(),
         pay_band=band,
+        listing_stage=listing,
         blur_comp=pipeline_blur_comp_columns(),
     )
     return HTMLResponse(_inject_chrome(body, user))
@@ -936,6 +1014,7 @@ async def admin_pipeline_csv(request: Request) -> Response:
         months_sel = 6
     months_back = None if months_sel <= 0 else months_sel
     band = (request.query_params.get("band") or "all").strip() or "all"
+    listing = normalize_listing_stage_query(request.query_params.get("listing"))
     with connect() as conn:
         rows = list_lead_profiles_for_review(
             conn,
@@ -946,6 +1025,7 @@ async def admin_pipeline_csv(request: Request) -> Response:
             months_back=months_back,
             pay_band=band,
             us_registrant_hq_only=lead_desk_us_registrant_hq_only(),
+            listing_stage=listing,
         )
 
     buf = io.StringIO()
@@ -953,6 +1033,7 @@ async def admin_pipeline_csv(request: Request) -> Response:
     w.writerow(
         [
             "pay_band_filter",
+            "listing_stage_filter",
             "cross_company_hint",
             "cik",
             "person_norm",
@@ -977,8 +1058,10 @@ async def admin_pipeline_csv(request: Request) -> Response:
             "equity_hwm",
             "has_s1_comp",
             "lead_tier",
+            "issuer_listing_stage",
             "has_mgmt_bio",
             "has_officer_row",
+            "has_beneficial_owner_stake",
             "neo_row_count",
             "comp_llm_assisted",
             "comp_timeline",
@@ -1021,8 +1104,13 @@ async def admin_pipeline_csv(request: Request) -> Response:
                 r["equity_hwm"],
                 r["has_s1_comp"],
                 r["lead_tier"] if "lead_tier" in r.keys() else "premium",
+                (r["issuer_listing_stage"] if "issuer_listing_stage" in r.keys() else "")
+                or "unknown",
                 r["has_mgmt_bio"],
                 r["has_officer_row"],
+                r["has_beneficial_owner_stake"]
+                if "has_beneficial_owner_stake" in r.keys()
+                else 0,
                 r["neo_row_count"],
                 r["comp_llm_assisted"],
                 r["comp_timeline"],
@@ -1065,7 +1153,7 @@ async def pipeline_row_json(
         payload["issuer_headquarters"] = format_headquarters_for_ui(
             payload.get("issuer_headquarters")
         )
-    return JSONResponse(payload)
+    return JSONResponse(_json_sanitize_for_response(payload))
 
 
 @app.get("/pipeline/geocode.json")
@@ -1168,14 +1256,25 @@ async def admin_allocate(
     if len(cy) != 6 or not cy.isdigit():
         return RedirectResponse("/admin?msg=" + quote("Invalid cycle."), status_code=302)
     rep = replace in ("1", "on", "true")
-    from wealth_leads.serve import _build_profiles
-
     with connect() as conn:
         profiles_all = _build_profiles(conn)
+        us_only = lead_desk_us_registrant_hq_only()
+        incl_bo = lead_desk_include_beneficial_only_leads()
+        filtered: list[dict[str, Any]] = []
+        for p in profiles_all:
+            if not is_acceptable_lead_person_name(_profile_display_name_for_quality_gate(p)):
+                continue
+            if not incl_bo and _is_beneficial_only_lead(p):
+                continue
+            if us_only and not registrant_hq_line_parses_as_united_states(
+                (p.get("issuer_headquarters") or "").strip()
+            ):
+                continue
+            filtered.append(p)
         stats = assign_for_cycle(
             conn,
             cycle_yyyymm=cy,
-            profiles_all=profiles_all,
+            profiles_all=filtered,
             replace=rep,
         )
     summary = (
@@ -1230,7 +1329,9 @@ async def admin_desk(request: Request) -> Response:
         return HTMLResponse("<h1>Forbidden</h1>", status_code=403)
     profiles, _pa, leads, comp, stats = _load_page_data()
     band = (request.query_params.get("band") or "all").strip() or "all"
+    listing = normalize_listing_stage_query(request.query_params.get("listing"))
     desk_view = filter_profiles_pay_band(profiles, band)
+    desk_view = filter_profiles_listing_stage(desk_view, listing)
     body = _page_desk(
         desk_view,
         leads,
@@ -1238,6 +1339,7 @@ async def admin_desk(request: Request) -> Response:
         stats,
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         pay_band=band,
+        listing_stage=listing,
         nav_base_path="/admin/desk",
         desk_universe_count=len(profiles),
     )
@@ -1263,6 +1365,7 @@ async def admin_finder(
     use_all = bool(all_neo)
     base = profiles_all if use_all else profiles
     band = (request.query_params.get("band") or "all").strip() or "all"
+    listing = normalize_listing_stage_query(request.query_params.get("listing"))
     filtered = filter_profiles_geo_industry_text(
         base,
         location_sub=hq,
@@ -1270,6 +1373,7 @@ async def admin_finder(
         text_sub=q,
     )
     filtered = filter_profiles_pay_band(filtered, band)
+    filtered = filter_profiles_listing_stage(filtered, listing)
     body = _page_finder(
         filtered,
         stats=stats,
@@ -1280,6 +1384,7 @@ async def admin_finder(
         all_neo=use_all,
         base_count=len(base),
         pay_band=band,
+        listing_stage=listing,
         nav_base_path="/admin/finder",
         form_action="/admin/finder",
         desk_href="/admin/desk",
@@ -1313,7 +1418,6 @@ async def lead(
         return redir
     user = _session_user(request)
     assert user is not None
-    profiles, profiles_all, leads, comp, stats = _load_page_data()
     from wealth_leads.serve import _norm_person_name
 
     norm = _norm_person_name(name)
@@ -1332,30 +1436,111 @@ async def lead(
                 "Open <a href='/my-leads'>My leads</a>.</p>",
                 status_code=403,
             )
-    prof = _find_profile(profiles_all, cik, norm) if not stats.get("missing_db") else None
-    filings: list[dict] = []
-    cr_dict: dict[str, Any] | None = None
-    issuer_snap: dict[str, Any] | None = None
-    roster_stats: dict[str, int] | None = None
-    if prof is not None and not stats.get("missing_db"):
-        with connect() as conn:
-            filings = _filings_for_profile(conn, cik, norm)
-            cr_row = get_lead_client_research(conn, (cik or "").strip(), norm)
-            cr_dict = row_to_client_research_dict(cr_row)
-            issuer_snap = get_issuer_snapshot_dict(conn, (cik or "").strip())
-            roster_stats = management_roster_scale_stats(conn, (cik or "").strip())
-    body = _page_lead(
-        prof,
-        filings,
-        query_cik=cik,
-        query_name=name,
-        stats=stats,
-        rendered_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        client_research=cr_dict,
-        issuer_snapshot=issuer_snap,
-        roster_stats=roster_stats,
-    )
-    return HTMLResponse(_inject_chrome(body, user))
+    try:
+        dbp = database_path()
+        if not os.path.isfile(dbp):
+            stats = {
+                "missing_db": True,
+                "profile_count": 0,
+                "profile_count_all": 0,
+                "filings": 0,
+                "officers": 0,
+                "comp_rows": 0,
+                "lead_desk_s1_only": False,
+                "lead_desk_min_signal_usd": 0.0,
+                "lead_desk_equity_only_legacy": False,
+                "latest_filing_date": None,
+                "db_file_modified": "—",
+            }
+            profiles_all: list[dict] = []
+        else:
+            mtime = datetime.fromtimestamp(os.path.getmtime(dbp)).strftime("%Y-%m-%d %H:%M")
+            cik_s = (cik or "").strip()
+            with connect() as conn:
+                stats = _lead_page_db_stats(conn, db_mtime=mtime)
+                if not conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='neo_compensation'"
+                ).fetchone():
+                    profiles_all = []
+                elif cik_s:
+                    profiles_all = _build_profiles(conn, cik_filter=cik_s)
+                else:
+                    profiles_all = []
+        prof = _find_profile(profiles_all, cik, norm) if not stats.get("missing_db") else None
+        filings: list[dict] = []
+        cr_dict: dict[str, Any] | None = None
+        issuer_snap: dict[str, Any] | None = None
+        beneficial_rows: list[dict[str, Any]] = []
+        important_llm: list[dict[str, Any]] = []
+        beneficial_stake_detail: dict[str, Any] | None = None
+        beneficial_filing_caveats = ""
+        if prof is not None and not stats.get("missing_db"):
+            with connect() as conn:
+                filings = _filings_for_profile(conn, cik, norm)
+                cr_row = get_lead_client_research(conn, (cik or "").strip(), norm)
+                cr_dict = row_to_client_research_dict(cr_row)
+                issuer_snap = get_issuer_snapshot_dict(conn, (cik or "").strip())
+                bo_only = bool(prof.get("has_s1_beneficial_owner")) and not bool(
+                    prof.get("has_s1_officer")
+                )
+                if bo_only:
+                    try:
+                        beneficial_stake_detail = beneficial_stake_detail_for_profile(
+                            conn, prof
+                        )
+                    except sqlite3.Error:
+                        beneficial_stake_detail = None
+                    try:
+                        beneficial_filing_caveats = _latest_filing_snapshot_caveats_for_cik(
+                            conn, (cik or "").strip()
+                        )
+                    except sqlite3.Error:
+                        beneficial_filing_caveats = ""
+                    try:
+                        important_llm = _latest_important_people_from_s1_llm_pack(
+                            conn, (cik or "").strip()
+                        )
+                    except sqlite3.Error:
+                        important_llm = []
+                else:
+                    try:
+                        beneficial_rows = [
+                            dict(r)
+                            for r in list_beneficial_owner_outreach_targets_for_cik(
+                                conn, (cik or "").strip(), limit=10
+                            )
+                        ]
+                    except sqlite3.Error:
+                        beneficial_rows = []
+                    try:
+                        important_llm = _latest_important_people_from_s1_llm_pack(
+                            conn, (cik or "").strip()
+                        )
+                    except sqlite3.Error:
+                        important_llm = []
+        body = _page_lead(
+            prof,
+            filings,
+            query_cik=cik,
+            query_name=name,
+            stats=stats,
+            rendered_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            client_research=cr_dict,
+            issuer_snapshot=issuer_snap,
+            beneficial_gems=beneficial_rows,
+            important_people_llm=important_llm,
+            beneficial_stake_detail=beneficial_stake_detail,
+            beneficial_filing_caveats=beneficial_filing_caveats,
+        )
+        return HTMLResponse(_inject_chrome(body, user))
+    except Exception as e:
+        traceback.print_exc()
+        return HTMLResponse(
+            "<h1>Profile error</h1><p>Something went wrong rendering this lead. "
+            "Check the server log for a traceback.</p>"
+            f"<p style='color:#8b96a3;font-size:0.85rem'>{html_module.escape(str(e))}</p>",
+            status_code=500,
+        )
 
 
 @app.get("/watchlist", response_model=None)
@@ -1468,6 +1653,7 @@ async def export_finder_csv(
     q: str = "",
     all_neo: int = 0,
     band: str = "all",
+    listing: str = "",
 ) -> Response:
     redir = _auth_redirect(request)
     if redir is not None:
@@ -1477,6 +1663,7 @@ async def export_finder_csv(
     if not u.get("is_admin"):
         return HTMLResponse("<h1>Forbidden</h1><p>Admin only.</p>", status_code=403)
     profiles, profiles_all, _l, _c, _s = _load_page_data()
+    list_cur = normalize_listing_stage_query(listing)
     data = finder_export_csv_bytes(
         profiles_all=profiles_all,
         profiles_desk=profiles,
@@ -1485,6 +1672,7 @@ async def export_finder_csv(
         q=q,
         all_neo=bool(all_neo),
         pay_band=(band or "all").strip() or "all",
+        listing_stage=list_cur,
     )
 
     def gen():
@@ -1501,7 +1689,11 @@ async def export_finder_csv(
 
 
 @app.get("/export/desk.csv", response_model=None)
-async def export_desk_csv(request: Request) -> Response:
+async def export_desk_csv(
+    request: Request,
+    band: str = "all",
+    listing: str = "all",
+) -> Response:
     redir = _auth_redirect(request)
     if redir is not None:
         return redir
@@ -1510,10 +1702,16 @@ async def export_desk_csv(request: Request) -> Response:
     if not u.get("is_admin"):
         return HTMLResponse("<h1>Forbidden</h1><p>Admin only.</p>", status_code=403)
     profiles, _pa, _leads, _comp, _stats = _load_page_data()
+    band_cur = (band or "all").strip() or "all"
+    list_cur = normalize_listing_stage_query(listing)
+    desk_rows = filter_profiles_pay_band(profiles, band_cur)
+    desk_rows = filter_profiles_listing_stage(desk_rows, list_cur)
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(
         [
+            "pay_band_filter",
+            "listing_stage_filter",
             "display_name",
             "company_name",
             "cik",
@@ -1524,12 +1722,15 @@ async def export_desk_csv(request: Request) -> Response:
             "headline_fy",
             "filing_date",
             "lead_tier",
+            "issuer_listing_stage",
             "profile_path",
         ]
     )
-    for p in profiles:
+    for p in desk_rows:
         w.writerow(
             [
+                band_cur,
+                list_cur,
                 p.get("display_name") or "",
                 p.get("company_name") or "",
                 p.get("cik") or "",
@@ -1540,6 +1741,7 @@ async def export_desk_csv(request: Request) -> Response:
                 p.get("headline_year") or "",
                 p.get("filing_date") or "",
                 p.get("lead_tier") or _profile_lead_tier(p),
+                (p.get("issuer_listing_stage") or "unknown").strip().lower(),
                 _profile_lead_url(p),
             ]
         )

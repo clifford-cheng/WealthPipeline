@@ -298,14 +298,15 @@ def run_allocation_from_db(
     cycle_yyyymm: str | None = None,
     replace: bool = True,
 ) -> dict[str, Any]:
-    from wealth_leads.serve import _build_profiles
+    from wealth_leads.serve import _build_profiles, _lead_desk_filter_profiles
 
     if cycle_yyyymm is None:
         cycle_yyyymm = __import__("datetime").datetime.now().strftime("%Y%m")
     with connect() as conn:
         profiles_all = _build_profiles(conn)
+        candidates = _lead_desk_filter_profiles(profiles_all)
         return assign_for_cycle(
-            conn, cycle_yyyymm=cycle_yyyymm, profiles_all=profiles_all, replace=replace
+            conn, cycle_yyyymm=cycle_yyyymm, profiles_all=candidates, replace=replace
         )
 
 

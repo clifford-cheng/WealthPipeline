@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from collections import defaultdict
 from datetime import datetime
 from typing import Any, Optional
 from urllib.parse import quote_plus, urljoin, urlparse
@@ -24,10 +25,13 @@ from wealth_leads.advisor_pack import (
     ensure_issuer_advisor_snapshot,
     fetch_s1_bio_for_person,
     llm_person_advisor_story,
+    outreach_pattern_pack_from_website,
     run_email_ping_suite,
 )
 from wealth_leads.config import (
     email_smtp_mail_from,
+    email_smtp_probe_max_candidates,
+    email_smtp_verify_enabled,
     user_agent,
 )
 from wealth_leads.db import get_issuer_website_for_cik, get_lead_client_research
@@ -116,14 +120,41 @@ def _session() -> requests.Session:
     return s
 
 
+def _html_looks_like_bot_challenge_page(html: str) -> bool:
+    """Cloudflare / similar return 200 with a JS challenge, not the real site HTML."""
+    if not html or len(html) < 400:
+        return False
+    low = html.lower()
+    if "just a moment" in low and (
+        "challenges.cloudflare.com" in low
+        or "/cdn-cgi/challenge" in low
+        or "cf-browser-verification" in low
+    ):
+        return True
+    if "checking your browser before accessing" in low:
+        return True
+    return False
+
+
 def _fetch_html(sess: requests.Session, url: str) -> tuple[Optional[str], Optional[str]]:
     try:
         r = sess.get(url, timeout=_FETCH_TIMEOUT_SEC, allow_redirects=True)
-        r.raise_for_status()
+        body = r.text or ""
         ct = (r.headers.get("Content-Type") or "").lower()
+        if r.status_code >= 400:
+            if _html_looks_like_bot_challenge_page(body):
+                return None, (
+                    f"bot_protection_page (Cloudflare or similar; HTTP {r.status_code}; "
+                    "needs a real browser or automation, not plain requests)"
+                )
+            r.raise_for_status()
         if "html" not in ct and "text" not in ct:
             return None, f"non-html content-type: {ct}"
-        return r.text, None
+        if _html_looks_like_bot_challenge_page(body):
+            return None, (
+                "bot_protection_page (e.g. Cloudflare JS challenge; plain HTTP cannot load this site)"
+            )
+        return body, None
     except requests.RequestException as e:
         return None, str(e)
 
@@ -302,14 +333,147 @@ def _fetch_headshot_bytes(
         return None, None
 
 
+def _upsert_pattern_outreach_from_profile(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
+    """
+    Persist guessed emails from ``issuer_website`` + display name (filing data only).
+    No HTTP. Returns ``unchanged`` if ``outreach_json`` already populated (full enrich kept).
+    """
+    cik = str(row["cik"] or "").strip()
+    person_norm = str(row["person_norm"] or "").strip()
+    if not cik or not person_norm:
+        return "bad_row"
+    display_name = (row["display_name"] or "").strip() or person_norm
+    company_name = (row["company_name"] or "").strip()
+    site = (row["issuer_website"] or "").strip()
+    if not site.startswith("http"):
+        site = get_issuer_website_for_cik(conn, cik)
+    if not site.startswith("http"):
+        return "no_website"
+    pack = outreach_pattern_pack_from_website(
+        display_name,
+        site,
+        verify_smtp=False,
+        mail_from="",
+        max_smtp_probes=email_smtp_probe_max_candidates(),
+    )
+    if not pack.get("candidates"):
+        return "no_patterns"
+    lsearch = linkedin_search_url(display_name, company_name)
+    now = _now_iso()
+    oj = json.dumps(pack, ensure_ascii=False)[:48000]
+    ex = get_lead_client_research(conn, cik, person_norm)
+    ojs = (ex["outreach_json"] or "").strip() if ex else ""
+    if ojs:
+        try:
+            prev = json.loads(ojs)
+        except json.JSONDecodeError:
+            return "unchanged"
+        if not prev.get("error") and (prev.get("candidates") or []):
+            return "unchanged"
+    if ex:
+        conn.execute(
+            """
+            UPDATE lead_client_research SET
+              outreach_json = ?,
+              linkedin_search_url = ?,
+              enriched_at = ?,
+              display_name = ?,
+              company_name = ?,
+              issuer_website = ?
+            WHERE cik = ? AND person_norm = ?
+            """,
+            (
+                oj,
+                lsearch[:2000],
+                now,
+                display_name[:400],
+                company_name[:400],
+                site[:500],
+                cik,
+                person_norm,
+            ),
+        )
+        return "updated"
+    conn.execute(
+        """
+        INSERT INTO lead_client_research (
+          cik, person_norm, display_name, company_name, issuer_website,
+          status, linkedin_search_url, enriched_at, outreach_json,
+          bio_website, photo_url, leadership_page_url,
+          linkedin_profile_url, research_summary, source_excerpt, raw_json, error_message,
+          person_story, photo_blob, photo_mime
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            cik,
+            person_norm,
+            display_name[:400],
+            company_name[:400],
+            site[:500],
+            "pending",
+            lsearch[:2000],
+            now,
+            oj,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    )
+    return "inserted"
+
+
+def materialize_email_outreach_for_profiles(
+    conn: sqlite3.Connection,
+    *,
+    limit: Optional[int] = None,
+) -> dict[str, Any]:
+    """
+    Fill ``lead_client_research.outreach_json`` with hostname-based email patterns for
+    profiles that have ``issuer_website`` (from filings). Runs after ``rebuild-profiles`` /
+    ``sync``. SMTP checks run on lead view or ``enrich-client-research`` when enabled.
+    """
+    cap = 50_000 if limit is None else max(1, min(int(limit), 100_000))
+    cur = conn.execute(
+        """
+        SELECT * FROM lead_profile
+        WHERE issuer_website IS NOT NULL AND TRIM(issuer_website) != ''
+        ORDER BY filing_date_latest DESC, cik, person_norm
+        LIMIT ?
+        """,
+        (cap,),
+    )
+    rows = cur.fetchall()
+    by: dict[str, int] = defaultdict(int)
+    for row in rows:
+        by[_upsert_pattern_outreach_from_profile(conn, row)] += 1
+    return {
+        "email_outreach_profiles_seen": len(rows),
+        "email_outreach_inserted": by.get("inserted", 0),
+        "email_outreach_updated": by.get("updated", 0),
+        "email_outreach_unchanged": by.get("unchanged", 0),
+        "email_outreach_no_patterns": by.get("no_patterns", 0)
+        + by.get("no_website", 0)
+        + by.get("bad_row", 0),
+    }
+
+
 def enrich_lead_profile_row(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
     *,
     use_llm: bool = True,
-    verify_smtp: bool = False,
+    verify_smtp: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Build and persist client research for one lead_profile row. Returns status dict."""
+    vs = email_smtp_verify_enabled() if verify_smtp is None else bool(verify_smtp)
     cik = str(row["cik"] or "").strip()
     person_norm = str(row["person_norm"] or "").strip()
     display_name = (row["display_name"] or "").strip() or person_norm
@@ -484,9 +648,9 @@ def enrich_lead_profile_row(
     summary = ""
     llm_page = ""
 
-    if use_llm and text_bundle.strip() and openai_api_key():
+    if use_llm and text_bundle.strip() and advisor_llm_available():
         try:
-            llm = _call_openai_client_pack(
+            llm = _call_llm_client_pack(
                 display_name=display_name,
                 title=title,
                 company_name=company_name,
@@ -535,7 +699,7 @@ def enrich_lead_profile_row(
                 sess,
                 display_name=display_name,
                 website_root=base_root,
-                verify_smtp=verify_smtp,
+                verify_smtp=vs,
                 mail_from=email_smtp_mail_from(),
             )
         except Exception as e:
@@ -582,7 +746,7 @@ def run_enrich_client_research(
     cik: Optional[str] = None,
     force: bool = False,
     use_llm: bool = True,
-    verify_smtp: bool = False,
+    verify_smtp: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Enrich up to `limit` lead_profile rows (newest first)."""
     lim = max(1, min(int(limit), 500))

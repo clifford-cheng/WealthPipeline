@@ -191,11 +191,40 @@ def _scrub_hq_for_location(hq: str) -> str:
     return s.strip(" ,")
 
 
+_FACILITY_OUR_CLAUSE = re.compile(
+    r",?\s*(?:in|at)\s+our\s+"
+    r"([A-Za-z][A-Za-z'\-]*(?:\s+[A-Za-z][A-Za-z'\-]*)?)\s+facility\b\.?",
+    re.I,
+)
+
+_NON_US_PRINCIPAL_HINT = re.compile(
+    r"\b("
+    r"hong\s+kong|香港|kowloon|cayman\s+islands|grand\s+cayman|tortola|"
+    r"british\s+virgin\s+islands|\bbvi\b|"
+    r"people'?s\s+republic\s+of\s+china|(?<![a-z])prc(?![a-z])"
+    r")\b",
+    re.I,
+)
+
+
+def strip_hq_our_facility_clause(hq: str) -> tuple[str, Optional[str]]:
+    """
+    Remove trailing 'in our Vista facility' style clauses; return (cleaned, city hint if any).
+    """
+    t = (hq or "").strip()
+    m = _FACILITY_OUR_CLAUSE.search(t)
+    if not m:
+        return t, None
+    city = (m.group(1) or "").strip()
+    t2 = (t[: m.start()] + t[m.end() :]).strip(" ,.;")
+    return t2, city or None
+
+
 def strip_registrant_hq_contact_tail(s: str) -> str:
     """Remove telephone / fax clauses often concatenated onto principal-office lines."""
     t = (s or "").strip()
     t = re.sub(
-        r",?\s*(telephone|phone|fax|facsimile|tel\.)\s*:.*$",
+        r",?\s*((?:telephone|phone|fax|facsimile|tel\.)|\btel)\s*:.*$",
         "",
         t,
         flags=re.I,
@@ -214,6 +243,96 @@ _LEASE_OR_RENTAL_CUT = re.compile(
     r"monthly\s+rental\s+cost\b|rental\s+cost\s+of\b)",
     re.I,
 )
+
+
+# Narrative accidentally concatenated after a street/city/ZIP line on S-1 cover or summary
+# (e.g. "…NY 11598 Lock-up: We, each of our officers… have agreed… hypothecate, pledge…").
+_HQ_LOCKUP_AND_PROSPECTUS_TAIL = re.compile(
+    r"(?is)"
+    r"(?:"
+    r"\block-?up\s*:"
+    r"|\block\s+up\s+agreement\s+"
+    r"|\bwe\s*,\s*each\s+of\s+our\s+(?:officers|directors|officers\s+and\s+directors)\b"
+    r"|\beach\s+of\s+our\s+officers\s*,?\s*directors\b"
+    r"|\bcertain\s+of\s+our\s+stockholders\s+have\s+agreed\b"
+    r"|\b(?:have|has)\s+agreed\s*,\s*subject\s+to\b"
+    r"|\bnot\s+to\s+sell\s*,\s*offer\s*,?\s*agree\s+to\s+sell\b"
+    r"|\bcontract\s+to\s+sell\s*,?\s*hypothecate\b"
+    r")",
+)
+
+
+def strip_hq_lockup_and_prospectus_tail(s: str) -> str:
+    """
+    Cut lock-up / selling-restriction / underwriting prose sometimes pasted after the
+    registrant address in a single blob (no sentence break). Keeps the address prefix only.
+    """
+    t = (s or "").strip()
+    if not t:
+        return ""
+    m = _HQ_LOCKUP_AND_PROSPECTUS_TAIL.search(t)
+    if m:
+        t = t[: m.start()].strip().rstrip(",.;")
+    # Truncated capture after ZIP: "11598 gr" or "11598 xyz"
+    t = re.sub(r"(\b\d{5}(?:-\d{4})?)\s+[A-Za-z]{1,4}\s*$", r"\1", t)
+    return t.rstrip(" ,")
+
+
+# Principal office line often ends with "ST 12345, (775) 902-5161", "…89703, 775 902, 5161",
+# or local-only ", 725-0090" (exchange + last four, no area code). Not part of the address.
+_HQ_TRAILING_PHONE_AFTER_ZIP = re.compile(
+    r"\b(?P<zip>\d{5}(?:-\d{4})?)\s*,\s*"
+    r"(?:\+?1[\s.-]*)?"
+    r"(?:"
+    r"\(?\d{3}\)?[\s.-]*\d{3}[\s.-]*\d{4}|"  # (775) 902-5161
+    r"\d{3}[\s.,-]+\d{3}(?:[\s.,-]+\d{1,4})?|"  # 775 902, 5161
+    r"\d{3}[\s.-]+\d{4}"  # 725-0090, 725.0090 (7-digit local)
+    r")\s*$",
+    re.I,
+)
+# Same tail when filers omit the comma before the phone: "32901 725-0090"
+_HQ_TRAILING_PHONE_AFTER_ZIP_SPACE = re.compile(
+    r"\b(?P<zip>\d{5}(?:-\d{4})?)\s+"
+    r"(?:\+?1[\s.-]*)?"
+    r"(?:"
+    r"\(?\d{3}\)?[\s.-]*\d{3}[\s.-]*\d{4}|"
+    r"\d{3}[\s.,-]+\d{3}(?:[\s.,-]+\d{1,4})?|"
+    r"\d{3}[\s.-]+\d{4}"
+    r")\s*$",
+    re.I,
+)
+
+
+def strip_hq_phone_tail_after_zip(s: str) -> str:
+    """Drop telephone digits that SEC cover/extract sometimes leaves after City, State ZIP."""
+    t = (s or "").strip()
+    if not t:
+        return ""
+    for rx in (_HQ_TRAILING_PHONE_AFTER_ZIP, _HQ_TRAILING_PHONE_AFTER_ZIP_SPACE):
+        m = rx.search(t)
+        if m:
+            t = t[: m.end("zip")].rstrip(", ;")
+            break
+    return t
+
+
+def normalize_registrant_hq_address_blob(s: str) -> str:
+    """
+    Normalize a registrant principal-office blob toward a U.S. mailing-address prefix.
+
+    Strips phone/fax clauses, lease tail, lock-up prospectus tail, then **telephone
+    digits glued after a U.S. ZIP** (10-digit, 3+3+4 chunks, or **local 7-digit**
+    e.g. ``32901, 725-0090``). Use before
+    city/state parsing, territory keys, or full-address display.
+    """
+    t = (s or "").strip()
+    if not t:
+        return ""
+    t = strip_registrant_hq_contact_tail(t)
+    t = strip_hq_lease_and_rental_tail(t)
+    t = strip_hq_lockup_and_prospectus_tail(t)
+    t = strip_hq_phone_tail_after_zip(t)
+    return t.rstrip(" ,")
 
 
 def strip_hq_lease_and_rental_tail(s: str) -> str:
@@ -268,7 +387,15 @@ def hq_city_state_looks_like_filing_noise(s: str | None) -> bool:
             "i.r.s employer",
             "primary standard industrial",
             "classification code number",
+            "lock-up",
+            "lock up",
+            "hypothecate",
+            "stockholders have agreed",
+            "agree to sell",
         )
+    ) or bool(
+        re.search(r",\s*\d{3}[\s.-]+\d{4}\s*$", low)
+        or re.search(r"^\s*[a-z]{2}\s*,\s*\d{3}[\s.-]+\d{4}\s*$", low)
     )
 
 
@@ -284,7 +411,7 @@ def _finalize_city_state_no_zip(display: str) -> str:
 
 _STREET_TYPE_WORD = re.compile(
     r"\b(street|st\.|avenue|ave|boulevard|blvd|road|rd|drive|dr|lane|ln|"
-    r"way|parkway|plaza|highway|hwy|court|ct\.?|circle|cir\.?|terrace|trail)\b",
+    r"way|parkway|place|plaza|highway|hwy|court|ct\.?|circle|cir\.?|terrace|trail)\b",
     re.I,
 )
 
@@ -295,7 +422,8 @@ def hq_has_registrant_address_detail(hq: str | None) -> bool:
     S-1 cover addresses include a street number, P.O. Box, suite, or long named thoroughfare;
     "City, ST 12345" alone is not enough (too easy to mispick from narrative text).
     """
-    s = strip_registrant_hq_contact_tail(_scrub_hq_for_location(hq or "")).strip()
+    s0 = normalize_registrant_hq_address_blob(hq or "")
+    s = _scrub_hq_for_location(s0).strip()
     if not s:
         return False
     if re.search(r"\b[Pp]\.?\s*[Oo]\.?\s*[Bb]ox\s+\d", s):
@@ -335,8 +463,18 @@ def _segment_is_location_noise(seg: str) -> bool:
         return True
     if re.match(r"^\d{5}(?:-\d{4})?$", s):
         return True
-    if re.match(r"^\d+", s):
-        return True
+    if re.match(r"^\d", s):
+        if _STREET_TYPE_WORD.search(s):
+            return False
+        if re.match(r"^\d{1,6}\s*$", s):
+            return True
+        if len(s) <= 6 and re.match(r"^(?:19|20)\d{2}\b", s):
+            return True
+        if len(s) <= 4 and re.match(r"^\d+", s) and not re.search(r"[A-Za-z]", s):
+            return True
+        if re.match(r"^\d+\s+[A-Za-z]", s) and len(s) >= 10:
+            return False
+        return False
     if _STREET_NOISE.search(s):
         return True
     if "®" in s and len(s) < 6:
@@ -348,6 +486,33 @@ def _segment_is_location_noise(seg: str) -> bool:
         s,
     ):
         return True
+    if re.search(
+        r"(?i)lock-?up(\s|:|$)|hypothecate|pledge\s*,\s*grant|stockholders?\s+have\s+agreed|"
+        r"contract\s+to\s+sell|each\s+of\s+our\s+officers",
+        s,
+    ):
+        return True
+    low_seg = s.lower().strip()
+    if len(low_seg) <= 3 and low_seg.isalpha() and low_seg not in (
+        "usa",
+        "uae",
+        "pei",
+    ):
+        if len(low_seg) == 2 and _norm_state_token(low_seg.upper()):
+            return False
+        return True
+    if re.match(
+        r"^(?:\+?1\s*)?"
+        r"(?:\(?\d{3}\)?[\s.-]*)?"
+        r"\d{3}[\s.,-]+\d{3}(?:[\s.,-]+\d{1,4})?\s*$",
+        s,
+    ):
+        return True
+    if re.match(
+        r"^(?:\+?1[\s.-]*)?(?:\(?\d{3}\)?[\s.-]*)?\d{3}[\s.-]+\d{4}\s*$",
+        s,
+    ):
+        return True
     return False
 
 
@@ -356,9 +521,12 @@ def _us_state_abbr_from_token(tok: str) -> Optional[str]:
     m = re.match(r"^([A-Z]{2})(?:\s+\d{5}(?:-\d{4})?)?\s*$", t, re.I)
     if m:
         return _norm_state_token(m.group(1))
-    low = t.lower()
+    t_no_zip = re.sub(r"\s+\d{5}(?:-\d{4})?\s*$", "", t, flags=re.I).strip()
+    low = t_no_zip.lower()
     if low in _US_STATE_NAMES:
         return _US_STATE_NAMES[low]
+    if t.lower() in _US_STATE_NAMES:
+        return _US_STATE_NAMES[t.lower()]
     return None
 
 
@@ -373,11 +541,13 @@ def hq_city_state_display(hq: str | None) -> str:
             return ""
         return t
 
-    s0 = strip_hq_lease_and_rental_tail(
-        strip_registrant_hq_contact_tail(hq or "")
-    )
+    s_strip, facility_city = strip_hq_our_facility_clause(hq or "")
+    # Same normalization as hq_principal_office_display_line (phone-after-ZIP, lock-up, etc.)
+    s0 = normalize_registrant_hq_address_blob(s_strip)
     raw = _scrub_hq_for_location(s0)
     if not raw:
+        return ""
+    if _NON_US_PRINCIPAL_HINT.search(raw):
         return ""
     if headquarters_looks_like_lease_narrative(raw) and not re.search(
         r"(?i)\b(street|st\.|avenue|road|suite|room|floor|building|hong\s+kong)\b",
@@ -391,6 +561,18 @@ def hq_city_state_display(hq: str | None) -> str:
 
     def _strip_zip_from_seg(seg: str) -> str:
         return re.sub(r"\s+\d{5}(?:-\d{4})?\s*$", "", (seg or "").strip()).strip()
+
+    if (
+        facility_city
+        and len(clean) == 1
+        and _ZIP_RE.search(clean[0])
+    ):
+        seg0 = _strip_zip_from_seg(clean[0])
+        st_only = _us_state_abbr_from_token(seg0)
+        if st_only:
+            hit = _emit(f"{facility_city}, {st_only}")
+            if hit:
+                return hit
 
     # e.g. "Houston, Texas 77056" — strip ZIP before full state name → abbr
     last_tok = _strip_zip_from_seg(clean[-1])
@@ -430,9 +612,8 @@ def hq_principal_office_display_line(hq: str | None, *, max_len: int = 800) -> s
     Single-line registrant principal office for UI (cleaned filing text; may include street + ZIP).
     Use on the lead profile for the full company address; use hq_city_state_display for city/state only.
     """
-    s0 = strip_hq_lease_and_rental_tail(
-        strip_registrant_hq_contact_tail(hq or "")
-    )
+    s_strip, _fc = strip_hq_our_facility_clause(hq or "")
+    s0 = normalize_registrant_hq_address_blob(s_strip)
     s = _scrub_hq_for_location(s0).strip(" ,")
     if not s:
         return ""

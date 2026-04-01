@@ -12,8 +12,7 @@ from wealth_leads.person_quality import (
 )
 from wealth_leads.territory import (
     is_plausible_registrant_headquarters,
-    strip_hq_lease_and_rental_tail,
-    strip_registrant_hq_contact_tail,
+    normalize_registrant_hq_address_blob,
 )
 
 OfficerRow = tuple[str, str, str, Optional[int]]  # name, title, source, age (management tables)
@@ -178,6 +177,10 @@ def _column_map(headers: list[str]) -> tuple[Optional[int], Optional[int], Optio
             name_i = i
         if age_i is None and re.match(r"^age\b", hl):
             age_i = i
+        if age_i is None and (
+            re.match(r"^years?\b", hl) or re.match(r"^approx\.?\s+age\b", hl)
+        ):
+            age_i = i
     if name_i is None and headers:
         name_i = 0
 
@@ -186,13 +189,22 @@ def _column_map(headers: list[str]) -> tuple[Optional[int], Optional[int], Optio
         if i == name_i:
             continue
         hl = _column_header_key(h)
+        # S-1s almost always use "Positions Held" / "Position" — \bposition\b misses "positions".
         if re.search(
-            r"\b(position|title|office\s+held|principal\s+occupation|"
+            r"\b(positions?|titles?|office\s+held|principal\s+occupation|"
             r"present\s+principal|principal\s+employment)\b",
             hl,
         ):
             pos_i = i
             break
+    if pos_i is None and headers:
+        for i, h in enumerate(headers):
+            if i == name_i or i == age_i:
+                continue
+            hl = _column_header_key(h)
+            if "position" in hl or "title" in hl:
+                pos_i = i
+                break
     if pos_i is None and headers:
         others = [j for j in range(len(headers)) if j != name_i and j != age_i]
         if len(others) == 1:
@@ -216,14 +228,21 @@ def extract_executive_officers_from_filing_html(html: str) -> list[OfficerRow]:
     found: list[OfficerRow] = []
 
     def _parse_age(cell: str) -> Optional[int]:
+        """18–100; do not pick ``20`` out of ``2024``."""
         s = (cell or "").strip()
-        m = re.search(r"\b(1[89]|[2-9]\d)\b", s)
-        if not m:
-            m = re.search(r"\b(100)\b", s)
-        if not m:
+        if not s:
             return None
-        n = int(m.group(1))
-        return n if 18 <= n <= 100 else None
+        if re.match(r"^(1[89]|[2-9]\d|100)$", s):
+            return int(s)
+        m_full = re.match(r"^(1[89]|[2-9]\d|100)\s*[\(\[].*[\)\]]$", s)
+        if m_full:
+            n = int(m_full.group(1))
+            return n if 18 <= n <= 100 else None
+        for m in re.finditer(r"(?<!\d)(1[89]|[2-9]\d|100)(?!\d)", s):
+            n = int(m.group(1))
+            if 18 <= n <= 100:
+                return n
+        return None
 
     for table in soup.find_all("table"):
         rows = table.find_all("tr")
@@ -241,6 +260,10 @@ def extract_executive_officers_from_filing_html(html: str) -> list[OfficerRow]:
         name_i, pos_i, age_i = _column_map(headers)
         if name_i is None or pos_i is None:
             continue
+        if age_i is None and len(headers) <= 8:
+            others = [j for j in range(len(headers)) if j != name_i and j != pos_i]
+            if len(others) == 1:
+                age_i = others[0]
         for tr in rows[header_idx + 1 :]:
             cells = _row_cell_texts(tr)
             if len(cells) <= max(name_i, pos_i):
@@ -277,6 +300,19 @@ def extract_executive_officers_from_filing_html(html: str) -> list[OfficerRow]:
             age_val: Optional[int] = None
             if age_i is not None and len(cells) > age_i:
                 age_val = _parse_age(cells[age_i])
+            if age_val is None and name_i is not None and pos_i is not None:
+                candidates: list[int] = []
+                for j, cell in enumerate(cells):
+                    if j in (name_i, pos_i):
+                        continue
+                    c = (cell or "").strip()
+                    if len(c) > 14:
+                        continue
+                    pv = _parse_age(cell)
+                    if pv is not None:
+                        candidates.append(pv)
+                if len(candidates) == 1:
+                    age_val = candidates[0]
             found.append((name, title, "management_section", age_val))
 
     by_name: dict[str, OfficerRow] = {}
@@ -286,7 +322,8 @@ def extract_executive_officers_from_filing_html(html: str) -> list[OfficerRow]:
         if prev is None:
             by_name[key] = (name, title, src, age)
         elif len(title) > len(prev[1]):
-            by_name[key] = (name, title, src, age)
+            keep_age = age if age is not None else prev[3]
+            by_name[key] = (name, title, src, keep_age)
         elif len(title) == len(prev[1]) and age is not None and prev[3] is None:
             by_name[key] = (name, title, src, age)
     return sorted(by_name.values(), key=lambda x: (x[1], x[0]))
@@ -458,7 +495,7 @@ def _hq_clean(chunk: str) -> str:
         flags=re.I,
     )
     s = re.sub(r",?\s*and\s+the\s+telephone\s+number\s+(?:at|there)\s+.+$", "", s, flags=re.I)
-    s = strip_hq_lease_and_rental_tail(strip_registrant_hq_contact_tail(s))
+    s = normalize_registrant_hq_address_blob(s)
     s = s.rstrip(" ,")
     return s[:500] if len(s) >= 4 else ""
 
@@ -1021,9 +1058,9 @@ def extract_issuer_revenue_line_from_filing_html(html: str) -> str:
 
 
 def why_surfaced_line(form_type: str, filing_date: Optional[str]) -> str:
-    """Single-line, filing-based timing context (not investment advice)."""
+    """Single-line filing hook for the desk (not investment advice)."""
     ft = (form_type or "Filing").strip()
-    fd = filing_date or "date unknown"
+    fd = filing_date or "?"
     amend = bool(re.search(r"/\s*A\b", ft, re.I))
-    tail = " (amendment)" if amend else ""
-    return f"{ft} filed {fd}{tail} — public registration activity in EDGAR."
+    tail = " · A" if amend else ""
+    return f"{ft} · {fd}{tail}"

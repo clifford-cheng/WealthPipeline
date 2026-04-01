@@ -5,8 +5,9 @@ Sources: summary-comp (NEO) rows plus S-1 officer/director-only profiles when th
 no SCT line in DB (`lead_tier` = visibility). `lead_tier` also marks standard vs premium
 for low-signal SCT.
 
-Rebuild runs after SEC sync (or manually via Admin / CLI). Cross-company hints flag the
-same normalized name appearing under multiple CIKs (possible repeat IPO / board moves).
+Rebuild runs after SEC sync (or manually via Admin / CLI). Rows are filtered with the same
+rules as the lead desk (by default, beneficial-only S-1 shareholders are omitted).
+Cross-company hints flag the same normalized name appearing under multiple CIKs.
 """
 from __future__ import annotations
 
@@ -148,7 +149,13 @@ def _effective_other_comp(p: dict) -> object:
 def _headline_comp_columns(p: dict) -> tuple[object, object, object, object]:
     """
     Headline FY from SCT: salary, bonus, other compensation, and sum of stock + option awards.
+    Beneficial-owner profiles use the stock column for disclosed pre-IPO stake value (no SCT FY).
     """
+    if p.get("has_s1_beneficial_owner"):
+        stk = _opt_float(p.get("signal_hwm"))
+        if stk is None:
+            stk = _opt_float(p.get("equity_hwm"))
+        return None, None, None, stk
     if not p.get("has_summary_comp") or p.get("headline_year") is None:
         return None, None, None, None
     sal = _opt_float(p.get("salary"))
@@ -169,10 +176,10 @@ def _headline_comp_columns(p: dict) -> tuple[object, object, object, object]:
 
 def rebuild_lead_profiles(conn: sqlite3.Connection) -> dict[str, Any]:
     from wealth_leads.crm_ui import format_headquarters_for_ui
-    from wealth_leads.serve import _build_profiles
+    from wealth_leads.serve import _build_profiles, _lead_desk_filter_profiles
     from wealth_leads.territory import hq_city_state_display, hq_has_registrant_address_detail
 
-    profiles = _build_profiles(conn)
+    profiles = _lead_desk_filter_profiles(_build_profiles(conn))
     if not profiles:
         conn.execute("DELETE FROM lead_profile")
         return {"profiles_source": 0, "rows_written": 0}
@@ -212,7 +219,8 @@ def rebuild_lead_profiles(conn: sqlite3.Connection) -> dict[str, Any]:
         has_off = 1 if (
             p.get("officer_age_from_table") is not None
             or (
-                (p.get("title") or "").strip()
+                p.get("has_s1_officer")
+                and (p.get("title") or "").strip()
                 and (p.get("title") or "").strip() != "—"
             )
         ) else 0
@@ -273,6 +281,8 @@ def rebuild_lead_profiles(conn: sqlite3.Connection) -> dict[str, Any]:
                 (p.get("lead_tier") or "premium")[:24],
                 hq_cs,
                 hq_detail,
+                (p.get("issuer_listing_stage") or "unknown")[:24],
+                1 if p.get("has_s1_beneficial_owner") else 0,
                 built_at,
             )
         )
@@ -290,13 +300,18 @@ def rebuild_lead_profiles(conn: sqlite3.Connection) -> dict[str, Any]:
             has_s1_comp, has_mgmt_bio, has_officer_row, neo_row_count,
             comp_timeline, issuer_summary_excerpt, why_surfaced,
             neo_filing_ids_json, quality_score, cross_company_hint, other_ciks_json,
-            comp_llm_assisted, lead_tier, issuer_hq_city_state, issuer_hq_has_detail, built_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            comp_llm_assisted, lead_tier, issuer_hq_city_state, issuer_hq_has_detail,
+            issuer_listing_stage, has_beneficial_owner_stake, built_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         rows,
     )
+    from wealth_leads.lead_research import materialize_email_outreach_for_profiles
+
+    eo = materialize_email_outreach_for_profiles(conn)
     return {
         "profiles_source": len(profiles),
         "rows_written": len(rows),
         "cross_company_flagged": sum(1 for r in rows if r[31] == 1),
+        **eo,
     }

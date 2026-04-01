@@ -8,6 +8,10 @@ from typing import Generator, Optional
 
 from wealth_leads.config import database_path
 
+# Windows + uvicorn --reload can briefly open two processes on the same file; default timeout is brittle.
+_SQLITE_CONNECT_TIMEOUT_SEC = 60.0
+_SQLITE_BUSY_TIMEOUT_MS = 60_000
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS filings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -182,9 +186,18 @@ def _migrate_app_auth(conn: sqlite3.Connection) -> None:
 def connect(path: Optional[str] = None) -> Generator[sqlite3.Connection, None, None]:
     dbp = path or database_path()
     Path(dbp).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(dbp)
+    conn = sqlite3.connect(dbp, timeout=_SQLITE_CONNECT_TIMEOUT_SEC)
     conn.row_factory = sqlite3.Row
     try:
+        # WAL + busy_timeout: fewer "database is locked" 500s under refresh + background sync / reload.
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.Error:
+            pass
+        try:
+            conn.execute(f"PRAGMA busy_timeout = {_SQLITE_BUSY_TIMEOUT_MS}")
+        except sqlite3.Error:
+            pass
         conn.executescript(SCHEMA)
         _migrate_filings_compensation_column(conn)
         _migrate_filings_issuer_summary(conn)
@@ -202,10 +215,13 @@ def connect(path: Optional[str] = None) -> Generator[sqlite3.Connection, None, N
         _migrate_lead_profile_lead_tier(conn)
         _migrate_lead_profile_headline_comp(conn)
         _migrate_lead_profile_hq_materialized(conn)
+        _migrate_lead_profile_issuer_listing_stage(conn)
+        _migrate_lead_profile_beneficial_flag(conn)
         _migrate_lead_client_research(conn)
         _migrate_issuer_advisor_snapshot(conn)
         _migrate_lead_client_research_advisor_cols(conn)
         _migrate_lead_client_research_photo_blob(conn)
+        _migrate_beneficial_owner_stake(conn)
         yield conn
         conn.commit()
     finally:
@@ -746,6 +762,78 @@ def _migrate_lead_profile_hq_materialized(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_lead_profile_issuer_listing_stage(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(lead_profile)").fetchall()}
+    if "issuer_listing_stage" not in cols:
+        conn.execute(
+            "ALTER TABLE lead_profile ADD COLUMN issuer_listing_stage "
+            "TEXT NOT NULL DEFAULT 'unknown'"
+        )
+
+
+def _migrate_lead_profile_beneficial_flag(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(lead_profile)").fetchall()}
+    if "has_beneficial_owner_stake" not in cols:
+        conn.execute(
+            "ALTER TABLE lead_profile ADD COLUMN has_beneficial_owner_stake "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+
+
+def issuer_listing_stage_map(
+    conn: sqlite3.Connection, ciks: set[str]
+) -> dict[str, str]:
+    """
+    Classify issuers from `filings.form_type` only (what is in the local DB).
+
+    - public: any 10-K or 10-Q family form
+    - pre_ipo: S-1 / F-1 family but no periodic report in DB
+    - unknown: otherwise (including CIKs with no rows)
+
+    Newly public names may lack a 10-Q/10-K in DB until the next sync.
+    """
+    ciks_clean = {str(ck).strip() for ck in ciks if ck and str(ck).strip()}
+    out: dict[str, str] = {ck: "unknown" for ck in ciks_clean}
+    if not ciks_clean:
+        return {}
+    qm = ",".join("?" * len(ciks_clean))
+    cur = conn.execute(
+        f"""
+        SELECT cik AS cik,
+          MAX(
+            CASE
+              WHEN form_type LIKE '10-K' || '%' OR form_type LIKE '10-Q' || '%'
+              THEN 1 ELSE 0
+            END
+          ) AS has_periodic,
+          MAX(
+            CASE
+              WHEN form_type LIKE 'S-1' || '%'
+                OR form_type LIKE 'F-1' || '%'
+              THEN 1 ELSE 0
+            END
+          ) AS has_s1_family
+        FROM filings
+        WHERE cik IN ({qm})
+        GROUP BY cik
+        """,
+        tuple(ciks_clean),
+    )
+    for r in cur.fetchall():
+        ck = str(r["cik"] or "").strip()
+        if not ck:
+            continue
+        has_p = int(r["has_periodic"] or 0)
+        has_s1 = int(r["has_s1_family"] or 0)
+        if has_p:
+            out[ck] = "public"
+        elif has_s1:
+            out[ck] = "pre_ipo"
+        else:
+            out[ck] = "unknown"
+    return out
+
+
 def _migrate_lead_client_research(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -802,6 +890,244 @@ def _migrate_lead_client_research_photo_blob(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE lead_client_research ADD COLUMN photo_blob BLOB")
     if "photo_mime" not in cols:
         conn.execute("ALTER TABLE lead_client_research ADD COLUMN photo_mime TEXT")
+
+
+def _migrate_beneficial_owner_stake(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS beneficial_owner_stake (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filing_id INTEGER NOT NULL,
+            holder_name TEXT NOT NULL,
+            holder_kind TEXT NOT NULL,
+            raw_name_cell TEXT,
+            shares_before_offering REAL,
+            pct_beneficial REAL,
+            footnote_markers TEXT,
+            footnote_text TEXT,
+            mailing_address TEXT,
+            notional_usd_est REAL,
+            offering_price_used REAL,
+            gem_score INTEGER NOT NULL DEFAULT 0,
+            outreach_recommended TEXT NOT NULL DEFAULT '',
+            outreach_notes TEXT,
+            FOREIGN KEY (filing_id) REFERENCES filings(id)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_beneficial_owner_filing ON beneficial_owner_stake(filing_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_beneficial_owner_gem ON beneficial_owner_stake(gem_score DESC)"
+    )
+    bcols = {
+        row[1] for row in conn.execute("PRAGMA table_info(beneficial_owner_stake)").fetchall()
+    }
+    if "offering_price_gross_usd" not in bcols:
+        conn.execute(
+            "ALTER TABLE beneficial_owner_stake ADD COLUMN offering_price_gross_usd REAL"
+        )
+    if "offering_underwriting_deduction_usd" not in bcols:
+        conn.execute(
+            "ALTER TABLE beneficial_owner_stake ADD COLUMN offering_underwriting_deduction_usd REAL"
+        )
+    if "offering_price_doc_anchor" not in bcols:
+        conn.execute(
+            "ALTER TABLE beneficial_owner_stake ADD COLUMN offering_price_doc_anchor TEXT"
+        )
+    if "underwriting_doc_anchor" not in bcols:
+        conn.execute(
+            "ALTER TABLE beneficial_owner_stake ADD COLUMN underwriting_doc_anchor TEXT"
+        )
+    if "mailing_footnote_doc_anchor" not in bcols:
+        conn.execute(
+            "ALTER TABLE beneficial_owner_stake ADD COLUMN mailing_footnote_doc_anchor TEXT"
+        )
+    if "beneficial_parse_build" not in bcols:
+        conn.execute(
+            "ALTER TABLE beneficial_owner_stake ADD COLUMN beneficial_parse_build TEXT DEFAULT ''"
+        )
+
+
+def replace_beneficial_owner_stakes(
+    conn: sqlite3.Connection, filing_id: int, rows: list[dict]
+) -> None:
+    conn.execute("DELETE FROM beneficial_owner_stake WHERE filing_id = ?", (filing_id,))
+    if not rows:
+        return
+    batch: list[tuple] = []
+    for r in rows:
+        batch.append(
+            (
+                filing_id,
+                (r.get("holder_name") or "")[:400],
+                (r.get("holder_kind") or "unknown")[:32],
+                (r.get("raw_name_cell") or "")[:500],
+                r.get("shares_before_offering"),
+                r.get("pct_beneficial"),
+                (r.get("footnote_markers") or "[]")[:500],
+                (r.get("footnote_text") or "")[:6000],
+                (r.get("mailing_address") or "")[:500],
+                r.get("notional_usd_est"),
+                r.get("offering_price_used"),
+                r.get("offering_price_gross_usd"),
+                r.get("offering_underwriting_deduction_usd"),
+                (r.get("offering_price_doc_anchor") or "")[:256],
+                (r.get("underwriting_doc_anchor") or "")[:256],
+                (r.get("mailing_footnote_doc_anchor") or "")[:256],
+                (r.get("beneficial_parse_build") or "")[:32],
+                int(r.get("gem_score") or 0),
+                (r.get("outreach_recommended") or "")[:64],
+                (r.get("outreach_notes") or "")[:1500],
+            )
+        )
+    conn.executemany(
+        """
+        INSERT INTO beneficial_owner_stake (
+            filing_id, holder_name, holder_kind, raw_name_cell,
+            shares_before_offering, pct_beneficial, footnote_markers, footnote_text,
+            mailing_address, notional_usd_est, offering_price_used,
+            offering_price_gross_usd, offering_underwriting_deduction_usd,
+            offering_price_doc_anchor, underwriting_doc_anchor, mailing_footnote_doc_anchor,
+            beneficial_parse_build,
+            gem_score, outreach_recommended, outreach_notes
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        batch,
+    )
+
+
+def list_beneficial_owner_gems_for_cik(
+    conn: sqlite3.Connection,
+    cik: str,
+    *,
+    min_gem: int = 1,
+    limit: int = 12,
+    persons_only: bool = True,
+) -> list[sqlite3.Row]:
+    ck = (cik or "").strip()
+    if not ck:
+        return []
+    kind_clause = " AND b.holder_kind = 'person' " if persons_only else ""
+    try:
+        return list(
+            conn.execute(
+                f"""
+                SELECT b.*, f.filing_date AS stake_filing_date, f.company_name AS stake_company_name,
+                       f.accession AS stake_accession
+                FROM beneficial_owner_stake b
+                JOIN filings f ON f.id = b.filing_id
+                WHERE f.cik = ? AND b.gem_score >= ? {kind_clause}
+                ORDER BY b.gem_score DESC, COALESCE(b.notional_usd_est, 0) DESC
+                LIMIT ?
+                """,
+                (ck, min_gem, limit),
+            ).fetchall()
+        )
+    except sqlite3.OperationalError:
+        return []
+
+
+def list_beneficial_owner_stakes_for_cik(
+    conn: sqlite3.Connection,
+    cik: str,
+) -> list[sqlite3.Row]:
+    """All person/unknown beneficial-owner rows for a CIK (caller matches to a profile by name)."""
+    ck = (cik or "").strip()
+    if not ck:
+        return []
+    try:
+        return list(
+            conn.execute(
+                """
+                SELECT b.*, f.filing_date AS stake_filing_date,
+                       f.primary_doc_url AS stake_primary_doc_url,
+                       f.accession AS stake_accession
+                FROM beneficial_owner_stake b
+                JOIN filings f ON f.id = b.filing_id
+                WHERE f.cik = ? AND b.holder_kind IN ('person', 'unknown')
+                ORDER BY b.gem_score DESC,
+                         COALESCE(b.notional_usd_est, 0) DESC,
+                         f.id DESC
+                """,
+                (ck,),
+            ).fetchall()
+        )
+    except sqlite3.OperationalError:
+        return []
+
+
+def list_beneficial_owner_outreach_targets_for_cik(
+    conn: sqlite3.Connection,
+    cik: str,
+    *,
+    limit: int = 10,
+) -> list[sqlite3.Row]:
+    """
+    Individuals likely worth outreach: natural persons with either a parsed mailing-style
+    line from the footnote or a material estimated stake (heuristic gem / notional).
+    Excludes generic cap-table noise (tiny holders with no address).
+    """
+    ck = (cik or "").strip()
+    if not ck:
+        return []
+    try:
+        return list(
+            conn.execute(
+                """
+                SELECT b.*, f.filing_date AS stake_filing_date, f.company_name AS stake_company_name,
+                       f.accession AS stake_accession, f.primary_doc_url AS stake_primary_doc_url
+                FROM beneficial_owner_stake b
+                JOIN filings f ON f.id = b.filing_id
+                WHERE f.cik = ?
+                  AND b.holder_kind = 'person'
+                  AND (
+                    TRIM(COALESCE(b.mailing_address, '')) != ''
+                    OR (
+                      COALESCE(b.notional_usd_est, 0) >= 500000
+                      AND b.gem_score >= 55
+                    )
+                  )
+                ORDER BY
+                  CASE WHEN b.outreach_recommended = 'mail' THEN 0 ELSE 1 END,
+                  b.gem_score DESC,
+                  COALESCE(b.notional_usd_est, 0) DESC
+                LIMIT ?
+                """,
+                (ck, limit),
+            ).fetchall()
+        )
+    except sqlite3.OperationalError:
+        return []
+
+
+def list_beneficial_owner_gems_for_filing_ids(
+    conn: sqlite3.Connection,
+    filing_ids: list[int],
+    *,
+    min_gem: int = 1,
+    limit: int = 8,
+    persons_only: bool = True,
+) -> list[sqlite3.Row]:
+    if not filing_ids:
+        return []
+    qm = ",".join("?" * len(filing_ids))
+    kind_clause = " AND holder_kind = 'person' " if persons_only else ""
+    try:
+        return list(
+            conn.execute(
+                f"""
+                SELECT * FROM beneficial_owner_stake
+                WHERE filing_id IN ({qm}) AND gem_score >= ? {kind_clause}
+                ORDER BY gem_score DESC, COALESCE(notional_usd_est, 0) DESC
+                LIMIT ?
+                """,
+                tuple(filing_ids) + (min_gem, limit),
+            ).fetchall()
+        )
+    except sqlite3.OperationalError:
+        return []
 
 
 def get_lead_client_research(
@@ -1077,6 +1403,7 @@ def list_lead_profiles_for_review(
     months_back: Optional[int] = 6,
     pay_band: str = "all",
     us_registrant_hq_only: bool = False,
+    listing_stage: str = "all",
 ) -> list[sqlite3.Row]:
     """
     Pipeline review rows. By default only NEO rows tied to an S-1-family filing
@@ -1122,12 +1449,30 @@ def list_lead_profiles_for_review(
                 "OR issuer_headquarters LIKE ? OR person_norm LIKE ? OR cik LIKE ?)"
             )
             params.extend([pat, pat, pat, pat, pat, pat])
+        lst = str(listing_stage or "all").strip().lower().replace("-", "_")
+        if lst in ("pre_ipo", "public", "unknown"):
+            sql += " AND issuer_listing_stage = ?"
+            params.append(lst)
         sql += " ORDER BY filing_date_latest DESC, cik, person_norm LIMIT ?"
         fetch_cap = max(1, min(int(limit), 5000))
         if us_registrant_hq_only:
             fetch_cap = max(1, min(fetch_cap * 5, 5000))
         params.append(fetch_cap)
         rows = list(conn.execute(sql, params).fetchall())
+        from wealth_leads.person_quality import is_acceptable_lead_person_name
+
+        def _pipeline_row_display_name(r: sqlite3.Row) -> str:
+            d = (r["display_name"] or "").strip()
+            if d:
+                return d
+            pn = (r["person_norm"] or "").strip()
+            return " ".join(w.title() for w in pn.split()) if pn else ""
+
+        rows = [
+            r
+            for r in rows
+            if is_acceptable_lead_person_name(_pipeline_row_display_name(r))
+        ]
         if us_registrant_hq_only:
             from wealth_leads.territory import registrant_hq_line_parses_as_united_states
 

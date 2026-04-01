@@ -15,6 +15,15 @@ def advisor_title_badge(title: str) -> str:
     low = t.lower()
     u = t.upper()
 
+    # S-1 beneficial-ownership path — not an operating executive title.
+    if (
+        "major shareholder" in low
+        or "beneficial ownership" in low
+        or ">5%" in t
+        or ("shareholder" in low and "beneficial" in low)
+    ):
+        return "5%+ holder"
+
     if re.search(r"\bCEO\b", u) or "chief executive officer" in low:
         return "CEO"
     if re.search(r"\bCFO\b", u) or "chief financial officer" in low:

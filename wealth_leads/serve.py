@@ -22,13 +22,28 @@ from wsgiref.simple_server import make_server
 
 from wealth_leads.config import (
     database_path,
+    email_hypothesis_top_n,
+    email_smtp_mail_from,
+    email_smtp_probe_max_candidates,
+    email_smtp_verify_enabled,
     lead_desk_equity_only_min_usd,
+    lead_desk_include_beneficial_only_leads,
     lead_desk_min_signal_usd,
     lead_desk_s1_only,
     lead_desk_us_registrant_hq_only,
 )
-from wealth_leads.advisor_pack import get_issuer_snapshot_dict
-from wealth_leads.db import connect, get_lead_client_research
+from wealth_leads.advisor_pack import (
+    apply_smtp_probes_to_candidates,
+    get_issuer_snapshot_dict,
+    outreach_pattern_pack_from_website,
+)
+from wealth_leads.db import (
+    connect,
+    get_lead_client_research,
+    issuer_listing_stage_map,
+    list_beneficial_owner_outreach_targets_for_cik,
+    list_beneficial_owner_stakes_for_cik,
+)
 from wealth_leads.lead_research import row_to_client_research_dict
 from wealth_leads.management import issuer_summary_looks_spammy, why_surfaced_line
 from wealth_leads.profile_build import _effective_other_comp
@@ -311,6 +326,128 @@ def _try_float(v: object) -> Optional[float]:
         return None
 
 
+def _beneficial_offering_snapshot_html(
+    stake: Optional[dict],
+    *,
+    include_holder_shares: bool = True,
+    notional_usd: Optional[float] = None,
+) -> str:
+    """
+    Compact S-1 snapshot: shares, Public / Fees / Net per share, Est. $ — above the comp grid.
+    """
+    if not stake:
+        return ""
+    og = _try_float(stake.get("offering_price_gross_usd"))
+    ud = _try_float(stake.get("offering_underwriting_deduction_usd"))
+    net = _try_float(stake.get("offering_price_used"))
+    sh = _try_float(stake.get("shares_before_offering")) if include_holder_shares else None
+    n = notional_usd if notional_usd is not None else _try_float(stake.get("notional_usd_est"))
+
+    if og is None and net is None:
+        if not (include_holder_shares and sh is not None and sh > 0 and n is not None):
+            return ""
+
+    pub_c = f"${og:,.2f}" if og is not None else "—"
+    fee_c = f"${ud:,.2f}" if ud is not None and ud > 0 else "—"
+    net_c = f"${net:,.2f}" if net is not None else "—"
+    sh_c = f"{sh:,.0f}" if sh is not None and sh > 0 else "—"
+
+    tip = (
+        "Illustrative filing math only — not cash comp or liquid value. "
+        "Public = assumed public price per share; Fees = underwriting discount and "
+        "commissions per share; Net = per share used for the dollar estimate."
+    )
+    cap = (
+        "Per-share inputs (S-1) — same figures for each holder row below."
+        if not include_holder_shares
+        else "How Stock / Total is derived — from the S-1 offering disclosure."
+    )
+
+    parts = [
+        f'<div class="lead-beneficial-offering-wrap" title="{html.escape(tip, quote=True)}">',
+        '<table class="lead-beneficial-offering-snap">',
+        f'<caption class="lead-beneficial-offering-cap">{html.escape(cap)}</caption>',
+        "<thead><tr>"
+        '<th scope="col" class="lead-beneficial-snap-void"></th>'
+        '<th scope="col" class="lead-beneficial-snap-col" title="Assumed public offering price per share">'
+        "Public</th>"
+        '<th scope="col" class="lead-beneficial-snap-col" title="Underwriting discount and commissions per share">'
+        "Fees</th>"
+        '<th scope="col" class="lead-beneficial-snap-col" title="Net per share after fees — used for the estimate">'
+        "Net</th>"
+        "</tr></thead><tbody>",
+    ]
+    if include_holder_shares:
+        parts.append(
+            "<tr>"
+            '<th scope="row" class="lead-beneficial-snap-row" title="Pre-offering shares in beneficial ownership table">'
+            "Shares</th>"
+            f'<td class="num" colspan="3">{html.escape(sh_c)}</td>'
+            "</tr>"
+        )
+    parts.append(
+        "<tr>"
+        '<th scope="row" class="lead-beneficial-snap-row" title="Dollars per share">Per share</th>'
+        f'<td class="num">{html.escape(pub_c)}</td>'
+        f'<td class="num">{html.escape(fee_c)}</td>'
+        f'<td class="num lead-beneficial-snap-em">{html.escape(net_c)}</td>'
+        "</tr>"
+    )
+    if include_holder_shares and n is not None:
+        parts.append(
+            '<tr class="lead-beneficial-snap-total">'
+            '<th scope="row" class="lead-beneficial-snap-row" '
+            'title="Illustrative dollars: shares × net per share">'
+            "Est. $</th>"
+            f'<td class="num" colspan="3">{html.escape(_money(n))}</td>'
+            "</tr>"
+        )
+    parts.append("</tbody></table></div>")
+    return "".join(parts)
+
+
+def filing_doc_url_with_fragment(base_url: str, fragment: str) -> str:
+    """SEC primary doc URL with HTML fragment (e.g. ``#item-abc``) for in-document jumps."""
+    u = (base_url or "").strip()
+    frag = (fragment or "").strip()
+    if not u:
+        return ""
+    if "#" in u:
+        u = u.split("#", 1)[0]
+    if frag and not frag.startswith("#"):
+        frag = "#" + frag
+    return u + frag
+
+
+def _beneficial_mailing_paragraph_html(addr_raw: str, doc_url: str, anchor: str) -> str:
+    esc = html.escape(addr_raw.replace("\r\n", "\n").replace("\r", "\n"))
+    u = filing_doc_url_with_fragment((doc_url or "").strip(), (anchor or "").strip())
+    if u and (anchor or "").strip():
+        return (
+            '<p class="meta" style="white-space:pre-line;line-height:1.45;margin-bottom:0.75rem">'
+            f'<a href="{html.escape(u)}" target="_blank" rel="noopener" '
+            'title="Open filing at the footnote / section we matched">'
+            f"{esc}</a></p>"
+        )
+    return (
+        '<p class="meta" style="white-space:pre-line;line-height:1.45;margin-bottom:0.75rem">'
+        f"{esc}</p>"
+    )
+
+
+def _beneficial_pct_cell(v: object) -> str:
+    if v is None:
+        return "—"
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "—"
+    if f < 0 or f > 100:
+        return "—"
+    rounded = f"{f:.2f}".rstrip("0").rstrip(".")
+    return f"{rounded}%"
+
+
 def _equity_awards_sum_profile(p: dict) -> Optional[float]:
     sa, oa = p.get("stock_awards"), p.get("option_awards")
     if sa is None and oa is None:
@@ -374,16 +511,46 @@ def _annotate_lead_tier_fields(p: dict) -> None:
     if tier == "premium":
         return
     if tier == "standard":
-        suffix = (
-            " — Not premium: disclosed S-1 summary comp is below the desk pay-signal bar; "
-            "still useful for smaller RIAs / lower minimums."
-        )
+        suffix = " · Standard: SCT below desk pay bar."
+    elif p.get("has_s1_beneficial_owner"):
+        suffix = " · Visibility: major shareholder (S-1 beneficial ownership), no NEO row."
+        if p.get("beneficial_stake_only_contact"):
+            suffix += " Stake-only contact (no mailing parsed in footnotes)."
     else:
-        suffix = (
-            " — Not premium: S-1 officer/director listing only (no summary comp row in DB); "
-            "visibility / referral-tier prospect."
-        )
+        suffix = " · Visibility: no SCT row in DB."
     p["why_surfaced"] = (base + suffix).strip()
+
+
+def _issuer_listing_stage_ui(p: dict) -> tuple[str, str, str]:
+    """Return (stage_key, short_label, title_tooltip)."""
+    st = (p.get("issuer_listing_stage") or "unknown").strip().lower()
+    if st == "pre_ipo":
+        return (
+            "pre_ipo",
+            "Pre-IPO",
+            "S-1/F-1 in your DB; no 10-K/10-Q yet — often still private or in registration. "
+            "Briefly mislabeled after IPO until periodic reports are synced.",
+        )
+    if st == "public":
+        return (
+            "public",
+            "Public",
+            "At least one 10-K or 10-Q in your DB — likely already listed (historical S-1 lead).",
+        )
+    return (
+        "unknown",
+        "Unknown",
+        "No clear S-1 vs periodic pattern in your snapshot — sync more filings or treat as inconclusive.",
+    )
+
+
+def _issuer_listing_stage_badge_html(p: dict) -> str:
+    key, lbl, tip = _issuer_listing_stage_ui(p)
+    cls = f"badge badge-listing-{key}"
+    return (
+        f'<span class="{html.escape(cls)}" title="{html.escape(tip, quote=True)}">'
+        f"{html.escape(lbl)}</span>"
+    )
 
 
 def _desk_sort_tuple(p: dict) -> tuple:
@@ -489,23 +656,46 @@ def management_roster_scale_stats(
     return {"raw_rows": raw_rows, "unique_people": len(keys)}
 
 
-def _fetch_s1_officer_join_rows(conn: sqlite3.Connection) -> list[dict]:
-    cur = conn.execute(
-        """
-        SELECT o.name AS person_name, o.title, o.age, o.filing_id,
-               f.company_name, f.cik, f.filing_date, f.index_url, f.primary_doc_url,
-               f.form_type AS filing_form_type,
-               f.issuer_summary AS filing_issuer_summary,
-               f.issuer_website AS filing_issuer_website,
-               f.issuer_headquarters AS filing_issuer_headquarters,
-               f.issuer_industry AS filing_issuer_industry,
-               f.issuer_revenue_text AS filing_issuer_revenue_text,
-               f.director_term_summary AS filing_director_term_summary
-        FROM officers o
-        JOIN filings f ON f.id = o.filing_id
-        WHERE LENGTH(TRIM(COALESCE(o.title, ''))) > 0
-        """
-    )
+def _fetch_s1_officer_join_rows(
+    conn: sqlite3.Connection, cik_filter: Optional[str] = None
+) -> list[dict]:
+    ck = (cik_filter or "").strip()
+    if ck:
+        cur = conn.execute(
+            """
+            SELECT o.name AS person_name, o.title, o.age, o.filing_id,
+                   f.company_name, f.cik, f.filing_date, f.index_url, f.primary_doc_url,
+                   f.form_type AS filing_form_type,
+                   f.issuer_summary AS filing_issuer_summary,
+                   f.issuer_website AS filing_issuer_website,
+                   f.issuer_headquarters AS filing_issuer_headquarters,
+                   f.issuer_industry AS filing_issuer_industry,
+                   f.issuer_revenue_text AS filing_issuer_revenue_text,
+                   f.director_term_summary AS filing_director_term_summary
+            FROM officers o
+            JOIN filings f ON f.id = o.filing_id
+            WHERE LENGTH(TRIM(COALESCE(o.title, ''))) > 0
+              AND f.cik = ?
+            """,
+            (ck,),
+        )
+    else:
+        cur = conn.execute(
+            """
+            SELECT o.name AS person_name, o.title, o.age, o.filing_id,
+                   f.company_name, f.cik, f.filing_date, f.index_url, f.primary_doc_url,
+                   f.form_type AS filing_form_type,
+                   f.issuer_summary AS filing_issuer_summary,
+                   f.issuer_website AS filing_issuer_website,
+                   f.issuer_headquarters AS filing_issuer_headquarters,
+                   f.issuer_industry AS filing_issuer_industry,
+                   f.issuer_revenue_text AS filing_issuer_revenue_text,
+                   f.director_term_summary AS filing_director_term_summary
+            FROM officers o
+            JOIN filings f ON f.id = o.filing_id
+            WHERE LENGTH(TRIM(COALESCE(o.title, ''))) > 0
+            """
+        )
     out: list[dict] = []
     for r in cur.fetchall():
         d = dict(r)
@@ -694,15 +884,171 @@ def _visibility_profile_dict(
     }
 
 
-def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
-    """One row per (CIK, person): headline = latest fiscal year; sums + per-year breakdown for drill-down."""
+# Min gem score for a natural-person beneficial owner to appear as its own pipeline / lead_profile row.
+_BENEFICIAL_OWNER_PIPELINE_MIN_GEM = 25
+
+
+def _beneficial_owner_pipeline_profiles(
+    conn: sqlite3.Connection,
+    *,
+    cik_filter: Optional[str],
+    exclude_keys: set[tuple[str, str]],
+    officer_rows_by_cik: dict[str, list[tuple[str, str, Optional[int], int, str]]],
+) -> list[dict]:
+    """
+    Major individual shareholders from ``beneficial_owner_stake`` (S-1 table parse), who are not
+    already represented as NEO/officer profiles. Makes people like footnoted >5% holders show up
+    on the pipeline after ``rebuild-profiles``.
+    """
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='beneficial_owner_stake'"
+    ).fetchone():
+        return []
+    ck_f = (cik_filter or "").strip()
+    q = """
+        SELECT b.filing_id, b.holder_name, b.holder_kind, b.shares_before_offering,
+               b.pct_beneficial, b.notional_usd_est, b.gem_score, b.outreach_notes,
+               f.cik, f.company_name, f.filing_date, f.index_url, f.primary_doc_url,
+               f.form_type AS filing_form_type,
+               f.issuer_summary AS filing_issuer_summary,
+               f.issuer_website AS filing_issuer_website,
+               f.issuer_headquarters AS filing_issuer_headquarters,
+               f.issuer_industry AS filing_issuer_industry,
+               f.issuer_revenue_text AS filing_issuer_revenue_text,
+               f.director_term_summary AS filing_director_term_summary
+        FROM beneficial_owner_stake b
+        JOIN filings f ON f.id = b.filing_id
+        WHERE b.holder_kind IN ('person', 'unknown')
+          AND b.gem_score >= ?
+    """
+    args: list[Any] = [_BENEFICIAL_OWNER_PIPELINE_MIN_GEM]
+    if ck_f:
+        q += " AND f.cik = ? "
+        args.append(ck_f)
+    q += """
+        ORDER BY f.cik,
+                 lower(trim(b.holder_name)),
+                 b.gem_score DESC,
+                 COALESCE(b.notional_usd_est, 0) DESC
+    """
+    try:
+        raw_rows = [dict(r) for r in conn.execute(q, tuple(args)).fetchall()]
+    except sqlite3.Error:
+        return []
+
+    best: dict[tuple[str, str], dict] = {}
+    for r in raw_rows:
+        if not _is_s1_form_type(str(r.get("filing_form_type") or "")):
+            continue
+        cik_s = str(r["cik"] or "").strip()
+        raw_h = (r.get("holder_name") or "").strip()
+        display = raw_h
+        if not is_acceptable_lead_person_name(display):
+            rfn = refine_lead_person_name(raw_h)
+            if rfn:
+                display = rfn
+        if not is_acceptable_lead_person_name(display):
+            continue
+        pk = _profile_key(cik_s, display)
+        if pk in exclude_keys:
+            continue
+        if pk not in best or int(r.get("gem_score") or 0) > int(
+            best[pk].get("gem_score") or 0
+        ):
+            best[pk] = {**r, "_display_name": display}
+
+    out: list[dict] = []
+    for row in best.values():
+        display = row["_display_name"]
+        cik_s = str(row["cik"] or "").strip()
+        pn = _norm_person_name(display)
+        fid = int(row["filing_id"])
+        notional = row.get("notional_usd_est")
+        try:
+            sig = float(notional) if notional is not None else 0.0
+        except (TypeError, ValueError):
+            sig = 0.0
+
+        sh = row.get("shares_before_offering")
+        pct = row.get("pct_beneficial")
+        tl_parts: list[str] = []
+        if sh is not None:
+            try:
+                tl_parts.append(f"{float(sh):,.0f} shares (pre-offering)")
+            except (TypeError, ValueError):
+                pass
+        if pct is not None:
+            try:
+                tl_parts.append(f"{float(pct):g}% beneficial")
+            except (TypeError, ValueError):
+                pass
+        timeline = " · ".join(tl_parts) if tl_parts else "S-1 beneficial ownership"
+
+        head = {
+            "person_name": display,
+            "company_name": row.get("company_name") or "",
+            "cik": cik_s,
+            "filing_id": fid,
+            "filing_date": row.get("filing_date") or "",
+            "index_url": row.get("index_url") or "",
+            "primary_doc_url": row.get("primary_doc_url") or "",
+            "filing_form_type": row.get("filing_form_type") or "",
+            "filing_issuer_summary": row.get("filing_issuer_summary") or "",
+            "filing_issuer_website": row.get("filing_issuer_website") or "",
+            "filing_issuer_headquarters": row.get("filing_issuer_headquarters") or "",
+            "filing_issuer_industry": row.get("filing_issuer_industry") or "",
+            "filing_issuer_revenue_text": row.get("filing_issuer_revenue_text") or "",
+            "filing_director_term_summary": row.get("filing_director_term_summary") or "",
+            "title": "",
+        }
+        narr_map: dict[tuple[int, str], dict] = {}
+        vprof = _visibility_profile_dict(
+            conn, head, officer_rows_by_cik, narr_map
+        )
+        vprof["title"] = "Major shareholder (>5%, S-1 beneficial ownership)"
+        vprof["has_s1_officer"] = False
+        vprof["has_s1_comp"] = False
+        vprof["has_s1_beneficial_owner"] = True
+        vprof["has_summary_comp"] = False
+        # Align pay-signal columns with NEO equity: pre-IPO stake × net $/share from filing when disclosed.
+        est = max(0.0, sig)
+        vprof["equity_hwm"] = est
+        vprof["total_hwm"] = est
+        vprof["signal_hwm"] = est
+        vprof["stock_awards"] = est if est > 0 else None
+        vprof["option_awards"] = None
+        vprof["comp_timeline"] = timeline[:500]
+        vprof["beneficial_stake_only_contact"] = not bool(
+            (row.get("mailing_address") or "").strip()
+        )
+        gem = int(row.get("gem_score") or 0)
+        notes = (row.get("outreach_notes") or "").strip()
+        base_why = why_surfaced_line(
+            str(row.get("filing_form_type") or ""), row.get("filing_date")
+        )
+        extra = f" · Beneficial-owner gem {gem}"
+        if notes:
+            extra += f" · {notes[:180]}"
+        vprof["why_surfaced"] = (base_why + extra)[:500]
+        _annotate_lead_tier_fields(vprof)
+        out.append(vprof)
+    return out
+
+
+def _build_profiles(
+    conn: sqlite3.Connection, *, cik_filter: Optional[str] = None
+) -> list[dict]:
+    """One row per (CIK, person): headline = latest fiscal year; sums + per-year breakdown for drill-down.
+
+    When ``cik_filter`` is set, only rows for that CIK are loaded (used for fast ``/lead`` pages).
+    """
     if not conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='neo_compensation'"
     ).fetchone():
         return []
 
-    cur = conn.execute(
-        """
+    ck_f = (cik_filter or "").strip()
+    neo_sql = """
         SELECT c.person_name, c.role_hint, c.fiscal_year,
                c.salary, c.bonus, c.stock_awards, c.option_awards,
                c.non_equity_incentive, c.pension_change, c.other_comp,
@@ -718,13 +1064,16 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
         FROM neo_compensation c
         JOIN filings f ON f.id = c.filing_id
         """
-    )
+    if ck_f:
+        cur = conn.execute(neo_sql + " WHERE f.cik = ?", (ck_f,))
+    else:
+        cur = conn.execute(neo_sql)
     raw = [dict(r) for r in cur.fetchall()]
     groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for row in raw:
         groups[_profile_key(row["cik"], row["person_name"])].append(row)
 
-    s1_officer_rows = _fetch_s1_officer_join_rows(conn)
+    s1_officer_rows = _fetch_s1_officer_join_rows(conn, ck_f or None)
     s1_officer_keys = {
         _profile_key(r["cik"], r["person_name"]) for r in s1_officer_rows
     }
@@ -737,8 +1086,6 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
         if str(r.get("cik") or "").strip()
     }
     ciks = ciks_neo | ciks_s1
-    if not groups and not s1_officer_rows:
-        return []
 
     narr_map: dict[tuple[int, str], dict] = {}
     fids_neo = {int(r["filing_id"]) for r in raw}
@@ -1089,6 +1436,29 @@ def _build_profiles(conn: sqlite3.Connection) -> list[dict]:
         _annotate_lead_tier_fields(vprof)
         profiles.append(vprof)
 
+    excl_keys = {
+        _profile_key(str(p.get("cik") or "").strip(), p.get("display_name") or "")
+        for p in profiles
+    }
+    for bprof in _beneficial_owner_pipeline_profiles(
+        conn,
+        cik_filter=ck_f or None,
+        exclude_keys=excl_keys,
+        officer_rows_by_cik=officer_rows_by_cik,
+    ):
+        profiles.append(bprof)
+
+    stage_ciks = {
+        str(p.get("cik") or "").strip()
+        for p in profiles
+        if str(p.get("cik") or "").strip()
+    }
+    stage_map = issuer_listing_stage_map(conn, stage_ciks)
+
+    for prof in profiles:
+        ck = str(prof.get("cik") or "").strip()
+        prof["issuer_listing_stage"] = stage_map.get(ck, "unknown")
+
     profiles.sort(key=_desk_sort_tuple, reverse=True)
     return profiles
 
@@ -1101,9 +1471,16 @@ def _lead_desk_filter_profiles(profiles: list[dict]) -> list[dict]:
     """
     s1_only = lead_desk_s1_only()
     us_hq_only = lead_desk_us_registrant_hq_only()
+    incl_beneficial_only = lead_desk_include_beneficial_only_leads()
     out: list[dict] = []
     for p in profiles:
-        if s1_only and not (p.get("has_s1_comp") or p.get("has_s1_officer")):
+        if s1_only and not (
+            p.get("has_s1_comp")
+            or p.get("has_s1_officer")
+            or p.get("has_s1_beneficial_owner")
+        ):
+            continue
+        if not incl_beneficial_only and _is_beneficial_only_lead(p):
             continue
         if us_hq_only and not registrant_hq_line_parses_as_united_states(
             (p.get("issuer_headquarters") or "").strip()
@@ -1156,6 +1533,26 @@ def filter_profiles_pay_band(profiles: list[dict], band: str) -> list[dict]:
     return out
 
 
+def normalize_listing_stage_query(v: object) -> str:
+    """Query param for desk/finder/pipeline: all | pre_ipo | public | unknown."""
+    x = str(v or "all").strip().lower().replace("-", "_")
+    if x in ("pre_ipo", "public", "unknown", "all"):
+        return x
+    return "all"
+
+
+def filter_profiles_listing_stage(profiles: list[dict], listing: str) -> list[dict]:
+    want = normalize_listing_stage_query(listing)
+    if want == "all":
+        return list(profiles)
+    out: list[dict] = []
+    for p in profiles:
+        st = (p.get("issuer_listing_stage") or "unknown").strip().lower()
+        if st == want:
+            out.append(p)
+    return out
+
+
 def _pay_band_nav_html(*, current: str, base_path: str, extra_qs: Optional[dict] = None) -> str:
     """Segment control for desk or finder (preserve non-band query keys)."""
     cur = (current or "all").strip().lower() or "all"
@@ -1185,6 +1582,41 @@ def _pay_band_nav_html(*, current: str, base_path: str, extra_qs: Optional[dict]
         "parsed <abbr title='Summary compensation table'>SCT</abbr> in your DB (best fiscal year "
         "— not household AUM). Same basis as Premium vs Standard tier.</p>"
         "<nav class='pay-band-nav' aria-label='Pay signal band'>" + " · ".join(links) + "</nav></div>"
+    )
+
+
+def _listing_stage_nav_html(
+    *, current: str, base_path: str, extra_qs: Optional[dict] = None
+) -> str:
+    """Tabs for Pre-IPO vs Listed vs Unknown (preserves pay band / finder / pipeline query keys)."""
+    cur = normalize_listing_stage_query(current)
+    extra: dict[str, str] = {}
+    for k, v in (extra_qs or {}).items():
+        if v is None or k == "listing":
+            continue
+        s = str(v).strip()
+        if s:
+            extra[k] = s
+    pairs = [
+        ("all", "All listings"),
+        ("pre_ipo", "Pre-IPO"),
+        ("public", "Listed"),
+        ("unknown", "Unknown"),
+    ]
+    path = (base_path or "/").split("?")[0]
+    links: list[str] = []
+    for key, label in pairs:
+        href = path + "?" + urlencode({**extra, "listing": key})
+        active = " pay-band-tab--active" if key == cur else ""
+        links.append(
+            f'<a class="pay-band-tab{active}" href="{html.escape(href)}">'
+            f"{html.escape(label)}</a>"
+        )
+    return (
+        "<div class='pay-band-wrap' style='margin-top:0.35rem'>"
+        "<p class='pay-band-hint'><strong>Listing stage</strong> — filter by registration vs "
+        "periodic reports in your DB (same as Listing column).</p>"
+        "<nav class='pay-band-nav' aria-label='Listing stage'>" + " · ".join(links) + "</nav></div>"
     )
 
 
@@ -1246,6 +1678,7 @@ def finder_export_csv_bytes(
     q: str,
     all_neo: bool,
     pay_band: str = "all",
+    listing_stage: str = "all",
 ) -> bytes:
     base = profiles_all if all_neo else profiles_desk
     filtered = filter_profiles_geo_industry_text(
@@ -1255,6 +1688,7 @@ def finder_export_csv_bytes(
         text_sub=q,
     )
     filtered = filter_profiles_pay_band(filtered, pay_band)
+    filtered = filter_profiles_listing_stage(filtered, listing_stage)
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(
@@ -1269,6 +1703,7 @@ def finder_export_csv_bytes(
             "latest_total_usd",
             "max_equity_usd",
             "lead_tier",
+            "issuer_listing_stage",
             "profile_path",
             "index_url",
             "primary_doc_url",
@@ -1287,6 +1722,7 @@ def finder_export_csv_bytes(
                 p.get("total") if p.get("total") is not None else "",
                 p.get("equity_hwm") if p.get("equity_hwm") is not None else "",
                 p.get("lead_tier") or _profile_lead_tier(p),
+                (p.get("issuer_listing_stage") or "unknown").strip().lower(),
                 _profile_lead_url(p),
                 p.get("index_url") or "",
                 p.get("primary_doc_url") or "",
@@ -1463,11 +1899,82 @@ def _profile_breakdown_table(p: dict) -> str:
     return "".join(parts)
 
 
-def _profile_lead_compensation_card_html(p: dict) -> str:
+def _profile_beneficial_equity_as_comp_html(
+    p: dict, stake: Optional[dict], *, filing_caveats: str = ""
+) -> str:
+    """
+    Beneficial-only leads: same column layout as SCT comp, with illustrative stake in Stock/Total.
+    """
+    n = None
+    if stake:
+        n = stake.get("notional_usd_est")
+    if n is None:
+        n = p.get("stock_awards")
+    if n is None:
+        n = p.get("equity_hwm")
+    fd = "—"
+    if stake and (stake.get("stake_filing_date") or "").strip():
+        fd = str(stake.get("stake_filing_date") or "").strip()
+    elif (p.get("filing_date") or "").strip():
+        fd = str(p.get("filing_date") or "").strip()
+    fd_e = html.escape(fd)
+    tbl = (
+        "<div class=\"table-wrap lead-comp-table-wrap\"><table class=\"inner-comp lead-comp-breakout\">"
+        "<thead><tr>"
+        '<th scope="col" title="Source">FY</th>'
+        '<th scope="col" title="Salary">Salary</th>'
+        '<th scope="col" title="Bonus">Bonus</th>'
+        '<th scope="col" title="Shares × net $/share (filing)">Stock</th>'
+        '<th scope="col" title="Option awards">Opt.</th>'
+        '<th scope="col" title="Non-equity incentive plan comp">Non-eq.</th>'
+        '<th scope="col" title="Change in pension value">Pens.</th>'
+        '<th scope="col" title="All other compensation">Other</th>'
+        '<th scope="col" title="Total">Total</th>'
+        "</tr></thead><tbody><tr>"
+        "<td class=\"num strong\">S-1</td>"
+        "<td class=\"num\">—</td>"
+        "<td class=\"num\">—</td>"
+        f"<td class=\"num\">{_money(n)}</td>"
+        "<td class=\"num\">—</td>"
+        "<td class=\"num\">—</td>"
+        "<td class=\"num\">—</td>"
+        "<td class=\"num\">—</td>"
+        f"<td class=\"num strong\">{_money(n)}</td>"
+        "</tr></tbody></table></div>"
+    )
+    foot = (
+        '<p class="meta dim lead-comp-foot" style="margin:0.45rem 0 0;font-size:0.78rem;line-height:1.5">'
+        f"Source S-1 filing date: <b>{fd_e}</b>.</p>"
+    )
+    econ = ""
+    if stake:
+        econ = _beneficial_offering_snapshot_html(stake, notional_usd=n)
+    verify = _beneficial_ownership_verify_banner_html(filing_caveats)
+    return (
+        '<div class="lead-comp-breakout-wrap card">'
+        '<h2 class="lead-section-h">Compensation</h2>'
+        f"{verify}"
+        '<p class="meta dim" style="margin:0 0 0.45rem;font-size:0.75rem;line-height:1.45">'
+        "S-1 beneficial ownership — illustrative economics."
+        '<span class="dim" style="display:block;margin-top:0.28rem;font-size:0.7rem">'
+        "Snapshot below: shares, per-share public / fees / net, then estimated dollars "
+        "(matches Stock / Total in the compensation table under it).</span></p>"
+        f"{econ}{tbl}{foot}"
+        "</div>"
+    )
+
+
+def _profile_lead_compensation_card_html(
+    p: dict, beneficial_stake: Optional[dict] = None, *, filing_caveats: str = ""
+) -> str:
     """
     Lead profile: show every stored fiscal year by default (full SCT history).
     Falls back to the single headline row when year_breakdown is empty but comp exists.
     """
+    if _is_beneficial_only_lead(p):
+        return _profile_beneficial_equity_as_comp_html(
+            p, beneficial_stake, filing_caveats=filing_caveats
+        )
     if not p.get("has_summary_comp"):
         return _profile_headline_comp_breakout_html(p)
     yb = p.get("year_breakdown") or []
@@ -1506,21 +2013,75 @@ def _profile_lead_compensation_card_html(p: dict) -> str:
 
 
 def _profile_lead_url(p: dict) -> str:
-    return "/lead?" + urlencode(
-        {"cik": str(p.get("cik") or ""), "name": p.get("display_name") or ""}
+    """Use normalized name in the query string so /lead matches DB person_norm reliably."""
+    nm = (p.get("norm_name") or "").strip() or _norm_person_name(
+        p.get("display_name") or ""
     )
+    return "/lead?" + urlencode({"cik": str(p.get("cik") or ""), "name": nm})
 
 
 def _find_profile(profiles: list[dict], cik: str, norm_name: str) -> Optional[dict]:
     cik_s = str(cik or "").strip()
+    want = (norm_name or "").strip()
     for p in profiles:
-        if str(p.get("cik") or "").strip() == cik_s and p.get("norm_name") == norm_name:
+        if str(p.get("cik") or "").strip() != cik_s:
+            continue
+        if (p.get("norm_name") or "").strip() == want:
+            return p
+    for p in profiles:
+        if str(p.get("cik") or "").strip() != cik_s:
+            continue
+        if _norm_person_name(p.get("display_name") or "") == want:
             return p
     return None
 
 
+def _is_beneficial_only_lead(p: dict) -> bool:
+    """S-1 beneficial-owner pipeline row — not a named exec / officer profile."""
+    return bool(p.get("has_s1_beneficial_owner")) and not bool(p.get("has_s1_officer"))
+
+
+def beneficial_stake_detail_for_profile(
+    conn: sqlite3.Connection, p: dict
+) -> Optional[dict]:
+    """Best beneficial_owner_stake row for this lead (matched by normalized holder name)."""
+    if not _is_beneficial_only_lead(p):
+        return None
+    ck = str(p.get("cik") or "").strip()
+    want = (p.get("norm_name") or "").strip() or _norm_person_name(
+        p.get("display_name") or ""
+    )
+    if not ck or not want:
+        return None
+    best: Optional[dict] = None
+    for r in list_beneficial_owner_stakes_for_cik(conn, ck):
+        d = dict(r)
+        hn = (d.get("holder_name") or "").strip()
+        if _norm_person_name(hn) != want:
+            continue
+        if best is None:
+            best = d
+            continue
+        g1 = int(d.get("gem_score") or 0)
+        g0 = int(best.get("gem_score") or 0)
+        if g1 > g0:
+            best = d
+        elif g1 == g0:
+            try:
+                n1 = float(d.get("notional_usd_est") or 0)
+                n0 = float(best.get("notional_usd_est") or 0)
+            except (TypeError, ValueError):
+                n1 = n0 = 0.0
+            if n1 > n0:
+                best = d
+    return best
+
+
 def _hq_one_line_for_maps(raw: str | None) -> str:
-    """Collapse multiline SEC HQ blocks to one line for map search URLs."""
+    """Same normalized one-line registrant address as the profile HQ (for map search URLs)."""
+    line = hq_principal_office_display_line(raw)
+    if line:
+        return line
     s = (raw or "").strip()
     if not s:
         return ""
@@ -1708,6 +2269,7 @@ def _desk_table(profiles: list[dict], stats: dict) -> str:
             )
         else:
             co_cell = company
+        stage_badge = _issuer_listing_stage_badge_html(p)
         rows.append(
             "<tr class='desk-row' tabindex='0' role='link' "
             f"data-href='{href}'{tip_attr}>"
@@ -1715,6 +2277,7 @@ def _desk_table(profiles: list[dict], stats: dict) -> str:
             f"<td class='profile-name'><a href='{href}'>{nm}</a>{why_cell}</td>"
             f"<td>{title}</td>"
             f"<td class='co-name'>{co_cell}</td>"
+            f"<td>{stage_badge}</td>"
             f"<td><span class='badge'>{badge}</span></td>"
             f"<td class='num strong'>{_money(p['total'])}</td>"
             f"<td class='num'>{_money(p.get('equity_hwm'))}</td>"
@@ -1728,7 +2291,7 @@ def _desk_table(profiles: list[dict], stats: dict) -> str:
     return f"""
   <h2>Lead desk</h2>
   <p class="meta">
-    <b>Person-first pre-IPO leads.</b> Desk = <b>S-1 family</b> profiles: <b>Premium</b> (SCT meets pay bar), <b>Standard</b> (SCT below bar, e.g. many directors), and <b>Visibility</b> (officer/director on S-1, no SCT row in DB). Pay bar (<code>WEALTH_LEADS_LEAD_DESK_MIN_SIGNAL_USD</code>) tiers only — it does not remove rows. <b>Company</b> links to issuer site when parsed, else filing doc. <b>Latest total</b> = headline FY SCT (— if none); <b>Max equity</b> = best single-year stock+options.
+    <b>Person-first leads from S-1-era filings.</b> Desk = <b>S-1 family</b> profiles: <b>Premium</b> (SCT meets pay bar), <b>Standard</b> (SCT below bar, e.g. many directors), and <b>Visibility</b> (officer/director on S-1, no SCT row in DB). <b>Listing</b> uses form types in your DB: <b>Pre-IPO</b> = S-1/F-1 on file but no 10-K/10-Q yet; <b>Public</b> = at least one periodic report (already listed or filing history); <b>Unknown</b> = inconclusive snapshot. Pay bar (<code>WEALTH_LEADS_LEAD_DESK_MIN_SIGNAL_USD</code>) tiers only — it does not remove rows. <b>Company</b> links to issuer site when parsed, else filing doc. <b>Latest total</b> = headline FY SCT (— if none); <b>Max equity</b> = best single-year stock+options.
     <b>Age</b> = stated in the filing, then + full calendar years to today (no birthday in EDGAR text); hover a row for <b>bio + age detail</b>.
     Full narrative + HQ on the profile page.
     <b>Click the row</b> for detail. Raw rows: <b>Source rows</b> below.
@@ -1779,6 +2342,7 @@ def _finder_table(profiles: list[dict]) -> str:
                 age_cell = str(int(oa_row))
             except (TypeError, ValueError):
                 pass
+        st_badge = _issuer_listing_stage_badge_html(p)
         rows_html.append(
             "<tr class='desk-row' tabindex='0' role='link' "
             f"data-href='{href}'>"
@@ -1786,6 +2350,7 @@ def _finder_table(profiles: list[dict]) -> str:
             f"<td class='profile-name'><a href='{href}'>{nm}</a></td>"
             f"<td>{title}</td>"
             f"<td class='co-name'>{company}</td>"
+            f"<td>{st_badge}</td>"
             f"<td class='hq-cell'>{hq_disp}</td>"
             f"<td class='ind-cell'>{ind_disp}</td>"
             f"<td class='num strong'>{_money(p['total'])}</td>"
@@ -1803,6 +2368,7 @@ def _finder_table(profiles: list[dict]) -> str:
     <thead>
       <tr>
         <th>Age</th><th>Person</th><th>Role</th><th>Company</th>
+        <th title="Pre-IPO vs public from form types in your DB">Listing</th>
         <th title="Registrant principal office / HQ from filing text">Registrant HQ</th>
         <th title="SIC or NAICS line when parsed from the filing">Industry (SIC/NAICS)</th>
         <th>Latest total</th><th>Filing</th><th>CIK</th><th>Sources</th>
@@ -1821,12 +2387,14 @@ def _finder_form(
     all_neo: bool,
     export_href: str,
     pay_band: str = "all",
+    listing_stage: str = "all",
     form_action: str = "/finder",
 ) -> str:
     hq_e = html.escape(hq)
     ind_e = html.escape(industry)
     q_e = html.escape(q)
     band_e = html.escape((pay_band or "all").strip() or "all")
+    list_e = html.escape(normalize_listing_stage_query(listing_stage))
     action_e = html.escape(form_action)
     return f"""
   <div class="card" style="margin-bottom:1rem">
@@ -1834,6 +2402,7 @@ def _finder_form(
     <p class="meta" style="margin-top:0">Filter by <b>registrant location</b> (HQ address text) and <b>SIC/NAICS</b> (parsed code line from the filing, if any) plus issuer summary text. All matching is substring, case-insensitive.</p>
     <form method="get" action="{action_e}" style="max-width:40rem">
       <input type="hidden" name="band" value="{band_e}"/>
+      <input type="hidden" name="listing" value="{list_e}"/>
       <label class="sr" for="hq">Registrant HQ contains</label>
       <input type="search" id="hq" name="hq" placeholder="e.g. California, Austin, 94105" value="{hq_e}" style="width:100%;max-width:100%;margin-bottom:0.5rem"/>
       <label class="sr" for="industry">SIC / NAICS or summary contains</label>
@@ -1861,21 +2430,30 @@ def _page_finder(
     all_neo: bool,
     base_count: int,
     pay_band: str = "all",
+    listing_stage: str = "all",
     nav_base_path: str = "/finder",
     form_action: str = "/finder",
     desk_href: str = "/",
     export_path: str = "/export/finder.csv",
 ) -> str:
     banner = _stats_banner(stats, rendered_at)
+    list_cur = normalize_listing_stage_query(listing_stage)
+    finder_extra = {
+        "hq": hq,
+        "industry": industry,
+        "q": q,
+        **({"all_neo": "1"} if all_neo else {}),
+        **({} if list_cur == "all" else {"listing": list_cur}),
+    }
     band_nav = _pay_band_nav_html(
         current=pay_band,
         base_path=nav_base_path,
-        extra_qs={
-            "hq": hq,
-            "industry": industry,
-            "q": q,
-            **({"all_neo": "1"} if all_neo else {}),
-        },
+        extra_qs=finder_extra,
+    )
+    listing_nav = _listing_stage_nav_html(
+        current=list_cur,
+        base_path=nav_base_path,
+        extra_qs={**finder_extra, "band": (pay_band or "all").strip() or "all"},
     )
     css = _shared_css()
     extra_css = """
@@ -1890,6 +2468,7 @@ def _page_finder(
             "q": q or "",
             "band": (pay_band or "all").strip() or "all",
             **({"all_neo": "1"} if all_neo else {}),
+            **({} if list_cur == "all" else {"listing": list_cur}),
         }
     )
     export_href = export_path + "?" + exp_q
@@ -1900,11 +2479,12 @@ def _page_finder(
         all_neo=all_neo,
         export_href=export_href,
         pay_band=pay_band,
+        listing_stage=list_cur,
         form_action=form_action,
     )
     tbl = _finder_table(profiles)
     scope = (
-        f"<p class='meta'>Showing <b>{len(profiles)}</b> row(s) after HQ / SIC·NAICS·summary / text filters and pay-signal band. "
+        f"<p class='meta'>Showing <b>{len(profiles)}</b> row(s) after HQ / SIC·NAICS·summary / text, pay-signal band, and listing stage. "
         f"Universe before filters: <b>{base_count}</b> "
         f"({'all in database' if all_neo else 'after lead-desk S-1-context filters'}).</p>"
     )
@@ -1926,6 +2506,7 @@ def _page_finder(
   </p>
   {banner}
   {band_nav}
+  {listing_nav}
   {form}
   {scope}
   {tbl}
@@ -2144,6 +2725,9 @@ def _shared_css() -> str:
     .badge-tier-premium { background: #15251c; color: #56d364; border-color: #2a6a3f; }
     .badge-tier-standard { background: #1e2515; color: #d4a72c; border-color: #5c4f2a; }
     .badge-tier-visibility { background: #22252c; color: #a8b0ba; border-color: #3d424d; }
+    .badge-listing-pre_ipo { background: #1a1e28; color: #79c0ff; border-color: #3d5280; }
+    .badge-listing-public { background: #1e2220; color: #8ddb9a; border-color: #2d4d3a; }
+    .badge-listing-unknown { background: #22252c; color: #8b96a3; border-color: #3d424d; }
     p.lead-tier-strip { margin-top: 0.35rem; margin-bottom: 0.5rem; }
     .client-research-card { border-color: #316d9a; background: linear-gradient(180deg, #141c24 0%, #121820 100%); }
     .client-research-card h2 { color: #79c0ff; }
@@ -2221,6 +2805,119 @@ def _shared_css() -> str:
     details.audit summary:hover { color: #c5ccd4; }
     body.lead-profile-page { max-width: 1180px; }
     .lead-page-header { margin-bottom: 1rem; padding-bottom: 0.85rem; border-bottom: 1px solid #2a3340; }
+    .lead-beneficial-verify {
+      margin: 0 0 0.55rem 0;
+      padding: 0.5rem 0.65rem;
+      border-radius: 5px;
+      border: 1px solid #5c4a2a;
+      background: linear-gradient(180deg, #1a1610 0%, #14120e 100%);
+      font-size: 0.74rem;
+      line-height: 1.45;
+      color: #d4c4a8;
+    }
+    .lead-beneficial-verify-p { margin: 0; }
+    .lead-beneficial-verify-llm {
+      margin: 0.45rem 0 0 0;
+      padding-top: 0.45rem;
+      border-top: 1px solid #3d3428;
+      color: #c5b896;
+      font-size: 0.72rem;
+      line-height: 1.4;
+    }
+    p.lead-important-people-beneficial-note {
+      margin: 0 0 0.5rem 0;
+      padding: 0.45rem 0.55rem;
+      border-radius: 4px;
+      border-left: 3px solid #316d9a;
+      background: #121a22;
+      font-size: 0.74rem;
+      line-height: 1.45;
+      color: #b8c5d4;
+    }
+    .lead-beneficial-offering-wrap {
+      margin: 0 0 0.45rem 0;
+      display: inline-block;
+      max-width: 100%;
+      vertical-align: top;
+    }
+    table.lead-beneficial-offering-snap {
+      border-collapse: collapse;
+      font-size: 0.72rem;
+      width: auto;
+      min-width: 15.5rem;
+      max-width: 22rem;
+      border: 1px solid #2a3340;
+      border-radius: 4px;
+      background: #0f141a;
+    }
+    table.lead-beneficial-offering-snap caption.lead-beneficial-offering-cap {
+      caption-side: top;
+      text-align: left;
+      padding: 0 0 0.28rem 0;
+      margin: 0;
+      font-size: 0.6rem;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: #6b7785;
+      font-weight: 600;
+    }
+    table.lead-beneficial-offering-snap thead th {
+      background: #0c1016;
+      border-bottom: 1px solid #2a3340;
+      font-size: 0.58rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #7a8796;
+      padding: 0.18rem 0.3rem;
+      font-weight: 600;
+    }
+    table.lead-beneficial-offering-snap thead th.lead-beneficial-snap-col {
+      text-transform: none;
+      letter-spacing: 0.02em;
+      font-size: 0.62rem;
+      color: #9aa3b0;
+    }
+    table.lead-beneficial-offering-snap th.lead-beneficial-snap-void {
+      width: 2.15rem;
+      min-width: 2.15rem;
+      border-right: 1px solid #1e2830;
+    }
+    table.lead-beneficial-offering-snap tbody th.lead-beneficial-snap-row {
+      text-align: left;
+      font-weight: 500;
+      color: #8b96a3;
+      padding: 0.18rem 0.35rem;
+      border-right: 1px solid #1e2830;
+      white-space: nowrap;
+      vertical-align: middle;
+      background: transparent;
+    }
+    table.lead-beneficial-offering-snap tbody td {
+      padding: 0.18rem 0.32rem;
+      vertical-align: middle;
+    }
+    table.lead-beneficial-offering-snap tbody tr + tr:not(.lead-beneficial-snap-total) th[scope="row"],
+    table.lead-beneficial-offering-snap tbody tr + tr:not(.lead-beneficial-snap-total) td {
+      border-top: 1px solid #1a2228;
+    }
+    table.lead-beneficial-offering-snap td.num {
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+      font-size: 0.74rem;
+    }
+    table.lead-beneficial-offering-snap .lead-beneficial-snap-em {
+      color: #9fd0f0;
+      font-weight: 600;
+    }
+    table.lead-beneficial-offering-snap tr.lead-beneficial-snap-total td.num {
+      font-weight: 600;
+      color: #e8ecf0;
+      font-size: 0.78rem;
+    }
+    table.lead-beneficial-offering-snap tr.lead-beneficial-snap-total th,
+    table.lead-beneficial-offering-snap tr.lead-beneficial-snap-total td {
+      border-top: 1px solid #2f3d4d;
+    }
     .lead-section-h {
       font-size: 0.95rem; font-weight: 600; margin: 0 0 0.5rem 0; color: #e8ecf0; letter-spacing: -0.01em;
     }
@@ -2377,11 +3074,26 @@ def _page_desk(
     rendered_at: str,
     *,
     pay_band: str = "all",
+    listing_stage: str = "all",
     nav_base_path: str = "/",
     desk_universe_count: Optional[int] = None,
 ) -> str:
     banner = _stats_banner(stats, rendered_at)
-    band_nav = _pay_band_nav_html(current=pay_band, base_path=nav_base_path)
+    list_cur = normalize_listing_stage_query(listing_stage)
+    desk_extra = {**({} if list_cur == "all" else {"listing": list_cur})}
+    band_nav = _pay_band_nav_html(
+        current=pay_band,
+        base_path=nav_base_path,
+        extra_qs=desk_extra,
+    )
+    listing_nav = _listing_stage_nav_html(
+        current=list_cur,
+        base_path=nav_base_path,
+        extra_qs={
+            "band": (pay_band or "all").strip() or "all",
+            **desk_extra,
+        },
+    )
     if (
         desk_universe_count is not None
         and (pay_band or "all").strip().lower() != "all"
@@ -2410,6 +3122,7 @@ def _page_desk(
   </p>
   {banner}
   {band_nav}
+  {listing_nav}
   {band_counts}
   {_comp_missing_callout(stats)}
   <label class="sr" for="filter">Filter desk + audit tables</label>
@@ -2557,12 +3270,8 @@ def _issuer_snapshot_card_html(snap: dict) -> str:
     )
 
 
-def _lead_company_public_card_html(
-    p: dict,
-    *,
-    roster_stats: Optional[dict] = None,
-) -> str:
-    """Company panel: HQ, website, referral breadth (no SIC/NAICS — often blank or noisy)."""
+def _lead_company_public_card_html(p: dict) -> str:
+    """Company panel: HQ, website (no SIC/NAICS — often blank or noisy)."""
     co = html.escape(p.get("company_name") or "—")
     cik = html.escape(str(p.get("cik") or ""))
     web_raw = (p.get("issuer_website") or "").strip()
@@ -2593,25 +3302,11 @@ def _lead_company_public_card_html(
     else:
         addr_dd = "<span class='dim'>—</span>"
 
-    ref_dd = "<span class='dim'>—</span>"
-    if roster_stats:
-        u = int(roster_stats.get("unique_people") or 0)
-        if u > 0:
-            ref_tip = (
-                "Distinct officer/director names deduped from filing tables — sizing hint only, "
-                "not wealth verification."
-            )
-            ref_dd = (
-                f'<span title="{html.escape(ref_tip, quote=True)}">'
-                f"<strong>{u}</strong> potential high-value referrals</span>"
-            )
-
     rows: list[tuple[str, str]] = [
         ("Company", f"<strong>{co}</strong>"),
         ("CIK", f'<span class="cik">{cik}</span>'),
         ("Website", web_dd),
         ("Headquarters", addr_dd),
-        ("Potential referrals", ref_dd),
     ]
     dl_parts = [
         f"<dt>{html.escape(label)}</dt><dd>{inner}</dd>" for label, inner in rows
@@ -2628,6 +3323,81 @@ def _lead_company_public_card_html(
     )
 
 
+def _outreach_for_lead_page(
+    cr: Optional[dict],
+    *,
+    display_name: str,
+    issuer_website: str,
+) -> tuple[dict, bool]:
+    """
+    Outreach JSON from ``lead_client_research``, merged with hostname-based email
+    patterns when the DB row has no ``candidates`` (e.g. enrich never run).
+
+    Returns ``(outreach_dict, used_hostname_patterns)``.
+    """
+    base: dict[str, Any] = {}
+    if cr:
+        raw = cr.get("outreach_json")
+        if raw:
+            try:
+                base = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            except json.JSONDecodeError:
+                base = {}
+    if base.get("error"):
+        base = {}
+    verify = email_smtp_verify_enabled()
+    mail_from = email_smtp_mail_from()
+    lim = email_smtp_probe_max_candidates()
+    if base.get("candidates"):
+        if not verify:
+            return base, False
+        merged = dict(base)
+        cands = [dict(x) for x in (merged.get("candidates") or [])]
+        try:
+            merged["candidates"] = apply_smtp_probes_to_candidates(
+                cands, mail_from=mail_from, max_probes=lim
+            )
+        except Exception:
+            merged["candidates"] = cands
+        return merged, False
+    try:
+        fb = outreach_pattern_pack_from_website(
+            display_name,
+            issuer_website,
+            verify_smtp=verify,
+            mail_from=mail_from,
+            max_smtp_probes=lim,
+        )
+    except Exception:
+        fb = {}
+    if not fb:
+        return base, False
+    merged = dict(fb)
+    if base.get("emails_on_site"):
+        merged["emails_on_site"] = base["emails_on_site"]
+    ds = str(base.get("domain_source") or "")
+    if base.get("domain") and "issuer site" in ds:
+        merged["domain"] = base["domain"]
+        merged["domain_source"] = base["domain_source"]
+    return merged, True
+
+
+def _outreach_sort_candidates(
+    cands: list[dict], on_site: list
+) -> list[dict]:
+    """On-site matches first, then non-rejected guesses, then SMTP reject (deprioritize)."""
+    on_low = {str(e).strip().lower() for e in on_site if e}
+
+    def key(c: dict) -> tuple[int, int, str]:
+        em = (c.get("email") or "").strip().lower()
+        st = (c.get("smtp_status") or "").strip().lower()
+        listed = 0 if em in on_low else 1
+        rejected = 1 if st == "reject" else 0
+        return (listed, rejected, em)
+
+    return sorted(cands, key=key)
+
+
 def _outreach_email_block_html(outreach: dict) -> str:
     if not outreach or outreach.get("error"):
         return ""
@@ -2638,52 +3408,117 @@ def _outreach_email_block_html(outreach: dict) -> str:
     bits: list[str] = []
     if dom:
         bits.append(
-            f"<p class='meta' style='margin-top:0;margin-bottom:0.35rem'><strong>Corporate mail domain (hint):</strong> "
+            f"<p class='meta' style='margin-top:0;margin-bottom:0.25rem'><strong>Mail domain</strong> "
             f"<code>{html.escape(dom)}</code>"
-            f"{(' — ' + html.escape(dsrc)) if dsrc else ''}</p>"
+            f"{(' · ' + html.escape(dsrc)) if dsrc else ''}</p>"
         )
     if on_site:
         esc = ", ".join(html.escape(x) for x in on_site[:8])
-        bits.append(f"<p class='meta' style='margin-bottom:0.35rem'><strong>Addresses seen on site:</strong> {esc}</p>")
+        bits.append(f"<p class='meta' style='margin-bottom:0.25rem'><strong>On website</strong> {esc}</p>")
     if not cands:
         return "".join(bits)
+    top_n = email_hypothesis_top_n()
+    on_low = {str(e).strip().lower() for e in on_site if e}
     rows = []
-    for c in cands:
-        em = html.escape(c.get("email") or "")
+    for c in _outreach_sort_candidates(cands, on_site)[:top_n]:
+        raw_em = (c.get("email") or "").strip()
+        em_low = raw_em.lower()
+        em = html.escape(raw_em)
+        badge = ""
+        if em_low in on_low:
+            badge = "<br/><span class='dim' style='font-size:0.68rem'>Matches site</span>"
         st = html.escape(str(c.get("smtp_status") or "—"))
         det = html.escape(str(c.get("smtp_detail") or "")[:120])
-        rows.append(f"<tr><td><code>{em}</code></td><td>{st}</td><td class='dim'>{det}</td></tr>")
+        rows.append(
+            f"<tr><td><code>{em}</code>{badge}</td><td>{st}</td><td class='dim'>{det}</td></tr>"
+        )
     bits.append(
-        "<p class='meta' style='margin:0.5rem 0 0.25rem'><strong>Suggested address patterns</strong> "
-        "<span class='dim'>(SMTP hints are often wrong; verify before sending)</span></p>"
+        f"<p class='meta' style='margin:0.5rem 0 0.2rem'><strong>Top picks</strong> "
+        f"<span class='dim'>(≤{top_n}; domain patterns — not inbox proof)</span></p>"
         '<div class="table-wrap"><table class="outreach-email-table"><thead><tr>'
         "<th>Email</th><th>Check</th><th>Detail</th></tr></thead><tbody>"
         + "".join(rows)
         + "</tbody></table></div>"
+        "<details class='meta dim' style='margin:0.35rem 0 0;font-size:0.7rem;line-height:1.4'>"
+        "<summary>What the check means</summary>"
+        "<p style='margin:0.35rem 0 0'>"
+        "<strong>reject</strong> / <strong>uncertain</strong> = weak SMTP signal only. "
+        "On-site addresses (above) beat guesses. "
+        f"Tweak list size: <code>WEALTH_LEADS_EMAIL_TOP_PICKS</code>."
+        "</p></details>"
     )
     return "".join(bits)
 
 
 def _client_research_card_html(
-    cr: Optional[dict], *, issuer_website: str = ""
+    cr: Optional[dict],
+    *,
+    issuer_website: str = "",
+    display_name: str = "",
+    beneficial_only: bool = False,
+    filing_mailing_address: str = "",
+    filing_doc_url: str = "",
+    filing_mailing_anchor: str = "",
 ) -> str:
+    if beneficial_only:
+        outreach_merged, pattern_fallback = {}, False
+    else:
+        outreach_merged, pattern_fallback = _outreach_for_lead_page(
+            cr,
+            display_name=(display_name or "").strip(),
+            issuer_website=(issuer_website or "").strip(),
+        )
+
+    addr_block = ""
+    if beneficial_only:
+        addr_head = (filing_mailing_address or "").strip()
+        if addr_head:
+            addr_block = (
+                '<h3 class="advisor-subh" style="margin-top:0">Mailing address (filing footnote)</h3>'
+                + _beneficial_mailing_paragraph_html(
+                    addr_head, filing_doc_url, filing_mailing_anchor
+                )
+            )
+        else:
+            addr_block = (
+                "<p class='meta dim' style='margin-bottom:0.75rem'>"
+                "No street-style address parsed from the beneficial-ownership footnotes yet.</p>"
+            )
+
+    panel_h2 = "Filing contact clues" if beneficial_only else "Outreach"
+
     if cr is None:
+        if beneficial_only:
+            return (
+                '<div class="card client-research-card lead-outreach-panel lead-beneficial-clues">'
+                f'<h2 class="lead-section-h">{panel_h2}</h2>'
+                f"{addr_block}"
+                '<p class="meta dim" style="margin-top:0;font-size:0.78rem;margin-bottom:0">'
+                "Major shareholders are not in the issuer's officer directory — we omit company email guesses. "
+                "Use the filing address when present, or other intro paths.</p>"
+                "</div>"
+            )
+        oh = _outreach_email_block_html(outreach_merged)
+        extra = ""
+        if oh and (outreach_merged.get("candidates") or []):
+            extra = (
+                '<p class="meta dim" style="margin-top:0.5rem;margin-bottom:0.25rem;font-size:0.78rem">'
+                "Domain-based guesses; <code>enrich-client-research</code> adds site-scraped emails and photo."
+                "</p>"
+                '<h3 class="advisor-subh">Email guesses</h3>'
+                f"{oh}"
+            )
         return (
             '<div class="card client-research-card lead-outreach-panel">'
-            '<h2 class="lead-section-h">Background &amp; outreach</h2>'
+            f'<h2 class="lead-section-h">{panel_h2}</h2>'
             '<p class="meta" style="margin-bottom:0">'
-            "<span class='dim'>Not generated yet.</span> Run <code>enrich-client-research</code> for photo, story, links, and email hints."
-            "</p></div>"
+            "<span class='dim'>No site scrape yet.</span> <code>enrich-client-research</code> → photo, bio, stronger email hints."
+            "</p>"
+            f"{extra}</div>"
         )
     st = (cr.get("status") or "").strip()
     person_story = (cr.get("person_story") or "").strip()
-    outreach: dict = {}
-    raw_o = cr.get("outreach_json")
-    if raw_o:
-        try:
-            outreach = json.loads(raw_o) if isinstance(raw_o, str) else (raw_o or {})
-        except json.JSONDecodeError:
-            outreach = {}
+    outreach: dict = outreach_merged
 
     summ = html.escape((cr.get("research_summary") or "").strip())
     bio = html.escape((cr.get("bio_website") or "").strip())
@@ -2723,7 +3558,7 @@ def _client_research_card_html(
     story_html = ""
     if person_story:
         story_html = (
-            '<h3 class="advisor-subh" style="margin-top:0">Advisor-ready story</h3>'
+            '<h3 class="advisor-subh" style="margin-top:0">At a glance</h3>'
             f'<p class="person-story-prose">{html.escape(person_story)}</p>'
         )
 
@@ -2732,7 +3567,7 @@ def _client_research_card_html(
         body_parts.append(story_html)
     if summ:
         body_parts.append(
-            f'<h3 class="advisor-subh">Website pull (short)</h3><p class="meta">{summ}</p>'
+            f'<h3 class="advisor-subh">From their site</h3><p class="meta">{summ}</p>'
         )
     if bio and not person_story:
         body_parts.append(f"<p class='meta' style='margin-bottom:0'>{bio}</p>")
@@ -2756,15 +3591,26 @@ def _client_research_card_html(
     links_html = ""
     if links:
         links_html = (
-            '<h3 class="advisor-subh">How to find them</h3>'
+            '<h3 class="advisor-subh">Links</h3>'
             '<div class="client-research-links">'
             + " · ".join(links)
             + "</div>"
         )
 
-    outreach_html = _outreach_email_block_html(outreach)
-    if outreach_html:
-        outreach_html = '<h3 class="advisor-subh">Contact hypotheses</h3>' + outreach_html
+    outreach_html = ""
+    if not beneficial_only:
+        outreach_html = _outreach_email_block_html(outreach)
+        if outreach_html:
+            pre = ""
+            if pattern_fallback:
+                _cap = email_smtp_probe_max_candidates()
+                pre = (
+                    '<p class="meta dim" style="margin-top:0;margin-bottom:0.25rem;font-size:0.78rem">'
+                    f"Patterns from filing website · SMTP check (≤{_cap}/load) · "
+                    "<code>WEALTH_LEADS_EMAIL_SMTP_VERIFY=0</code> to skip"
+                    "</p>"
+                )
+            outreach_html = pre + '<h3 class="advisor-subh">Email guesses</h3>' + outreach_html
 
     err_html = ""
     if err and st in ("partial", "error", "skipped"):
@@ -2772,21 +3618,327 @@ def _client_research_card_html(
 
     status_note = ""
     if st == "partial":
-        status_note = "<p class='meta dim' style='margin-top:0.35rem'>Partial — verify on issuer site.</p>"
+        status_note = "<p class='meta dim' style='margin-top:0.35rem;font-size:0.78rem'>Partial scrape — spot-check on live site.</p>"
     elif st == "skipped" and (person_story or outreach_html):
-        status_note = "<p class='meta dim' style='margin-top:0.35rem'>No company website; S-1 story / domain hints may still apply.</p>"
+        status_note = "<p class='meta dim' style='margin-top:0.35rem;font-size:0.78rem'>No issuer URL — filing/ domain hints only.</p>"
 
-    inner = photo_html + "".join(body_parts) + links_html + outreach_html + err_html + status_note
+    inner = (
+        addr_block
+        + photo_html
+        + "".join(body_parts)
+        + links_html
+        + outreach_html
+        + err_html
+        + status_note
+    )
+    if beneficial_only:
+        inner += (
+            '<p class="meta dim" style="margin-top:0.65rem;font-size:0.78rem;margin-bottom:0">'
+            "Company email guesses are hidden for major shareholders — they are rarely in the registrant directory.</p>"
+        )
     if not inner.strip():
         inner = (
-            "<p class='meta dim' style='margin-bottom:0'>No website match yet.</p>" + links_html + outreach_html
+            "<p class='meta dim' style='margin-bottom:0'>No site enrichment yet.</p>" + links_html + outreach_html
         )
 
+    panel_cls = (
+        "card client-research-card lead-outreach-panel lead-beneficial-clues"
+        if beneficial_only
+        else "card client-research-card lead-outreach-panel"
+    )
     return (
-        '<div class="card client-research-card lead-outreach-panel">'
-        '<h2 class="lead-section-h">Background &amp; outreach</h2>'
+        f'<div class="{panel_cls}">'
+        f'<h2 class="lead-section-h">{panel_h2}</h2>'
         f"{inner}"
         "</div>"
+    )
+
+
+def _beneficial_outreach_shareholders_card_html(rows: Optional[list[dict]]) -> str:
+    """Company column: same table pattern as summary comp — illustrative stake, %, address, filing."""
+    if not rows:
+        return ""
+    econ_hdr = _beneficial_offering_snapshot_html(rows[0], include_holder_shares=False)
+    body: list[str] = [
+        "<thead><tr>",
+        '<th scope="col">Name</th>',
+        '<th scope="col" title="Pre-offering shares from beneficial ownership table">Shares</th>',
+        '<th scope="col" title="Shares × net $/share from filing when underwriting is parsed (illustrative)">'
+        "Illustrative value</th>",
+        '<th scope="col" title="Percent beneficial per table">%</th>',
+        '<th scope="col">Mailing / footnote address</th>',
+        '<th scope="col">Filing date</th>',
+        "</tr></thead><tbody>",
+    ]
+    for g in rows:
+        nm_raw = str(g.get("holder_name") or "").strip()
+        nm = html.escape(nm_raw)
+        notes = (g.get("outreach_notes") or "").strip()
+        title_attr = (
+            f' title="{html.escape(notes[:420] + ("…" if len(notes) > 420 else ""), quote=True)}"'
+            if notes
+            else ""
+        )
+        sh_raw = g.get("shares_before_offering")
+        if sh_raw is not None:
+            try:
+                sh_cell = f'<td class="num">{float(sh_raw):,.0f}</td>'
+            except (TypeError, ValueError):
+                sh_cell = '<td class="num dim">—</td>'
+        else:
+            sh_cell = '<td class="num dim">—</td>'
+        val_cell = f"<td class=\"num strong\">{_money(g.get('notional_usd_est'))}</td>"
+        pct_cell = f"<td class=\"num\">{_beneficial_pct_cell(g.get('pct_beneficial'))}</td>"
+        addr = (g.get("mailing_address") or "").strip()
+        doc_u = (g.get("stake_primary_doc_url") or "").strip()
+        ma = (g.get("mailing_footnote_doc_anchor") or "").strip()
+        if addr:
+            ae = html.escape(addr.replace("\r\n", "\n"))
+            mu = filing_doc_url_with_fragment(doc_u, ma) if doc_u and ma else ""
+            if mu:
+                addr_cell = (
+                    f"<td class=\"num\" style=\"max-width:14rem;font-size:0.82rem;"
+                    f'white-space:pre-line;line-height:1.35;word-break:break-word">'
+                    f'<a href="{html.escape(mu)}" target="_blank" rel="noopener" '
+                    f'title="Filing footnote">{ae}</a></td>'
+                )
+            else:
+                addr_cell = (
+                    f"<td class=\"num\" style=\"max-width:14rem;font-size:0.82rem;"
+                    f'white-space:pre-line;line-height:1.35;word-break:break-word">{ae}</td>'
+                )
+        else:
+            addr_cell = "<td class=\"dim\">—</td>"
+        fd = html.escape(str(g.get("stake_filing_date") or "—"))
+        fil_cell = f'<td class="num">{fd}</td>'
+        body.append(
+            "<tr>"
+            f"<td><strong{title_attr}>{nm}</strong></td>"
+            f"{sh_cell}{val_cell}{pct_cell}{addr_cell}{fil_cell}</tr>"
+        )
+    body.append("</tbody>")
+    tbl = (
+        '<div class="table-wrap lead-comp-table-wrap">'
+        '<table class="inner-comp lead-comp-breakout">'
+        + "".join(body)
+        + "</table></div>"
+    )
+    foot = (
+        '<p class="meta dim lead-comp-foot" style="font-size:0.78rem;line-height:1.45;margin:0.4rem 0 0">'
+        '<span title="Filing-only illustration; not a solicitation.">'
+        "Illustrative S-1 positions. Natural-person holders with address or material stake; excludes funds and "
+        "entities.</span></p>"
+    )
+    return (
+        '<div class="lead-comp-breakout-wrap card lead-beneficial-gems">'
+        '<h2 class="lead-section-h">Individual shareholders</h2>'
+        '<p class="meta dim" style="margin:0 0 0.45rem;font-size:0.75rem;line-height:1.45">'
+        "Outreach-oriented names on this issuer."
+        '<span class="dim" style="display:block;margin-top:0.28rem;font-size:0.7rem">'
+        "The per-share snapshot below applies to every row in the table under it.</span></p>"
+        f"{econ_hdr}{tbl}{foot}</div>"
+    )
+
+
+def _latest_filing_snapshot_caveats_for_cik(conn: sqlite3.Connection, cik: str) -> str:
+    """LLM ``filing_snapshot_caveats`` from newest stored ``s1_llm_lead_pack`` for this issuer."""
+    ck = (cik or "").strip()
+    if not ck:
+        return ""
+    try:
+        r = conn.execute(
+            """
+            SELECT s1_llm_lead_pack FROM filings
+            WHERE cik = ? AND s1_llm_lead_pack IS NOT NULL
+              AND TRIM(s1_llm_lead_pack) != ''
+            ORDER BY COALESCE(filing_date, '') DESC, id DESC
+            LIMIT 1
+            """,
+            (ck,),
+        ).fetchone()
+    except sqlite3.Error:
+        return ""
+    if not r:
+        return ""
+    raw = (r["s1_llm_lead_pack"] or "").strip()
+    if not raw:
+        return ""
+    try:
+        pack = json.loads(raw)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(pack, dict):
+        return ""
+    cav = pack.get("filing_snapshot_caveats")
+    if cav is None:
+        return ""
+    return str(cav).strip()[:1500]
+
+
+def _beneficial_ownership_verify_banner_html(llm_caveats: object) -> str:
+    caveats_block = ""
+    cav_txt = (
+        llm_caveats.strip()
+        if isinstance(llm_caveats, str)
+        else ("" if llm_caveats is None else str(llm_caveats))
+    ).strip()
+    if cav_txt:
+        caveats_block = (
+            '<p class="lead-beneficial-verify-llm"><strong>Latest S-1 AI excerpt also noted:</strong> '
+            f"{html.escape(cav_txt)}</p>"
+        )
+    return (
+        '<div class="lead-beneficial-verify" role="note">'
+        "<p class=\"lead-beneficial-verify-p\"><strong>Verify before advising.</strong> "
+        "Share counts and dollars here are a <em>registration-statement snapshot</em> "
+        "(beneficial-ownership table × assumed offering math). They do <strong>not</strong> "
+        "reflect later corporate actions (e.g. reverse splits), distress or bankruptcy, "
+        "market prices, dilution, or legal / regulatory / criminal matters that can change "
+        "economic reality. Confirm the <strong>current</strong> cap table, 8-Ks, and other public "
+        "sources before any client conversation.</p>"
+        f"{caveats_block}"
+        "</div>"
+    )
+
+
+def _latest_important_people_from_s1_llm_pack(
+    conn: sqlite3.Connection, cik: str
+) -> list[dict]:
+    """``important_people`` from latest ``filings.s1_llm_lead_pack`` (enrich-s1-ai)."""
+    ck = (cik or "").strip()
+    if not ck:
+        return []
+    try:
+        r = conn.execute(
+            """
+            SELECT s1_llm_lead_pack FROM filings
+            WHERE cik = ? AND s1_llm_lead_pack IS NOT NULL
+              AND TRIM(s1_llm_lead_pack) != ''
+            ORDER BY COALESCE(filing_date, '') DESC, id DESC
+            LIMIT 1
+            """,
+            (ck,),
+        ).fetchone()
+    except sqlite3.Error:
+        return []
+    if not r:
+        return []
+    raw = (r["s1_llm_lead_pack"] or "").strip()
+    if not raw:
+        return []
+    try:
+        pack = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(pack, dict):
+        return []
+    ip = pack.get("important_people")
+    if not isinstance(ip, list):
+        return []
+    out: list[dict] = []
+    for x in ip:
+        if not isinstance(x, dict) or not (str(x.get("name") or "").strip()):
+            continue
+        try:
+            out.append(dict(x))
+        except (TypeError, ValueError):
+            continue
+    return out[:40]
+
+
+def _important_people_beneficial_lead_note_html(beneficial_only: bool) -> str:
+    """Callout when the lead is beneficial-only: AI card is supplementary to the comp snapshot."""
+    if not beneficial_only:
+        return ""
+    return (
+        '<p class="lead-important-people-beneficial-note">'
+        "<strong>Major-shareholder lead:</strong> This is <em>supplementary</em> S-1 excerpt context from "
+        "<code>enrich-s1-ai</code> — not a second source of truth. Use the <strong>Compensation</strong> "
+        "card for stake math; use this for relationships, footnotes, and planning hooks. The LLM only saw "
+        "a window of the filing; reverse splits, distress, and post-filing events may be missing — see the "
+        "yellow verify box above the snapshot.</p>"
+    )
+
+
+def _important_people_s1_ai_card_html(
+    people: Optional[list[dict]], *, beneficial_only: bool = False
+) -> str:
+    """LLM-curated individuals (spouses, beneficial owners, etc.) from ``enrich-s1-ai``."""
+    if not isinstance(people, list):
+        people = []
+    note = _important_people_beneficial_lead_note_html(beneficial_only)
+    if not people:
+        return (
+            '<div class="card lead-important-people-ai">'
+            '<h2 class="lead-section-h">Important people (S-1 AI)</h2>'
+            f"{note}"
+            '<p class="meta dim" style="margin:0">'
+            "No AI extract yet. Run <code>python -m wealth_leads enrich-s1-ai</code> on this issuer’s S-1 "
+            "so the model can list beneficial owners, spouses, and footnotes — not only named executives."
+            "</p></div>"
+        )
+    items: list[str] = []
+    for pe in people[:20]:
+        nm = html.escape(str(pe.get("name") or ""))
+        cat = html.escape(str(pe.get("category") or "").replace("_", " "))
+        rel = (pe.get("relationship_to_company_or_insider") or "").strip()
+        sh = (pe.get("shares_disclosed") or "").strip()
+        own = (pe.get("ownership_or_interest_text") or "").strip()
+        implied = (pe.get("implied_value_at_offering_text") or "").strip()
+        addr = (pe.get("disclosed_address") or "").strip()
+        hook = (pe.get("wealth_or_planning_hook") or "").strip()
+        src = (pe.get("source_hint") or "").strip()
+        bits: list[str] = []
+        if rel:
+            bits.append(html.escape(rel[:500] + ("…" if len(rel) > 500 else "")))
+        if sh:
+            bits.append(
+                "<span class='dim'>Shares (filing):</span> "
+                + html.escape(sh[:180] + ("…" if len(sh) > 180 else ""))
+            )
+        if own:
+            bits.append(
+                "<span class='dim'>Interest:</span> "
+                + html.escape(own[:400] + ("…" if len(own) > 400 else ""))
+            )
+        if implied:
+            bits.append(
+                "<span class='dim'>Illustrative at offering price (from excerpt):</span> "
+                "<strong>"
+                + html.escape(implied[:500] + ("…" if len(implied) > 500 else ""))
+                + "</strong>"
+            )
+        if addr:
+            bits.append(
+                "<span class='dim'>Address (filing):</span> "
+                + html.escape(addr[:300] + ("…" if len(addr) > 300 else ""))
+            )
+        if hook:
+            bits.append(
+                "<span class='dim'>Hook:</span> "
+                + html.escape(hook[:400] + ("…" if len(hook) > 400 else ""))
+            )
+        if src:
+            bits.append(f"<span class='dim'>{html.escape(src[:200])}</span>")
+        body = "<br/>".join(bits) if bits else ""
+        items.append(
+            f"<li style='margin:0.6rem 0'><strong>{nm}</strong>"
+            f"{' · <span class=\"dim\">' + cat + '</span>' if cat else ''}"
+            f"{('<div class=\"meta\" style=\"margin-top:0.3rem;line-height:1.45\">' + body + '</div>') if body else ''}"
+            f"</li>"
+        )
+    return (
+        '<div class="card lead-important-people-ai">'
+        '<h2 class="lead-section-h">Important people (S-1 AI)</h2>'
+        f"{note}"
+        '<p class="meta dim" style="margin-top:0;font-size:0.78rem">'
+        "From <code>enrich-s1-ai</code> — same disclosure neighborhood as <strong>security ownership of "
+        "certain beneficial owners and management</strong>: individuals and footnotes. When the excerpt includes "
+        "both a person’s stake and an assumed offering price per share, we ask the model for an illustrative "
+        "shares × price line (not a market valuation)."
+        "</p><ul style='list-style:none;padding-left:0;margin:0.35rem 0 0'>"
+        + "".join(items)
+        + "</ul></div>"
     )
 
 
@@ -2800,7 +3952,10 @@ def _page_lead(
     rendered_at: str,
     client_research: Optional[dict] = None,
     issuer_snapshot: Optional[dict] = None,
-    roster_stats: Optional[dict] = None,
+    beneficial_gems: Optional[list[dict]] = None,
+    important_people_llm: Optional[list[dict]] = None,
+    beneficial_stake_detail: Optional[dict] = None,
+    beneficial_filing_caveats: str = "",
 ) -> str:
     css = _shared_css()
     if profile is None:
@@ -2823,6 +3978,7 @@ def _page_lead(
 </html>"""
 
     p = profile
+    beneficial_only = _is_beneficial_only_lead(p)
     doc_u = p.get("primary_doc_url") or ""
     doc_e = html.escape(doc_u)
     doc_link = (
@@ -2852,7 +4008,7 @@ def _page_lead(
     director_card = f"""
     <div class="card">
       <h2 class="lead-section-h">Director &amp; board terms</h2>
-      <p class="meta" style="margin-bottom:0">{html.escape(dts_body) if dts_body else "<span class='dim'>Not extracted yet — run <code>backfill-comp --force</code> after updating the parser.</span>"}</p>
+      <p class="meta" style="margin-bottom:0">{html.escape(dts_body) if dts_body else "<span class='dim'>—</span> <span class='dim' style='font-size:0.78rem'>(<code>backfill-comp --force</code>)</span>"}</p>
     </div>"""
 
     mb = (p.get("mgmt_bio_text") or "").strip()
@@ -2869,24 +4025,24 @@ def _page_lead(
         role_suffix = f" — {html.escape(mb_role)}" if mb_role else ""
         mgmt_narrative_card = f"""
     <div class="card">
-      <h2 class="lead-section-h">Management biography</h2>
+      <h2 class="lead-section-h">SEC filing bio</h2>
       <p class="meta" style="margin-bottom:0"><strong>{html.escape(heading_line)}</strong>{role_suffix}</p>
       {paras_html}
     </div>"""
     else:
         mgmt_narrative_card = f"""
     <div class="card bio-placeholder">
-      <h2 class="lead-section-h">Management biography</h2>
+      <h2 class="lead-section-h">SEC filing bio</h2>
       <p class="meta" style="margin-bottom:0">
-        <span class='dim'>No narrative block stored for this executive yet.</span>
-        Re-sync or run <code>backfill-comp --force</code> to re-parse the <b>Executive Officers and Directors</b> prose (name, role, age context, prior positions in narrative form).
-        {(' ' + doc_link) if doc_link else ''}
+        <span class='dim'>No S-1 bio block yet.</span>{(' ' + doc_link) if doc_link else ''}
+        <span class='dim' style='font-size:0.78rem'> · <code>backfill-comp --force</code></span>
       </p>
     </div>"""
 
-    bookmark_q = urlencode(
-        {"cik": str(p.get("cik") or ""), "name": p.get("display_name") or ""}
+    _bm_nm = (p.get("norm_name") or "").strip() or _norm_person_name(
+        p.get("display_name") or ""
     )
+    bookmark_q = urlencode({"cik": str(p.get("cik") or ""), "name": _bm_nm})
 
     oa = p.get("officer_age")
     stated = p.get("age_stated_in_filing")
@@ -2922,7 +4078,7 @@ def _page_lead(
             age_hero_val = "—"
             age_hero_title = ""
     else:
-        age_hero_title = "Not in officers table or narrative — run backfill if missing."
+        age_hero_title = "Not in filing roster or bio — backfill if needed."
     hq_txt = (p.get("issuer_headquarters") or "").strip()
     hq_loc = hq_city_state_display(hq_txt)
     if not hq_loc:
@@ -2941,13 +4097,11 @@ def _page_lead(
     age_title_attr = html.escape(age_hero_title, quote=True) if age_hero_title else ""
 
     snap_dict = issuer_snapshot or {}
-    company_intro_card = _lead_company_public_card_html(
-        p, roster_stats=roster_stats
-    )
+    company_intro_card = _lead_company_public_card_html(p)
     snapshot_card = _issuer_snapshot_card_html(snap_dict)
     snapshot_folded = (
         '<details class="lead-more lead-snapshot-fold">'
-        "<summary>Company snapshot <span class='dim'>(enriched story, if available)</span></summary>"
+        "<summary>Company snapshot <span class='dim'>(if enriched)</span></summary>"
         f'<div class="lead-snapshot-inner">{snapshot_card}</div></details>'
     )
 
@@ -2992,18 +4146,33 @@ def _page_lead(
         <span class="lead-kv-v">{loc_display}</span></div>
       <div class="lead-kv"><span class="lead-kv-l">Latest filing</span>
         <span class="lead-kv-v">{html.escape(p.get('filing_date') or '—')}</span></div>
+      <div class="lead-kv"><span class="lead-kv-l">Listing</span>
+        <span class="lead-kv-v">{_issuer_listing_stage_badge_html(p)}</span></div>
       <div class="lead-kv"><span class="lead-kv-l">Desk tier</span>
         <span class="lead-kv-v">{tier_badge}</span></div>
     </div>"""
 
     why_card = f"""
     <div class="card lead-why-card">
-      <h2 class="lead-section-h">Why surfaced</h2>
+      <h2 class="lead-section-h">Why on the desk</h2>
       <p class="meta" style="margin-bottom:0">{html.escape(p.get('why_surfaced') or '—')}</p>
     </div>"""
 
+    _mail_ft = ""
+    _bo_doc = (p.get("primary_doc_url") or "").strip()
+    _bo_mail_anchor = ""
+    if beneficial_stake_detail:
+        _mail_ft = (beneficial_stake_detail.get("mailing_address") or "").strip()
+        _bo_doc = (beneficial_stake_detail.get("stake_primary_doc_url") or _bo_doc).strip()
+        _bo_mail_anchor = (beneficial_stake_detail.get("mailing_footnote_doc_anchor") or "").strip()
     research_card = _client_research_card_html(
-        client_research, issuer_website=web_raw
+        client_research,
+        issuer_website=web_raw,
+        display_name=(p.get("display_name") or "").strip(),
+        beneficial_only=beneficial_only,
+        filing_mailing_address=_mail_ft,
+        filing_doc_url=_bo_doc if beneficial_only else "",
+        filing_mailing_anchor=_bo_mail_anchor if beneficial_only else "",
     )
 
     filings_block = f"""
@@ -3021,9 +4190,19 @@ def _page_lead(
       {filings_block}
     </details>"""
 
+    gems_card = (
+        ""
+        if beneficial_only
+        else _beneficial_outreach_shareholders_card_html(beneficial_gems)
+    )
+    ip_card = _important_people_s1_ai_card_html(
+        important_people_llm, beneficial_only=beneficial_only
+    )
     col_company = f"""
     <aside class="lead-col lead-col-company" aria-labelledby="lead-col-company">
       <div class="lead-col-title" id="lead-col-company">Company</div>
+      {gems_card}
+      {ip_card}
       {company_intro_card}
       {snapshot_folded}
       {source_details}
@@ -3032,18 +4211,25 @@ def _page_lead(
     comp_fullwidth = f"""
     <section class="lead-comp-fullwidth" aria-label="Summary compensation from filing">
       <div class="lead-comp-block">
-      {_profile_lead_compensation_card_html(p)}
+      {_profile_lead_compensation_card_html(p, beneficial_stake_detail, filing_caveats=beneficial_filing_caveats)}
       </div>
     </section>"""
 
+    _person_note = (
+        '<p class="lead-data-note">'
+        "Use <strong>Filing contact clues</strong> for the footnote mailing address when we parsed one — "
+        "not company directory contact. Email guesses are omitted for major shareholders.</p>"
+        if beneficial_only
+        else "<p class=\"lead-data-note\">Address/phone here is registrant-level from SEC — not personal home contact.</p>"
+    )
     col_person = f"""
     <main class="lead-col lead-col-person" aria-labelledby="lead-col-person">
       <div class="lead-col-title" id="lead-col-person">Person</div>
-      <p class="lead-data-note">Filings give registrant address only — not a personal home address or phone.</p>
+      {_person_note}
       {why_card}
       {research_card}
       <details class="lead-more">
-        <summary>Management biography (filing text)</summary>
+        <summary>Filing bio (full text)</summary>
         <div class="lead-mgmt-bio-wrap" style="margin-top:0.5rem">
       {mgmt_narrative_card}
         </div>
@@ -3083,13 +4269,75 @@ def _page_lead(
 </html>"""
 
 
+def _lead_page_db_stats(conn: sqlite3.Connection, *, db_mtime: str) -> dict:
+    """
+    Inexpensive counts for pages that need a stats-shaped dict without building all profiles.
+    """
+    nf = int(conn.execute("SELECT COUNT(*) FROM filings").fetchone()[0])
+    no = int(conn.execute("SELECT COUNT(*) FROM officers").fetchone()[0])
+    nc = 0
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='neo_compensation'"
+    ).fetchone():
+        nc = int(conn.execute("SELECT COUNT(*) FROM neo_compensation").fetchone()[0])
+    np_all = 0
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lead_profile'"
+    ).fetchone():
+        try:
+            np_all = int(conn.execute("SELECT COUNT(*) FROM lead_profile").fetchone()[0])
+        except sqlite3.OperationalError:
+            np_all = 0
+    latest = conn.execute("SELECT MAX(filing_date) FROM filings").fetchone()[0]
+    return {
+        "missing_db": False,
+        "filings": nf,
+        "officers": no,
+        "comp_rows": nc,
+        "profile_count": np_all,
+        "profile_count_all": np_all,
+        "lead_desk_s1_only": lead_desk_s1_only(),
+        "lead_desk_min_signal_usd": lead_desk_min_signal_usd(),
+        "lead_desk_equity_only_legacy": lead_desk_equity_only_min_usd(),
+        "latest_filing_date": latest,
+        "db_file_modified": db_mtime,
+    }
+
+
+# Desk/finder call `_build_profiles` — cache until the DB file changes (mtime + size).
+_LOAD_PAGE_DATA_CACHE: dict[str, Any] = {"key": None, "blob": None}
+
+
 def _load_page_data() -> tuple[list[dict], list[dict], list[sqlite3.Row], list[sqlite3.Row], dict]:
     dbp = database_path()
     if not Path(dbp).is_file():
         empty = {"missing_db": True, "profile_count": 0, "profile_count_all": 0}
         return [], [], [], [], empty
 
-    mtime = datetime.fromtimestamp(Path(dbp).stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+    st = Path(dbp).stat()
+    cache_key = (str(dbp), st.st_mtime, st.st_size)
+    global _LOAD_PAGE_DATA_CACHE
+    if _LOAD_PAGE_DATA_CACHE.get("key") == cache_key:
+        blob = _LOAD_PAGE_DATA_CACHE.get("blob")
+        if blob is not None:
+            profiles_all, leads, comp, nf, no, nc, latest, mtime_s = blob
+            profiles = _lead_desk_filter_profiles(profiles_all)
+            stats = {
+                "missing_db": False,
+                "filings": nf,
+                "officers": no,
+                "comp_rows": nc,
+                "profile_count": len(profiles),
+                "profile_count_all": len(profiles_all),
+                "lead_desk_s1_only": lead_desk_s1_only(),
+                "lead_desk_min_signal_usd": lead_desk_min_signal_usd(),
+                "lead_desk_equity_only_legacy": lead_desk_equity_only_min_usd(),
+                "latest_filing_date": latest,
+                "db_file_modified": mtime_s,
+            }
+            return profiles, profiles_all, leads, comp, stats
+
+    mtime = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
 
     with connect() as conn:
         profiles_all = _build_profiles(conn)
@@ -3176,6 +4424,8 @@ def _load_page_data() -> tuple[list[dict], list[dict], list[sqlite3.Row], list[s
         "latest_filing_date": latest,
         "db_file_modified": mtime,
     }
+    _LOAD_PAGE_DATA_CACHE["key"] = cache_key
+    _LOAD_PAGE_DATA_CACHE["blob"] = (profiles_all, leads, comp, nf, no, nc, latest, mtime)
     return profiles, profiles_all, leads, comp, stats
 
 
@@ -3229,6 +4479,7 @@ def _app(environ, start_response):
         qtxt = (qs.get("q") or [""])[0].strip()
         all_neo = (qs.get("all_neo") or [""])[0] in ("1", "on", "true", "True")
         band = ((qs.get("band") or ["all"])[0] or "all").strip() or "all"
+        listing = normalize_listing_stage_query((qs.get("listing") or ["all"])[0])
         profiles, profiles_all, _leads, _comp, _stats = _load_page_data()
         body = finder_export_csv_bytes(
             profiles_all=profiles_all,
@@ -3238,6 +4489,7 @@ def _app(environ, start_response):
             q=qtxt,
             all_neo=all_neo,
             pay_band=band,
+            listing_stage=listing,
         )
         start_response(
             "200 OK",
@@ -3279,6 +4531,7 @@ def _app(environ, start_response):
         qtxt = (qs.get("q") or [""])[0].strip()
         all_neo = (qs.get("all_neo") or [""])[0] in ("1", "on", "true", "True")
         band = ((qs.get("band") or ["all"])[0] or "all").strip() or "all"
+        listing = normalize_listing_stage_query((qs.get("listing") or ["all"])[0])
         base = profiles_all if all_neo else profiles
         filtered = filter_profiles_geo_industry_text(
             base,
@@ -3287,6 +4540,7 @@ def _app(environ, start_response):
             text_sub=qtxt,
         )
         filtered = filter_profiles_pay_band(filtered, band)
+        filtered = filter_profiles_listing_stage(filtered, listing)
         html_out = _page_finder(
             filtered,
             stats=stats,
@@ -3297,6 +4551,7 @@ def _app(environ, start_response):
             all_neo=all_neo,
             base_count=len(base),
             pay_band=band,
+            listing_stage=listing,
         )
     elif pi == "/lead":
         qs = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
@@ -3308,16 +4563,54 @@ def _app(environ, start_response):
         filings: list[dict] = []
         cr_dict: Optional[dict] = None
         issuer_snap: Optional[dict] = None
-        roster_stats_out: Optional[dict] = None
+        beneficial_rows: list[dict] = []
+        important_llm: list[dict] = []
+        beneficial_stake_detail: Optional[dict] = None
+        beneficial_filing_caveats = ""
         if prof is not None and not stats.get("missing_db"):
             with connect() as conn:
                 filings = _filings_for_profile(conn, cik, norm)
                 cr_row = get_lead_client_research(conn, cik, norm)
                 cr_dict = row_to_client_research_dict(cr_row)
                 issuer_snap = get_issuer_snapshot_dict(conn, cik)
-                roster_stats_out = management_roster_scale_stats(
-                    conn, (cik or "").strip()
+                bo_only = bool(prof.get("has_s1_beneficial_owner")) and not bool(
+                    prof.get("has_s1_officer")
                 )
+                if bo_only:
+                    try:
+                        beneficial_stake_detail = beneficial_stake_detail_for_profile(
+                            conn, prof
+                        )
+                    except sqlite3.Error:
+                        beneficial_stake_detail = None
+                    try:
+                        beneficial_filing_caveats = _latest_filing_snapshot_caveats_for_cik(
+                            conn, (cik or "").strip()
+                        )
+                    except sqlite3.Error:
+                        beneficial_filing_caveats = ""
+                    try:
+                        important_llm = _latest_important_people_from_s1_llm_pack(
+                            conn, (cik or "").strip()
+                        )
+                    except sqlite3.Error:
+                        important_llm = []
+                else:
+                    try:
+                        beneficial_rows = [
+                            dict(r)
+                            for r in list_beneficial_owner_outreach_targets_for_cik(
+                                conn, (cik or "").strip(), limit=10
+                            )
+                        ]
+                    except sqlite3.Error:
+                        beneficial_rows = []
+                    try:
+                        important_llm = _latest_important_people_from_s1_llm_pack(
+                            conn, (cik or "").strip()
+                        )
+                    except sqlite3.Error:
+                        important_llm = []
         html_out = _page_lead(
             prof,
             filings,
@@ -3327,12 +4620,17 @@ def _app(environ, start_response):
             rendered_at=rendered_at,
             client_research=cr_dict,
             issuer_snapshot=issuer_snap,
-            roster_stats=roster_stats_out,
+            beneficial_gems=beneficial_rows,
+            important_people_llm=important_llm,
+            beneficial_stake_detail=beneficial_stake_detail,
+            beneficial_filing_caveats=beneficial_filing_caveats,
         )
     else:
         qs = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
         band = ((qs.get("band") or ["all"])[0] or "all").strip() or "all"
+        listing = normalize_listing_stage_query((qs.get("listing") or ["all"])[0])
         desk_view = filter_profiles_pay_band(profiles, band)
+        desk_view = filter_profiles_listing_stage(desk_view, listing)
         html_out = _page_desk(
             desk_view,
             leads,
@@ -3340,6 +4638,7 @@ def _app(environ, start_response):
             stats,
             rendered_at,
             pay_band=band,
+            listing_stage=listing,
             nav_base_path="/",
             desk_universe_count=len(profiles),
         )

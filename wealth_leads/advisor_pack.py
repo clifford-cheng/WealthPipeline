@@ -386,7 +386,9 @@ def llm_issuer_advisor_snapshot(
         "business_plain = what they do in plain English, 2-4 sentences max.\n"
         "pool_angle = for an advisor only: how company scale might relate to breadth of exec "
         "households / plan complexity (speculative but grounded; if unknown, say so briefly).\n"
-        "caveat = one sentence reminding this is filing text, not investment advice."
+        "caveat = one sentence: filing text only, not investment advice; ownership and share counts "
+        "in registration statements are point-in-time and can be overturned by later splits, "
+        "distress, or enforcement — advisors must verify current cap table and 8-Ks."
     )
     user = (
         f"Company: {company_name}\nCIK: {cik}\n\n--- SEC / extracted text ---\n"
@@ -453,11 +455,11 @@ def llm_person_advisor_story(
     if not advisor_llm_available():
         return ""
     system = (
-        "You merge public sources into a single, easy-to-read executive brief for a wealth advisor. "
-        "No home address or personal phone — we do not have them. Do NOT imply you have private contact "
-        "info. Synthesize S-1 narrative and website bio into 4-7 short sentences: role, career thread, "
-        "anything liquidity-relevant if stated. If sources conflict, note filing vs website briefly. "
-        "Plain English, confident tone. No bullet labels — flowing prose."
+        "Write a short executive brief for a wealth advisor (outreach / discovery call prep). "
+        "No home address or personal phone; do not imply private contact data. "
+        "Use at most 4 tight sentences (or 4–5 lines starting with '- '), in this order when known: "
+        "role at this company, career path, prior notable employers, anything liquidity or equity-related "
+        "if explicitly stated. If filing vs website differ, one short clause. No marketing filler."
     )
     user = (
         f"Name: {display_name}\nTitle: {title}\nCompany: {company_name}\n\n"
@@ -467,7 +469,7 @@ def llm_person_advisor_story(
     )
     try:
         return advisor_llm_chat_text(
-            system=system, user=user, temperature=0.2, max_tokens=900, timeout=120.0
+            system=system, user=user, temperature=0.2, max_tokens=450, timeout=120.0
         )
     except Exception:
         return ""
@@ -548,20 +550,31 @@ def _name_parts(display_name: str) -> tuple[str, str]:
 
 
 def build_email_candidates(
-    display_name: str, domain: str, *, max_variants: int = 12
+    display_name: str,
+    domain: str,
+    *,
+    max_variants: Optional[int] = None,
 ) -> list[dict[str, Any]]:
+    from wealth_leads.config import email_hypothesis_top_n
+
+    cap = max_variants if max_variants is not None else email_hypothesis_top_n()
+    cap = max(1, min(int(cap), 12))
     first, last = _name_parts(display_name)
     if not domain or not first:
         return []
     fl = f"{first}.{last}" if last else first
-    locals_ = [
-        first,
-        fl,
-        f"{first[0]}.{last}" if last and first else first,
-        f"{first}{last}" if last else first,
-        f"{first}_{last}" if last else first,
-        f"{last}" if last else first,
-    ]
+    # Prefer first.last@ (most common corporate pattern), then first@, then other variants.
+    if last:
+        locals_ = [
+            fl,
+            first,
+            f"{first[0]}.{last}" if first else first,
+            f"{first}{last}" if last else first,
+            f"{first}_{last}" if last else first,
+            f"{last}",
+        ]
+    else:
+        locals_ = [first]
     seen: set[str] = set()
     out: list[dict[str, Any]] = []
     dom = domain.lower().strip()
@@ -571,7 +584,7 @@ def build_email_candidates(
             continue
         seen.add(loc)
         out.append({"email": f"{loc}@{dom}", "pattern": loc})
-        if len(out) >= max_variants:
+        if len(out) >= cap:
             break
     return out
 
@@ -661,6 +674,78 @@ def discover_site_emails(sess: requests.Session, base_root: str) -> list[str]:
     return found
 
 
+def apply_smtp_probes_to_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    mail_from: str = "",
+    max_probes: int = 8,
+) -> list[dict[str, Any]]:
+    """
+    SMTP RCPT check for up to ``max_probes`` rows still marked ``skipped`` (or empty).
+    Leaves rows that already have ``uncertain`` / ``reject`` / ``error`` unchanged.
+    """
+    n = 0
+    out: list[dict[str, Any]] = []
+    mf = (mail_from or "").strip()
+    cap = max(1, min(int(max_probes), 50))
+    for c in candidates:
+        row = dict(c)
+        prev = (row.get("smtp_status") or "skipped").strip().lower()
+        if prev not in ("skipped", ""):
+            out.append(row)
+            continue
+        if n >= cap:
+            out.append(row)
+            continue
+        em = (row.get("email") or "").strip()
+        if "@" not in em:
+            out.append(row)
+            continue
+        st, det = smtp_rcpt_probe(em, mail_from=mf)
+        row["smtp_status"] = st
+        row["smtp_detail"] = det
+        n += 1
+        out.append(row)
+    return out
+
+
+def outreach_pattern_pack_from_website(
+    display_name: str,
+    website_root: str,
+    *,
+    verify_smtp: bool = False,
+    mail_from: str = "",
+    max_smtp_probes: int = 8,
+) -> dict[str, Any]:
+    """
+    Issuer website URL from the filing only (hostname → mail domain + name patterns).
+
+    No HTTP fetch. Optional SMTP RCPT probes (same idea as enrich ``--smtp``).
+    """
+    ws = (website_root or "").strip()
+    if not ws:
+        return {}
+    if not ws.startswith("http"):
+        ws = "https://" + ws
+    dom, dsrc = infer_primary_domain([], ws)
+    if not dom:
+        return {}
+    cands = build_email_candidates(display_name, dom)
+    if not cands:
+        return {}
+    rows = [{**c, "smtp_status": "skipped", "smtp_detail": ""} for c in cands]
+    if verify_smtp:
+        rows = apply_smtp_probes_to_candidates(
+            rows, mail_from=mail_from, max_probes=max_smtp_probes
+        )
+    return {
+        "emails_on_site": [],
+        "domain": dom,
+        "domain_source": dsrc or "from website hostname",
+        "candidates": rows,
+    }
+
+
 def run_email_ping_suite(
     sess: requests.Session,
     *,
@@ -669,22 +754,22 @@ def run_email_ping_suite(
     verify_smtp: bool,
     mail_from: str = "",
 ) -> dict[str, Any]:
+    from wealth_leads.config import email_smtp_probe_max_candidates
+
+    lim = email_smtp_probe_max_candidates()
     emails = discover_site_emails(sess, website_root)
     domain, dom_src = infer_primary_domain(emails, website_root)
     candidates = build_email_candidates(display_name, domain or "") if domain else []
-    verifies: list[dict[str, Any]] = []
-    for c in candidates:
-        row = {**c, "smtp_status": "skipped", "smtp_detail": ""}
-        if verify_smtp and domain:
-            st, det = smtp_rcpt_probe(c["email"], mail_from=mail_from)
-            row["smtp_status"] = st
-            row["smtp_detail"] = det
-        verifies.append(row)
+    rows = [{**c, "smtp_status": "skipped", "smtp_detail": ""} for c in candidates]
+    if verify_smtp and domain and rows:
+        rows = apply_smtp_probes_to_candidates(
+            rows, mail_from=mail_from, max_probes=lim
+        )
     return {
         "emails_on_site": emails,
         "domain": domain,
         "domain_source": dom_src,
-        "candidates": verifies,
+        "candidates": rows,
     }
 
 

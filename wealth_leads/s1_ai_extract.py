@@ -40,6 +40,7 @@ from typing import Any, Optional
 from bs4 import BeautifulSoup
 
 from wealth_leads.compensation import NeoCompRow
+
 from wealth_leads.config import (
     anthropic_api_key,
     anthropic_s1_model,
@@ -63,6 +64,44 @@ from wealth_leads.db import (
     update_filing_s1_llm_lead_pack,
 )
 from wealth_leads.serve import _norm_person_name
+
+# Ownership tables often end before numbered footnotes; extend merged windows so the LLM sees both.
+_FOOTNOTE_TAIL_AFTER_OWNERSHIP = 38_000
+_EXTEND_SPAN_IF_OWNERSHIP_RE = re.compile(
+    r"security ownership of certain beneficial|related stockholder matters|"
+    r"principal stockholders|"
+    r"beneficial ownership of (?:common|capital|voting|our|the)\b",
+    re.I,
+)
+
+
+def _coalesce_text_intervals(intervals: list[tuple[int, int]], *, gap: int = 200) -> list[tuple[int, int]]:
+    if not intervals:
+        return []
+    intervals = sorted(intervals, key=lambda x: (x[0], x[1]))
+    merged: list[tuple[int, int]] = [intervals[0]]
+    for lo, hi in intervals[1:]:
+        p_lo, p_hi = merged[-1]
+        if lo > p_hi + gap:
+            merged.append((lo, hi))
+        else:
+            merged[-1] = (p_lo, max(p_hi, hi))
+    return merged
+
+
+def _extend_merged_spans_for_ownership_footnotes(
+    text: str, merged: list[tuple[int, int]], n: int
+) -> list[tuple[int, int]]:
+    """Widen spans that contain beneficial-ownership headings so numbered notes under the table stay included."""
+    if not merged:
+        return merged
+    out: list[tuple[int, int]] = []
+    for lo, hi in merged:
+        chunk = text[lo:hi]
+        if _EXTEND_SPAN_IF_OWNERSHIP_RE.search(chunk):
+            hi = min(n, hi + _FOOTNOTE_TAIL_AFTER_OWNERSHIP)
+        out.append((lo, hi))
+    return _coalesce_text_intervals(out)
 
 
 def _s1_html_to_plain(html: str) -> str:
@@ -121,8 +160,17 @@ def s1_html_to_document_text(html: str, *, max_chars: int = 100_000) -> str:
         ("executive compensation", 10_000, 45_000),
         ("director compensation", 10_000, 40_000),
         ("grant of plan-based awards", 8_000, 38_000),
-        ("principal stockholders", 8_000, 45_000),
-        ("security ownership of certain beneficial owner", 8_000, 45_000),
+        ("principal stockholders", 10_000, 58_000),
+        ("security ownership of certain beneficial owner", 10_000, 58_000),
+        ("security ownership of", 10_000, 55_000),
+        ("related stockholder matters", 10_000, 60_000),
+        ("beneficial owner", 10_000, 58_000),
+        ("more than 5%", 10_000, 55_000),
+        ("five percent", 10_000, 52_000),
+        ("assumed initial public offering price", 10_000, 48_000),
+        ("initial public offering price", 10_000, 45_000),
+        ("price range per share", 10_000, 42_000),
+        ("offering price per share", 10_000, 42_000),
         ("certain relationships and related", 8_000, 40_000),
         ("underwriting", 8_000, 38_000),
         ("use of proceeds", 8_000, 38_000),
@@ -148,6 +196,8 @@ def s1_html_to_document_text(html: str, *, max_chars: int = 100_000) -> str:
         else:
             a, b = merged[-1]
             merged[-1] = (a, max(b, hi))
+
+    merged = _extend_merged_spans_for_ownership_footnotes(text, merged, n)
 
     parts: list[str] = []
     for i, (lo, hi) in enumerate(merged):
@@ -188,6 +238,12 @@ def s1_html_to_document_text(html: str, *, max_chars: int = 100_000) -> str:
             score += 1
         if "stockholder" in slug or "ownership" in slug:
             score += 1
+        if "beneficial" in slug and "owner" in slug:
+            score += 10
+        if " per share" in slug or "offering price" in slug:
+            score += 8
+        if "footnote" in slug or "spouse" in slug:
+            score += 4
         scored.append((score, span))
     scored.sort(key=lambda x: (-x[0], x[1][0]))
     acc: list[str] = [prefix]
@@ -231,6 +287,21 @@ pre-IPO / wealth-management lead research. Your job is to extract EVERYTHING in 
 that is supported by the document excerpt—issuer facts, people, pay, ownership, offering context,
 and professional firms—so downstream software can build reviewable lead profiles.
 
+Wealth advisors care about large individual stock positions and family ties even when the person
+is NOT a current officer or director. Always scan ownership / beneficial-holder tables, related-party
+notes, and NUMBERED FOOTNOTES under those tables for: spouses, widows/widowers, former executives,
+heirs, trustees, and natural-person >5% holders. Include women and family members by name when the
+filing ties them to shares, options, or economic interest. Do not skip someone because they are
+labeled only as a spouse or relative.
+
+Beneficial-ownership tables often reference a superscript or parenthetical marker like (1), (3), or ¹.
+When the excerpt includes both the table row AND the matching numbered note (usually directly below the
+table or in a "Notes" block in the same section), resolve the reference: treat the note's full name,
+share counts, %, and address as part of that holder's record in lead_intel.important_people (and
+principal_stockholders text when rows are entity + footnote defines the economic interest). This linkage
+is straightforward when both pieces appear in the excerpt—do not drop the person because the table cell
+is abbreviated.
+
 Rules:
 - Use ONLY the excerpt; do not invent names, amounts, addresses, titles, or law firms.
 - Where the excerpt is silent, use null or empty arrays (do not guess).
@@ -240,6 +311,21 @@ Rules:
 - Person names: plain English as in the filing (avoid ALL CAPS if the filing uses mixed case).
 - lead_intel text fields: concise prose taken from or tightly summarized from the excerpt; cite
   ranges as the filing states them (e.g. price "X to Y per share" as narrative text).
+- For natural persons in lead_intel.important_people: when the excerpt states both (1) their share
+  amount (table, footnote, or narrative) and (2) an assumed initial public offering price per share,
+  a price range (use midpoint or endpoints as the filing suggests), or equivalent offering-price
+  language elsewhere in the excerpt, you MAY multiply to give an illustrative notional—put it in
+  implied_value_at_offering_text (e.g. "Illustrative ~$40M at ~8,000,000 shares × $5/share from
+  assumed offering price in excerpt"). Do not fabricate share counts or prices; if either side is
+  missing from the excerpt, leave implied_value_at_offering_text null.
+  If lead_intel.filing_snapshot_caveats is non-null (splits, distress, etc.), mention in
+  implied_value_at_offering_text that the figure is filing-math only and may be misleading vs
+  current reality when those caveats apply.
+- lead_intel.filing_snapshot_caveats: If the excerpt mentions reverse or forward stock splits,
+  consolidations, recapitalizations, bankruptcy/restructuring risk, going-concern doubts, or material
+  legal / regulatory / criminal matters (including against insiders or family) that could change the
+  economics for shareholders, summarize in 1–3 short sentences using ONLY excerpt language. If silent,
+  null. This helps advisors; it is not legal or investment advice.
 - Return one JSON object with exactly the top-level keys in the user schema (no markdown)."""
 
 
@@ -291,11 +377,25 @@ _USER_SCHEMA = """Analyze this S-1 excerpt and return a single JSON object with 
         }
       ]
     },
+    "important_people": [
+      {
+        "name": string,
+        "category": string,
+        "relationship_to_company_or_insider": string or null,
+        "ownership_or_interest_text": string or null,
+        "shares_disclosed": string or null,
+        "implied_value_at_offering_text": string or null,
+        "disclosed_address": string or null,
+        "wealth_or_planning_hook": string or null,
+        "source_hint": string or null
+      }
+    ],
     "related_party_transactions": string or null,
     "use_of_proceeds": string or null,
     "auditor": string or null,
     "legal_counsel": string or null,
-    "material_contracts_note": string or null
+    "material_contracts_note": string or null,
+    "filing_snapshot_caveats": string or null
   },
   "notes": string
 }
@@ -315,13 +415,19 @@ Section guidance:
   underwriting, MD&A or offering sections if present in excerpt).
 - lead_intel.ownership.principal_stockholders: beneficial owners / >5% holders if in excerpt;
   shares_or_percent as stated (string OK, e.g. "12.3%" or "1,200,000 shares").
+- lead_intel.important_people: natural persons surfaced from "Security Ownership of Certain Beneficial
+  Owners and Management and Related Stockholder Matters" (or similarly titled ownership tables), including
+  numbered footnotes that give addresses or explain stakes—e.g. major individual shareholders who are not
+  officers, spouses, trustees, former execs. Prefer one row per person; set disclosed_address when the
+  excerpt gives a street/mailing address; category examples: "major shareholder", "beneficial owner (footnote)".
 - lead_intel.related_party_transactions: short summary of related-party deals naming parties if in excerpt.
 - lead_intel.use_of_proceeds: brief use-of-proceeds if in excerpt.
 - lead_intel.auditor / legal_counsel: firm names if clearly stated for the offering or audit opinion.
 - lead_intel.material_contracts_note: only if excerpt mentions key employment / change-of-control hooks.
 - notes: extraction caveats (e.g. "CD&A truncated in excerpt").
 
-If a subsection is missing from the excerpt, use null or empty arrays inside lead_intel."""
+If a subsection is missing from the excerpt, use null or empty arrays inside lead_intel.
+Use an empty array [] for important_people only when no qualifying individuals appear in the excerpt."""
 
 
 def _parse_json_from_llm_text(text: str) -> dict[str, Any]:
@@ -518,16 +624,65 @@ def _lead_intel_json_for_db(data: dict[str, Any]) -> Optional[str]:
         holders = ownership.get("principal_stockholders")
         if isinstance(holders, list) and holders:
             pack["ownership"] = {"principal_stockholders": holders[:80]}
+    ip = raw.get("important_people")
+    if isinstance(ip, list) and ip:
+        clean_ip: list[dict[str, Any]] = []
+        for item in ip[:120]:
+            if not isinstance(item, dict):
+                continue
+            name = (item.get("name") or "").strip()
+            if not name:
+                continue
+            clean_ip.append(
+                {
+                    "name": name[:300],
+                    "category": (item.get("category") or "").strip()[:64],
+                    "relationship_to_company_or_insider": (
+                        (item.get("relationship_to_company_or_insider") or "")
+                        .strip()[:2000]
+                        or None
+                    ),
+                    "ownership_or_interest_text": (
+                        (item.get("ownership_or_interest_text") or "")
+                        .strip()[:2000]
+                        or None
+                    ),
+                    "shares_disclosed": (
+                        (item.get("shares_disclosed") or "").strip()[:256] or None
+                    ),
+                    "implied_value_at_offering_text": (
+                        (item.get("implied_value_at_offering_text") or "")
+                        .strip()[:800]
+                        or None
+                    ),
+                    "disclosed_address": (
+                        (item.get("disclosed_address") or "").strip()[:500] or None
+                    ),
+                    "wealth_or_planning_hook": (
+                        (item.get("wealth_or_planning_hook") or "").strip()[:800]
+                        or None
+                    ),
+                    "source_hint": (
+                        (item.get("source_hint") or "").strip()[:400] or None
+                    ),
+                }
+            )
+        if clean_ip:
+            pack["important_people"] = clean_ip
     for key in (
         "related_party_transactions",
         "use_of_proceeds",
         "auditor",
         "legal_counsel",
         "material_contracts_note",
+        "filing_snapshot_caveats",
     ):
         v = raw.get(key)
         if not _empty_lead_intel_val(v):
-            pack[key] = v
+            if key == "filing_snapshot_caveats":
+                pack[key] = str(v).strip()[:1200]
+            else:
+                pack[key] = v
     if not pack:
         return None
     return json.dumps(pack, ensure_ascii=False)
