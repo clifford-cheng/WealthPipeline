@@ -146,6 +146,32 @@ def _effective_other_comp(p: dict) -> object:
     return _imputed_other_from_total(p)
 
 
+def _materialized_search_text(
+    *,
+    display_name: str,
+    title: str,
+    company_name: str,
+    person_norm: str,
+    cik: str,
+    issuer_headquarters: str,
+    issuer_industry: str,
+    why_surfaced: str,
+    issuer_summary_excerpt: str,
+) -> str:
+    parts = [
+        display_name,
+        title,
+        company_name,
+        (person_norm or "").replace("_", " "),
+        cik,
+        issuer_headquarters,
+        issuer_industry,
+        why_surfaced,
+        (issuer_summary_excerpt or "")[:320],
+    ]
+    return " ".join(p.lower() for p in parts if (p or "").strip())
+
+
 def _headline_comp_columns(p: dict) -> tuple[object, object, object, object]:
     """
     Headline FY from SCT: salary, bonus, other compensation, and sum of stock + option awards.
@@ -177,9 +203,9 @@ def _headline_comp_columns(p: dict) -> tuple[object, object, object, object]:
 def rebuild_lead_profiles(conn: sqlite3.Connection) -> dict[str, Any]:
     from wealth_leads.crm_ui import format_headquarters_for_ui
     from wealth_leads.serve import _build_profiles, _lead_desk_filter_profiles
-    from wealth_leads.territory import hq_city_state_display, hq_has_registrant_address_detail
+    from wealth_leads.territory import hq_city_state_pipeline_only, hq_has_registrant_address_detail
 
-    profiles = _lead_desk_filter_profiles(_build_profiles(conn))
+    profiles = _lead_desk_filter_profiles(_build_profiles(conn), conn)
     if not profiles:
         conn.execute("DELETE FROM lead_profile")
         return {"profiles_source": 0, "rows_written": 0}
@@ -225,9 +251,20 @@ def rebuild_lead_profiles(conn: sqlite3.Connection) -> dict[str, Any]:
             )
         ) else 0
 
-        q = 0  # reserved; pipeline sorts by filing_date_latest
         summ = (p.get("issuer_summary") or "").strip()
         summ_ex = (summ[:600] + "…") if len(summ) > 600 else summ
+        why_s = (p.get("why_surfaced") or "")[:500]
+        search_blob = _materialized_search_text(
+            display_name=(p.get("display_name") or "")[:400],
+            title=(p.get("title") or "")[:400],
+            company_name=(p.get("company_name") or "")[:400],
+            person_norm=pn,
+            cik=cik,
+            issuer_headquarters=(p.get("issuer_headquarters") or "")[:500],
+            issuer_industry=(p.get("issuer_industry") or "")[:500],
+            why_surfaced=why_s,
+            issuer_summary_excerpt=summ_ex,
+        )[:4000]
         llm_comp = 1 if _neo_llm_assisted_for_person(conn, fids, pn) else 0
         sal_h, bonus_h, other_h, stk_h = _headline_comp_columns(p)
         tot_h = (
@@ -237,7 +274,7 @@ def rebuild_lead_profiles(conn: sqlite3.Connection) -> dict[str, Any]:
         )
 
         hq_line = format_headquarters_for_ui((p.get("issuer_headquarters") or ""))[:500]
-        hq_cs = (hq_city_state_display(hq_line)[:120] if hq_line else "") or ""
+        hq_cs = (hq_city_state_pipeline_only(hq_line)[:120] if hq_line else "") or ""
         hq_detail = 1 if (hq_line and hq_has_registrant_address_detail(hq_line)) else 0
 
         rows.append(
@@ -272,9 +309,8 @@ def rebuild_lead_profiles(conn: sqlite3.Connection) -> dict[str, Any]:
                 int(nc),
                 (p.get("comp_timeline") or "")[:500],
                 summ_ex,
-                (p.get("why_surfaced") or "")[:500],
+                why_s,
                 json.dumps(fids),
-                int(q),
                 cross,
                 json.dumps(others),
                 llm_comp,
@@ -283,6 +319,10 @@ def rebuild_lead_profiles(conn: sqlite3.Connection) -> dict[str, Any]:
                 hq_detail,
                 (p.get("issuer_listing_stage") or "unknown")[:24],
                 1 if p.get("has_s1_beneficial_owner") else 0,
+                (p.get("issuer_risk_level") or "none")[:24],
+                json.dumps(p.get("issuer_risk_reasons") or []),
+                (p.get("issuer_revenue_text") or "").strip()[:500],
+                search_blob,
                 built_at,
             )
         )
@@ -299,19 +339,23 @@ def rebuild_lead_profiles(conn: sqlite3.Connection) -> dict[str, Any]:
             salary_headline, bonus_headline, other_comp_headline, stock_grants_headline,
             has_s1_comp, has_mgmt_bio, has_officer_row, neo_row_count,
             comp_timeline, issuer_summary_excerpt, why_surfaced,
-            neo_filing_ids_json, quality_score, cross_company_hint, other_ciks_json,
+            neo_filing_ids_json, cross_company_hint, other_ciks_json,
             comp_llm_assisted, lead_tier, issuer_hq_city_state, issuer_hq_has_detail,
-            issuer_listing_stage, has_beneficial_owner_stake, built_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            issuer_listing_stage, has_beneficial_owner_stake,
+            issuer_risk_level, issuer_risk_reasons_json, issuer_revenue_text, search_text, built_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         rows,
     )
+    from wealth_leads.db import rebuild_lead_profile_fts_index
+
+    rebuild_lead_profile_fts_index(conn)
     from wealth_leads.lead_research import materialize_email_outreach_for_profiles
 
     eo = materialize_email_outreach_for_profiles(conn)
     return {
         "profiles_source": len(profiles),
         "rows_written": len(rows),
-        "cross_company_flagged": sum(1 for r in rows if r[31] == 1),
+        "cross_company_flagged": sum(1 for r in rows if r[30] == 1),
         **eo,
     }

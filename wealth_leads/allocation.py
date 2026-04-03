@@ -8,13 +8,21 @@ import math
 import re
 import sqlite3
 from collections import defaultdict
+from datetime import date, datetime
 from typing import Any
 
+from wealth_leads.config import (
+    assign_exclude_issuer_risk_elevated,
+    assign_exclude_issuer_risk_high,
+    assign_exclude_visibility_tier,
+    assign_max_filing_stale_days,
+)
 from wealth_leads.db import (
     connect,
     delete_assignments_for_cycle,
     get_allocation_settings,
     insert_lead_assignment,
+    is_lead_suppressed,
     list_allocation_clients,
     list_assignments_for_cycle,
 )
@@ -29,6 +37,43 @@ from wealth_leads.territory import (
 
 _TAG_S1 = "S-1 Filed"
 _TAG_PRE_IPO = "Pre-IPO / RSU Vesting"
+
+
+def _filing_date_age_days(filing_date: object) -> int | None:
+    s = str(filing_date or "").strip()[:10]
+    if len(s) < 10:
+        return None
+    try:
+        fd = datetime.strptime(s, "%Y-%m-%d").date()
+        return (date.today() - fd).days
+    except ValueError:
+        return None
+
+
+def _assignment_gate_skip_reason(conn: sqlite3.Connection, p: dict) -> str | None:
+    """
+    If this profile should not receive automated cycle assignment, return a short reason key;
+    otherwise None.
+    """
+    ck = str(p.get("cik") or "").strip()
+    pn = (p.get("norm_name") or "").strip()
+    if not ck or not pn:
+        return "incomplete"
+    if is_lead_suppressed(conn, ck, pn):
+        return "suppress"
+    if assign_exclude_visibility_tier() and (p.get("lead_tier") or "") == "visibility":
+        return "visibility"
+    lvl = (p.get("issuer_risk_level") or "none").strip().lower()
+    if assign_exclude_issuer_risk_high() and lvl == "high":
+        return "issuer_risk_high"
+    if assign_exclude_issuer_risk_elevated() and lvl == "elevated":
+        return "issuer_risk_elevated"
+    max_days = assign_max_filing_stale_days()
+    if max_days > 0:
+        age = _filing_date_age_days(p.get("filing_date"))
+        if age is None or age > max_days:
+            return "stale_filing"
+    return None
 
 
 def _safe_float(x: Any) -> float:
@@ -216,8 +261,17 @@ def assign_for_cycle(
             )
 
     assigned_count: dict[int, int] = defaultdict(int)
-    enriched: list[dict[str, Any]] = []
+    gate_counts: dict[str, int] = defaultdict(int)
+    eligible_profiles: list[dict] = []
     for p in profiles_all:
+        gr = _assignment_gate_skip_reason(conn, p)
+        if gr:
+            gate_counts[gr] += 1
+            continue
+        eligible_profiles.append(p)
+
+    enriched: list[dict[str, Any]] = []
+    for p in eligible_profiles:
         e = enrich_profile(p)
         if not e["cik"] or not e["person_norm"]:
             continue
@@ -230,6 +284,8 @@ def assign_for_cycle(
         "assigned": 0,
         "skipped_no_eligible": 0,
         "skipped_exclusive": 0,
+        "skipped_assignment_gate": int(sum(gate_counts.values())),
+        "assignment_gate_breakdown": dict(gate_counts),
     }
 
     for e in enriched:
@@ -304,7 +360,7 @@ def run_allocation_from_db(
         cycle_yyyymm = __import__("datetime").datetime.now().strftime("%Y%m")
     with connect() as conn:
         profiles_all = _build_profiles(conn)
-        candidates = _lead_desk_filter_profiles(profiles_all)
+        candidates = _lead_desk_filter_profiles(profiles_all, conn)
         return assign_for_cycle(
             conn, cycle_yyyymm=cycle_yyyymm, profiles_all=candidates, replace=replace
         )

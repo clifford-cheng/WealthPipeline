@@ -36,10 +36,9 @@ from wealth_leads.config import (
     app_allow_public_signup,
     app_secret_key,
     database_path,
-    lead_desk_include_beneficial_only_leads,
     lead_desk_us_registrant_hq_only,
-    profile_stale_warning_days,
     require_app_auth,
+    user_may_view_pipeline_exec_bundle,
 )
 from wealth_leads.advisor_pack import get_issuer_snapshot_dict
 from wealth_leads.allocation import assign_for_cycle, assignments_to_display_rows
@@ -49,27 +48,35 @@ from wealth_leads.crm_ui import (
     pipeline_hq_city_state,
     render_admin_home,
     render_my_leads_page,
+    render_pipeline_company_page,
     render_pipeline_review_page,
 )
 from wealth_leads.db import (
     add_user_watchlist,
     app_user_count,
     connect,
-    count_lead_profiles,
+    delete_lead_suppress,
     delete_user_watchlist,
     get_allocation_settings,
     get_app_user_by_email,
     get_app_user_by_id,
     get_lead_client_research,
+    get_advisor_lead_outreach,
     get_lead_profile_row,
     insert_app_user,
+    insert_lead_advisor_feedback,
+    insert_lead_suppress,
     list_allocation_clients,
+    list_lead_advisor_feedback,
+    list_lead_suppress,
     list_beneficial_owner_gems_for_filing_ids,
     list_beneficial_owner_outreach_targets_for_cik,
+    list_advisor_lead_outreach_status_by_norm_for_cik,
     list_lead_profiles_for_review,
     list_user_watchlist,
     update_allocation_settings,
     update_user_allocation_profile,
+    upsert_advisor_lead_outreach,
 )
 from wealth_leads.lead_research import row_to_client_research_dict
 from wealth_leads.password_util import hash_password, verify_password
@@ -99,6 +106,27 @@ def _lead_profile_row_dict(row: sqlite3.Row) -> dict[str, Any]:
         else:
             out[k] = v
     return out
+
+
+def _pipeline_review_params(request: Request) -> dict[str, Any]:
+    """Shared query params for pipeline HTML, company drill-in, and CSV export."""
+    q = (request.query_params.get("q") or "").strip()
+    include_non_s1 = request.query_params.get("include_non_s1") == "1"
+    try:
+        months_sel = int(request.query_params.get("months", "6"))
+    except ValueError:
+        months_sel = 6
+    raw_tier = (request.query_params.get("tier") or "").strip().lower().replace("-", "_")
+    if raw_tier in ("standard", "economy", "std", "other"):
+        pipeline_tier_tab = "standard"
+    else:
+        pipeline_tier_tab = "exec"
+    return {
+        "q": q,
+        "include_non_s1": include_non_s1,
+        "months_sel": months_sel,
+        "pipeline_tier_tab": pipeline_tier_tab,
+    }
 
 
 def _json_safe_num(v: Any) -> Any:
@@ -357,19 +385,29 @@ from wealth_leads.serve import (
     _find_profile,
     _latest_filing_snapshot_caveats_for_cik,
     _latest_important_people_from_s1_llm_pack,
+    _lead_desk_filter_profiles,
     _lead_page_db_stats,
     _load_page_data,
+    _norm_person_name,
+    _desk_sort_tuple,
     _page_desk,
+    _page_desk_company,
     _page_finder,
     _page_lead,
     _profile_lead_tier,
     _profile_lead_url,
     beneficial_stake_detail_for_profile,
     filter_profiles_geo_industry_text,
-    filter_profiles_listing_stage,
-    filter_profiles_pay_band,
+    desk_sales_bundle_company_counts,
+    filter_profiles_sales_bundle,
+    filter_rows_sales_bundle,
+    profile_sales_bundle,
     finder_export_csv_bytes,
-    normalize_listing_stage_query,
+    lead_feedback_form_html,
+    lead_outreach_form_html,
+    lead_issuer_recency_bundle,
+    normalize_sales_bundle_query,
+    sales_bundle_from_lead_tier,
 )
 from wealth_leads.territory import registrant_hq_line_parses_as_united_states
 
@@ -871,6 +909,8 @@ async def admin_home(request: Request) -> Response:
     with connect() as conn:
         clients = list_allocation_clients(conn)
         settings_row = get_allocation_settings(conn)
+        suppress_rows = list_lead_suppress(conn, limit=80)
+        advisor_feedback_rows = list_lead_advisor_feedback(conn, limit=40)
         try:
             filing_count = int(
                 conn.execute("SELECT COUNT(*) FROM filings").fetchone()[0]
@@ -884,6 +924,8 @@ async def admin_home(request: Request) -> Response:
         alloc_msg=msg,
         filing_count=filing_count,
         sync_info=sync_state(),
+        suppress_rows=suppress_rows,
+        advisor_feedback_rows=advisor_feedback_rows,
     )
     return HTMLResponse(_inject_chrome(body, user))
 
@@ -898,77 +940,110 @@ async def admin_pipeline(request: Request) -> Response:
     assert user is not None
     if not user.get("is_admin"):
         return HTMLResponse("<h1>Forbidden</h1>", status_code=403)
-    q = (request.query_params.get("q") or "").strip()
-    cross_only = request.query_params.get("cross_only") == "1"
-    include_non_s1 = request.query_params.get("include_non_s1") == "1"
     msg = request.query_params.get("msg", "")
-    try:
-        months_sel = int(request.query_params.get("months", "6"))
-    except ValueError:
-        months_sel = 6
-    months_back = None if months_sel <= 0 else months_sel
-    band = (request.query_params.get("band") or "all").strip() or "all"
-    listing = normalize_listing_stage_query(request.query_params.get("listing"))
+    pf = _pipeline_review_params(request)
+    months_back = None if pf["months_sel"] <= 0 else pf["months_sel"]
     with connect() as conn:
         rows = list_lead_profiles_for_review(
             conn,
-            s1_only=not include_non_s1,
-            search=q,
+            s1_only=not pf["include_non_s1"],
+            search=pf["q"],
             limit=800,
-            cross_only=cross_only,
             months_back=months_back,
-            pay_band=band,
+            pay_band="all",
             us_registrant_hq_only=lead_desk_us_registrant_hq_only(),
-            listing_stage=listing,
+            listing_stage="all",
         )
-        total = count_lead_profiles(conn)
-        b = conn.execute("SELECT MAX(built_at) FROM lead_profile").fetchone()
-    built = ""
-    if b and b[0]:
-        built = f"Last rebuilt (UTC): {b[0]}"
-        warn_days = profile_stale_warning_days()
-        if warn_days > 0:
-            try:
-                raw_ts = str(b[0]).replace("Z", "").strip()[:19]
-                bt = datetime.strptime(raw_ts, "%Y-%m-%d %H:%M:%S").replace(
-                    tzinfo=timezone.utc
-                )
-                if (datetime.now(timezone.utc) - bt).total_seconds() > warn_days * 86400:
-                    built += (
-                        f" — materialized profiles are older than {warn_days} day(s); "
-                        "consider Rebuild profiles."
-                    )
-            except ValueError:
-                pass
-    else:
-        built = "Not built yet — run SEC sync or Rebuild below."
     from wealth_leads.config import pipeline_blur_comp_columns
-
-    if lead_desk_us_registrant_hq_only():
-        policy_hint = (
-            "U.S. registrant HQ filter is on (WEALTH_LEADS_DESK_US_HQ_ONLY): rows whose principal-office line "
-            "does not parse as a U.S. state or ZIP are hidden here, on the desk, and in desk CSV exports."
-        )
-    else:
-        policy_hint = (
-            "U.S. registrant HQ filter is off — non-U.S. registrant offices are included when they pass other gates."
-        )
 
     body = render_pipeline_review_page(
         rows=rows,
-        total_in_db=total,
-        visible_count=len(rows),
-        search=q,
-        cross_only=cross_only,
-        include_non_s1=include_non_s1,
-        months=months_sel,
+        search=pf["q"],
+        include_non_s1=pf["include_non_s1"],
+        months=pf["months_sel"],
+        tier_tab=pf["pipeline_tier_tab"],
         msg=msg,
-        built_hint=built,
-        policy_hint=policy_hint,
         pipeline_path=_pipeline_url_path(),
-        pay_band=band,
-        listing_stage=listing,
         blur_comp=pipeline_blur_comp_columns(),
+    )
+    return HTMLResponse(_inject_chrome(body, user))
+
+
+@app.get("/admin/pipeline/company", response_class=HTMLResponse)
+@app.get("/pipeline/company", response_class=HTMLResponse)
+async def admin_pipeline_company(request: Request) -> Response:
+    redir = _auth_redirect(request)
+    if redir is not None:
+        return redir
+    user = _session_user(request)
+    assert user is not None
+    if not user.get("is_admin"):
+        return HTMLResponse("<h1>Forbidden</h1>", status_code=403)
+    cik = (request.query_params.get("cik") or "").strip()
+    if not cik:
+        return RedirectResponse(_pipeline_url_path(), status_code=302)
+    pf = _pipeline_review_params(request)
+    months_back = None if pf["months_sel"] <= 0 else pf["months_sel"]
+    pp = _pipeline_url_path()
+    back_qs: dict[str, str] = {
+        "q": pf["q"],
+        "months": str(pf["months_sel"]),
+        "include_non_s1": "1" if pf["include_non_s1"] else "",
+        "tier": pf["pipeline_tier_tab"],
+    }
+    back_href = pp + "?" + urlencode({k: v for k, v in back_qs.items() if v})
+
+    with connect() as conn:
+        rows = list_lead_profiles_for_review(
+            conn,
+            s1_only=not pf["include_non_s1"],
+            search=pf["q"],
+            limit=800,
+            months_back=months_back,
+            pay_band="all",
+            us_registrant_hq_only=lead_desk_us_registrant_hq_only(),
+            listing_stage="all",
+            cik=cik,
+        )
+        outreach_by_norm = list_advisor_lead_outreach_status_by_norm_for_cik(
+            conn, int(user["id"]), cik
+        )
+    from wealth_leads.config import pipeline_blur_comp_columns
+
+    company_name = (
+        (rows[0]["company_name"] or "").strip()
+        if rows
+        else f"CIK {cik}"
+    )
+    raw_sb = (request.query_params.get("sales_bundle") or "").strip()
+    sb_cur = (
+        normalize_sales_bundle_query(raw_sb)
+        if raw_sb
+        else "economy"
+    )
+    if sb_cur == "premium" and not user_may_view_pipeline_exec_bundle(user):
+        return HTMLResponse(
+            "<h1>Not included in your access</h1>"
+            "<p>The executive roster is sold separately. Use the roster link from your "
+            "subscription, or contact the administrator.</p>"
+            '<p class="dim"><a href="'
+            + html_module.escape(back_href, quote=True)
+            + '">Back to pipeline</a></p>',
+            status_code=403,
+        )
+    rows_view = filter_rows_sales_bundle(rows, sb_cur)
+
+    body = render_pipeline_company_page(
+        rows=rows_view,
+        sales_bundle=sb_cur,
+        company_name=company_name,
+        back_href=back_href,
+        blur_comp=pipeline_blur_comp_columns(),
+        outreach_by_norm=outreach_by_norm,
+        pipeline_path=_pipeline_url_path(),
+        search=pf["q"],
+        months=pf["months_sel"],
+        include_non_s1=pf["include_non_s1"],
     )
     return HTMLResponse(_inject_chrome(body, user))
 
@@ -985,10 +1060,7 @@ async def admin_pipeline_rebuild(request: Request) -> RedirectResponse:
         return RedirectResponse("/my-leads", status_code=302)
     with connect() as conn:
         st = rebuild_lead_profiles(conn)
-    summary = (
-        f"Rebuilt lead_profile: {st['rows_written']} rows "
-        f"({st.get('cross_company_flagged', 0)} multi-CIK hints)."
-    )
+    summary = f"Rebuilt lead_profile: {st['rows_written']} rows."
     return RedirectResponse(
         _pipeline_url_path() + "?msg=" + quote(summary),
         status_code=302,
@@ -1005,35 +1077,24 @@ async def admin_pipeline_csv(request: Request) -> Response:
     assert user is not None
     if not user.get("is_admin"):
         return HTMLResponse("Forbidden", status_code=403)
-    q = (request.query_params.get("q") or "").strip()
-    cross_only = request.query_params.get("cross_only") == "1"
-    include_non_s1 = request.query_params.get("include_non_s1") == "1"
-    try:
-        months_sel = int(request.query_params.get("months", "6"))
-    except ValueError:
-        months_sel = 6
-    months_back = None if months_sel <= 0 else months_sel
-    band = (request.query_params.get("band") or "all").strip() or "all"
-    listing = normalize_listing_stage_query(request.query_params.get("listing"))
+    pf = _pipeline_review_params(request)
+    months_back = None if pf["months_sel"] <= 0 else pf["months_sel"]
     with connect() as conn:
         rows = list_lead_profiles_for_review(
             conn,
-            s1_only=not include_non_s1,
-            search=q,
+            s1_only=not pf["include_non_s1"],
+            search=pf["q"],
             limit=5000,
-            cross_only=cross_only,
             months_back=months_back,
-            pay_band=band,
+            pay_band="all",
             us_registrant_hq_only=lead_desk_us_registrant_hq_only(),
-            listing_stage=listing,
+            listing_stage="all",
         )
 
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(
         [
-            "pay_band_filter",
-            "listing_stage_filter",
             "cross_company_hint",
             "cik",
             "person_norm",
@@ -1076,7 +1137,6 @@ async def admin_pipeline_csv(request: Request) -> Response:
         cash_excl = pipeline_cash_excl_equity_from_row(r)
         w.writerow(
             [
-                band,
                 r["cross_company_hint"],
                 r["cik"],
                 r["person_norm"],
@@ -1258,30 +1318,62 @@ async def admin_allocate(
     rep = replace in ("1", "on", "true")
     with connect() as conn:
         profiles_all = _build_profiles(conn)
-        us_only = lead_desk_us_registrant_hq_only()
-        incl_bo = lead_desk_include_beneficial_only_leads()
-        filtered: list[dict[str, Any]] = []
-        for p in profiles_all:
-            if not is_acceptable_lead_person_name(_profile_display_name_for_quality_gate(p)):
-                continue
-            if not incl_bo and _is_beneficial_only_lead(p):
-                continue
-            if us_only and not registrant_hq_line_parses_as_united_states(
-                (p.get("issuer_headquarters") or "").strip()
-            ):
-                continue
-            filtered.append(p)
+        desk = _lead_desk_filter_profiles(profiles_all, conn)
+        filtered = [
+            p
+            for p in desk
+            if is_acceptable_lead_person_name(_profile_display_name_for_quality_gate(p))
+        ]
         stats = assign_for_cycle(
             conn,
             cycle_yyyymm=cy,
             profiles_all=filtered,
             replace=rep,
         )
+    sg = int(stats.get("skipped_assignment_gate") or 0)
     summary = (
         f"Cycle {cy}: assigned {stats['assigned']} of {stats['candidates']} candidates; "
-        f"skipped no-eligible {stats['skipped_no_eligible']}, exclusive {stats['skipped_exclusive']}."
+        f"skipped no-eligible {stats['skipped_no_eligible']}, exclusive {stats['skipped_exclusive']}"
+        + (f", assignment rules {sg}" if sg else "")
+        + "."
     )
     return RedirectResponse("/admin?msg=" + quote(summary), status_code=302)
+
+
+@app.post("/admin/suppress")
+async def admin_suppress_post(
+    request: Request,
+    action: str = Form("add"),
+    cik: str = Form(""),
+    person_norm: str = Form(""),
+    person_name: str = Form(""),
+    reason: str = Form(""),
+) -> RedirectResponse:
+    redir = _auth_redirect(request)
+    if redir is not None:
+        return redir
+    user = _session_user(request)
+    assert user is not None
+    if not user.get("is_admin"):
+        return RedirectResponse("/my-leads", status_code=302)
+    ck = (cik or "").strip()
+    pn = (person_norm or "").strip()
+    if not pn and (person_name or "").strip():
+        pn = _norm_person_name(person_name)
+    act = (action or "add").strip().lower()
+    if not ck or not pn:
+        return RedirectResponse(
+            "/admin?msg=" + quote("Suppress: need CIK and person norm (or display name)."),
+            status_code=302,
+        )
+    with connect() as conn:
+        if act == "delete":
+            delete_lead_suppress(conn, cik=ck, person_norm=pn)
+            msg = "Removed from suppress list."
+        else:
+            insert_lead_suppress(conn, cik=ck, person_norm=pn, reason=reason)
+            msg = "Added to suppress list."
+    return RedirectResponse("/admin?msg=" + quote(msg), status_code=302)
 
 
 @app.post("/admin/client/{user_id}")
@@ -1328,20 +1420,60 @@ async def admin_desk(request: Request) -> Response:
     if not user.get("is_admin"):
         return HTMLResponse("<h1>Forbidden</h1>", status_code=403)
     profiles, _pa, leads, comp, stats = _load_page_data()
-    band = (request.query_params.get("band") or "all").strip() or "all"
-    listing = normalize_listing_stage_query(request.query_params.get("listing"))
-    desk_view = filter_profiles_pay_band(profiles, band)
-    desk_view = filter_profiles_listing_stage(desk_view, listing)
+    n_prem_co, n_eco_co = desk_sales_bundle_company_counts(profiles)
+    sb = normalize_sales_bundle_query(request.query_params.get("sales_bundle"))
+    filtered = filter_profiles_sales_bundle(profiles, sb)
     body = _page_desk(
-        desk_view,
+        filtered,
         leads,
         comp,
         stats,
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        pay_band=band,
-        listing_stage=listing,
         nav_base_path="/admin/desk",
         desk_universe_count=len(profiles),
+        sales_bundle=sb,
+        premium_company_count=n_prem_co,
+        economy_company_count=n_eco_co,
+    )
+    return HTMLResponse(_inject_chrome(body, user))
+
+
+@app.get("/admin/desk/company", response_model=None)
+async def admin_desk_company(request: Request) -> Response:
+    redir = _auth_redirect(request)
+    if redir is not None:
+        return redir
+    user = _session_user(request)
+    assert user is not None
+    if not user.get("is_admin"):
+        return HTMLResponse("<h1>Forbidden</h1>", status_code=403)
+    cik_w = (request.query_params.get("cik") or "").strip()
+    if not cik_w:
+        return HTMLResponse(
+            "<h1>Bad request</h1><p>Missing <code>cik</code>. Open the desk and click a company.</p>",
+            status_code=400,
+        )
+    profiles, _pa, leads, comp, stats = _load_page_data(omit_audit_tables=True)
+    at_cik = [p for p in profiles if str(p.get("cik") or "").strip() == cik_w]
+    filtered_cik = list(at_cik)
+    filtered_cik.sort(key=_desk_sort_tuple, reverse=True)
+    sb = normalize_sales_bundle_query(request.query_params.get("sales_bundle"))
+    filtered_cik = filter_profiles_sales_bundle(filtered_cik, sb)
+    co_name = ""
+    if filtered_cik:
+        co_name = (filtered_cik[0].get("company_name") or "").strip()
+    elif at_cik:
+        co_name = (at_cik[0].get("company_name") or "").strip()
+    body = _page_desk_company(
+        filtered_cik,
+        leads,
+        comp,
+        stats,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        cik=cik_w,
+        company_name=co_name,
+        nav_base_path="/admin/desk",
+        sales_bundle=sb,
     )
     return HTMLResponse(_inject_chrome(body, user))
 
@@ -1361,19 +1493,17 @@ async def admin_finder(
     assert user is not None
     if not user.get("is_admin"):
         return HTMLResponse("<h1>Forbidden</h1>", status_code=403)
-    profiles, profiles_all, _leads, _comp, stats = _load_page_data()
+    profiles, profiles_all, _leads, _comp, stats = _load_page_data(
+        omit_audit_tables=True
+    )
     use_all = bool(all_neo)
     base = profiles_all if use_all else profiles
-    band = (request.query_params.get("band") or "all").strip() or "all"
-    listing = normalize_listing_stage_query(request.query_params.get("listing"))
     filtered = filter_profiles_geo_industry_text(
         base,
         location_sub=hq,
         industry_sub=industry,
         text_sub=q,
     )
-    filtered = filter_profiles_pay_band(filtered, band)
-    filtered = filter_profiles_listing_stage(filtered, listing)
     body = _page_finder(
         filtered,
         stats=stats,
@@ -1383,8 +1513,6 @@ async def admin_finder(
         q=q,
         all_neo=use_all,
         base_count=len(base),
-        pay_band=band,
-        listing_stage=listing,
         nav_base_path="/admin/finder",
         form_action="/admin/finder",
         desk_href="/admin/desk",
@@ -1412,6 +1540,7 @@ async def lead(
     request: Request,
     cik: str = "",
     name: str = "",
+    msg: str = "",
 ) -> Response:
     redir = _auth_redirect(request)
     if redir is not None:
@@ -1421,6 +1550,7 @@ async def lead(
     from wealth_leads.serve import _norm_person_name
 
     norm = _norm_person_name(name)
+    lead_page_msg = (msg or "").strip()
     if not user.get("is_admin"):
         with connect() as conn:
             ok = conn.execute(
@@ -1474,6 +1604,9 @@ async def lead(
         important_llm: list[dict[str, Any]] = []
         beneficial_stake_detail: dict[str, Any] | None = None
         beneficial_filing_caveats = ""
+        lead_recency: dict[str, Any] = {}
+        lead_feedback_html = ""
+        lead_outreach_html = ""
         if prof is not None and not stats.get("missing_db"):
             with connect() as conn:
                 filings = _filings_for_profile(conn, cik, norm)
@@ -1518,6 +1651,30 @@ async def lead(
                         )
                     except sqlite3.Error:
                         important_llm = []
+                try:
+                    lead_recency = lead_issuer_recency_bundle(
+                        conn, (cik or "").strip()
+                    )
+                except sqlite3.Error:
+                    lead_recency = {}
+            pn_fb = (prof.get("norm_name") or "").strip() or norm
+            ck_fb = (cik or "").strip()
+            if pn_fb and ck_fb:
+                lead_feedback_html = lead_feedback_form_html(ck_fb, pn_fb)
+                uid = user.get("id")
+                if uid is not None:
+                    with connect() as conn_o:
+                        row_o = get_advisor_lead_outreach(conn_o, int(uid), ck_fb, pn_fb)
+                    cur_o: dict[str, str] | None = None
+                    if row_o is not None:
+                        cur_o = {
+                            "email": str(row_o["email"] or ""),
+                            "status": str(row_o["status"] or "none"),
+                            "notes": str(row_o["notes"] or ""),
+                        }
+                    lead_outreach_html = lead_outreach_form_html(
+                        ck_fb, pn_fb, current=cur_o
+                    )
         body = _page_lead(
             prof,
             filings,
@@ -1531,6 +1688,10 @@ async def lead(
             important_people_llm=important_llm,
             beneficial_stake_detail=beneficial_stake_detail,
             beneficial_filing_caveats=beneficial_filing_caveats,
+            lead_recency=lead_recency,
+            lead_feedback_html=lead_feedback_html,
+            lead_outreach_html=lead_outreach_html,
+            lead_page_msg=lead_page_msg,
         )
         return HTMLResponse(_inject_chrome(body, user))
     except Exception as e:
@@ -1541,6 +1702,127 @@ async def lead(
             f"<p style='color:#8b96a3;font-size:0.85rem'>{html_module.escape(str(e))}</p>",
             status_code=500,
         )
+
+
+@app.post("/lead/feedback", response_model=None)
+async def lead_feedback_post(
+    request: Request,
+    cik: str = Form(...),
+    person_norm: str = Form(...),
+    category: str = Form("other"),
+    note: str = Form(""),
+    also_suppress: str = Form(""),
+) -> Response:
+    redir = _auth_redirect(request)
+    if redir is not None:
+        return redir
+    user = _session_user(request)
+    assert user is not None
+    ck = (cik or "").strip()
+    pn = (person_norm or "").strip()
+    if not ck or not pn:
+        return HTMLResponse("<h1>Bad request</h1><p>Missing cik or person_norm.</p>", 400)
+    if not user.get("is_admin"):
+        with connect() as conn:
+            ok = conn.execute(
+                """
+                SELECT 1 FROM lead_assignments
+                WHERE user_id = ? AND cik = ? AND person_norm = ? LIMIT 1
+                """,
+                (user["id"], ck, pn),
+            ).fetchone()
+        if not ok:
+            return HTMLResponse(
+                "<h1>Forbidden</h1><p>Feedback only for leads assigned to you.</p>",
+                status_code=403,
+            )
+    email = str(user.get("email") or "").strip()
+    suppress = also_suppress.strip().lower() in ("1", "on", "true", "yes")
+    try:
+        with connect() as conn:
+            insert_lead_advisor_feedback(
+                conn,
+                cik=ck,
+                person_norm=pn,
+                category=category,
+                note=note,
+                user_email=email,
+                also_suppress=suppress,
+            )
+    except sqlite3.Error:
+        return HTMLResponse(
+            "<h1>Database error</h1><p>Could not save feedback.</p>", status_code=500
+        )
+    q = urlencode(
+        {
+            "cik": ck,
+            "name": pn,
+            "msg": "Feedback recorded — thank you.",
+        }
+    )
+    return RedirectResponse(f"/lead?{q}", status_code=302)
+
+
+@app.post("/lead/outreach", response_model=None)
+async def lead_outreach_post(
+    request: Request,
+    cik: str = Form(...),
+    person_norm: str = Form(...),
+    email: str = Form(""),
+    status: str = Form("none"),
+    notes: str = Form(""),
+) -> Response:
+    redir = _auth_redirect(request)
+    if redir is not None:
+        return redir
+    user = _session_user(request)
+    assert user is not None
+    ck = (cik or "").strip()
+    pn = (person_norm or "").strip()
+    if not ck or not pn:
+        return HTMLResponse("<h1>Bad request</h1><p>Missing cik or person_norm.</p>", 400)
+    uid = user.get("id")
+    if uid is None:
+        return HTMLResponse(
+            "<h1>Forbidden</h1><p>Sign in to save outreach.</p>", status_code=403
+        )
+    if not user.get("is_admin"):
+        with connect() as conn:
+            ok = conn.execute(
+                """
+                SELECT 1 FROM lead_assignments
+                WHERE user_id = ? AND cik = ? AND person_norm = ? LIMIT 1
+                """,
+                (int(uid), ck, pn),
+            ).fetchone()
+        if not ok:
+            return HTMLResponse(
+                "<h1>Forbidden</h1><p>Outreach only for leads assigned to you.</p>",
+                status_code=403,
+            )
+    try:
+        with connect() as conn:
+            upsert_advisor_lead_outreach(
+                conn,
+                int(uid),
+                ck,
+                pn,
+                email=email,
+                status=status,
+                notes=notes,
+            )
+    except sqlite3.Error:
+        return HTMLResponse(
+            "<h1>Database error</h1><p>Could not save outreach.</p>", status_code=500
+        )
+    q = urlencode(
+        {
+            "cik": ck,
+            "name": pn,
+            "msg": "Outreach saved.",
+        }
+    )
+    return RedirectResponse(f"/lead?{q}", status_code=302)
 
 
 @app.get("/watchlist", response_model=None)
@@ -1652,8 +1934,6 @@ async def export_finder_csv(
     industry: str = "",
     q: str = "",
     all_neo: int = 0,
-    band: str = "all",
-    listing: str = "",
 ) -> Response:
     redir = _auth_redirect(request)
     if redir is not None:
@@ -1662,8 +1942,7 @@ async def export_finder_csv(
     assert u is not None
     if not u.get("is_admin"):
         return HTMLResponse("<h1>Forbidden</h1><p>Admin only.</p>", status_code=403)
-    profiles, profiles_all, _l, _c, _s = _load_page_data()
-    list_cur = normalize_listing_stage_query(listing)
+    profiles, profiles_all, _l, _c, _s = _load_page_data(omit_audit_tables=True)
     data = finder_export_csv_bytes(
         profiles_all=profiles_all,
         profiles_desk=profiles,
@@ -1671,8 +1950,6 @@ async def export_finder_csv(
         industry=industry,
         q=q,
         all_neo=bool(all_neo),
-        pay_band=(band or "all").strip() or "all",
-        listing_stage=list_cur,
     )
 
     def gen():
@@ -1691,8 +1968,7 @@ async def export_finder_csv(
 @app.get("/export/desk.csv", response_model=None)
 async def export_desk_csv(
     request: Request,
-    band: str = "all",
-    listing: str = "all",
+    sales_bundle: str = "premium",
 ) -> Response:
     redir = _auth_redirect(request)
     if redir is not None:
@@ -1701,17 +1977,14 @@ async def export_desk_csv(
     assert u is not None
     if not u.get("is_admin"):
         return HTMLResponse("<h1>Forbidden</h1><p>Admin only.</p>", status_code=403)
-    profiles, _pa, _leads, _comp, _stats = _load_page_data()
-    band_cur = (band or "all").strip() or "all"
-    list_cur = normalize_listing_stage_query(listing)
-    desk_rows = filter_profiles_pay_band(profiles, band_cur)
-    desk_rows = filter_profiles_listing_stage(desk_rows, list_cur)
+    profiles, _pa, _leads, _comp, _stats = _load_page_data(omit_audit_tables=True)
+    sb_cur = normalize_sales_bundle_query(sales_bundle)
+    desk_rows = filter_profiles_sales_bundle(profiles, sb_cur)
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(
         [
-            "pay_band_filter",
-            "listing_stage_filter",
+            "sales_bundle_filter",
             "display_name",
             "company_name",
             "cik",
@@ -1729,8 +2002,7 @@ async def export_desk_csv(
     for p in desk_rows:
         w.writerow(
             [
-                band_cur,
-                list_cur,
+                sb_cur,
                 p.get("display_name") or "",
                 p.get("company_name") or "",
                 p.get("cik") or "",
@@ -1762,4 +2034,5 @@ async def export_desk_csv(
 
 @app.get("/healthz")
 async def healthz() -> dict:
+    """Cheap liveness probe (load balancers / Docker). Does not open SQLite — safe if DB is locked."""
     return {"ok": True, "db": str(database_path())}

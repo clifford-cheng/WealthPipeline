@@ -10,8 +10,12 @@ from wealth_leads.config import (
     database_path,
     enrich_client_research_after_sync_enabled,
     enrich_client_research_after_sync_limit,
+    fetch_standalone_issuer_sec_hints,
     follow_10k_for_s1_ciks,
+    follow_8k_for_s1_ciks,
+    issuer_sec_hints_min_refresh_days,
     submissions_10k_per_cik,
+    submissions_8k_per_cik,
     sync_form_types,
 )
 from wealth_leads.compensation import NeoCompRow, extract_neo_compensation_from_s1
@@ -54,8 +58,18 @@ from wealth_leads.parse_index import (
     primary_document_url_for_form,
 )
 from wealth_leads.rss import RssFiling, fetch_current_feed
-from wealth_leads.submissions import recent_10k_rss_filings_for_cik, s1_ciks_with_latest_name
+from wealth_leads.submissions import (
+    recent_submission_filings_for_cik,
+    refresh_issuer_sec_hints_if_stale,
+    s1_ciks_with_latest_name,
+    submission_form_is_8k,
+)
 from wealth_leads.sec_client import get_text
+
+
+def _form_is_s1_registration_family(form_type: str) -> bool:
+    ft = (form_type or "").upper().replace(" ", "")
+    return "S-1" in ft or "F-1" in ft
 
 
 def _neo_comp_db_rows(
@@ -326,7 +340,7 @@ def _process_rss_item(
     mgmt_off = extract_executive_officers_from_filing_html(body_html)
     sig_off = extract_officers_from_s1_html(body_html)
     officers = merge_officer_rows(mgmt_off, sig_off)
-    if not officers:
+    if not officers and _form_is_s1_registration_family(item.form_type):
         print(
             f"[warn] No officers parsed: {item.company_name} ({item.accession})",
             file=sys.stderr,
@@ -358,17 +372,24 @@ def _process_rss_item(
     dts = extract_director_term_summary_from_filing_html(body_html)
     update_filing_director_term_summary(conn, filing_id, dts)
 
-    comps = extract_neo_compensation_from_s1(body_html)
-    replace_neo_compensation(conn, filing_id, _neo_comp_db_rows(filing_id, comps))
-    replace_beneficial_owner_stakes(
-        conn, filing_id, beneficial_owner_rows_for_db(body_html)
-    )
-    if not comps:
-        print(
-            f"[warn] No NEO summary comp table: {item.company_name} "
-            f"({item.accession})",
-            file=sys.stderr,
-        )
+    if submission_form_is_8k(item.form_type):
+        replace_neo_compensation(conn, filing_id, [])
+        replace_beneficial_owner_stakes(conn, filing_id, [])
+    else:
+        comps = extract_neo_compensation_from_s1(body_html)
+        replace_neo_compensation(conn, filing_id, _neo_comp_db_rows(filing_id, comps))
+        if _form_is_s1_registration_family(item.form_type):
+            replace_beneficial_owner_stakes(
+                conn, filing_id, beneficial_owner_rows_for_db(body_html)
+            )
+        else:
+            replace_beneficial_owner_stakes(conn, filing_id, [])
+        if not comps:
+            print(
+                f"[warn] No NEO summary comp table: {item.company_name} "
+                f"({item.accession})",
+                file=sys.stderr,
+            )
 
 
 def sync(*, force_reprocess: bool = False) -> None:
@@ -394,20 +415,50 @@ def sync(*, force_reprocess: bool = False) -> None:
             _process_rss_item(conn, item, session, force_reprocess=force_reprocess)
 
         n_follow = 0
+        n_hints_only = 0
         per_10k = submissions_10k_per_cik()
-        if follow_10k_for_s1_ciks() and per_10k > 0:
-            cik_rows = s1_ciks_with_latest_name(conn)
+        per_8k = submissions_8k_per_cik()
+        want_10k = follow_10k_for_s1_ciks() and per_10k > 0
+        want_8k = follow_8k_for_s1_ciks() and per_8k > 0
+        mx10 = per_10k if want_10k else 0
+        mx8 = per_8k if want_8k else 0
+        standalone_hints = fetch_standalone_issuer_sec_hints()
+        min_hint_days = issuer_sec_hints_min_refresh_days()
+        cik_rows = s1_ciks_with_latest_name(conn)
+        if mx10 > 0 or mx8 > 0:
             for cik, cname in cik_rows:
-                for extra in recent_10k_rss_filings_for_cik(
-                    conn, cik, cname, session, limit=per_10k
+                for extra in recent_submission_filings_for_cik(
+                    conn,
+                    cik,
+                    cname,
+                    session,
+                    max_10k=mx10,
+                    max_8k=mx8,
                 ):
                     _process_rss_item(
                         conn, extra, session, force_reprocess=force_reprocess
                     )
                     n_follow += 1
+            parts = []
+            if mx10:
+                parts.append(f"up to {mx10} 10-K/A")
+            if mx8:
+                parts.append(f"up to {mx8} 8-K/A")
             print(
-                f"10-K follow (same CIKs as S-1): {n_follow} new filing(s) from "
-                f"{len(cik_rows)} issuer(s), up to {per_10k} recent 10-K/A each",
+                f"Submissions follow (CIKs with S-1 in DB): {n_follow} new filing(s) from "
+                f"{len(cik_rows)} issuer(s); {', '.join(parts)} per issuer (one JSON fetch each)",
+                file=sys.stderr,
+            )
+        elif standalone_hints and cik_rows:
+            for cik, cname in cik_rows:
+                if refresh_issuer_sec_hints_if_stale(
+                    conn, cik, cname, session, min_days=min_hint_days
+                ):
+                    n_hints_only += 1
+            print(
+                f"Issuer SEC hints (submissions JSON only, throttled ≥{min_hint_days}d): "
+                f"refreshed for {n_hints_only} of {len(cik_rows)} S-1 CIK(s) "
+                f"(set SEC_ISSUER_HINTS_STANDALONE=0 to disable).",
                 file=sys.stderr,
             )
 
@@ -558,7 +609,7 @@ def export_compensation_csv() -> None:
 def main() -> None:
     p = argparse.ArgumentParser(
         description=(
-            "SEC filing lead pipeline: S-1 RSS + 10-K cross-reference per CIK (submissions API); "
+            "SEC filing lead pipeline: S-1 RSS + 10-K/8-K cross-reference per S-1 CIK (submissions API); "
             "optional global 10-K RSS via SEC_SYNC_FORMS."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -580,8 +631,9 @@ def main() -> None:
         help="Re-process filings even if officers + compensation already stored",
     )
     s.epilog = (
-        "Env: SEC_SYNC_FORMS (default S-1), SEC_FOLLOW_10K=1 (10-K per S-1 CIK via submissions), "
-        "SEC_10K_PER_CIK=3, SEC_RSS_COUNT. Set SEC_SYNC_FORMS=S-1,10-K for a global 10-K RSS feed too. "
+        "Env: SEC_SYNC_FORMS (default S-1), SEC_FOLLOW_10K=1, SEC_10K_PER_CIK=3, "
+        "SEC_FOLLOW_8K=1 (recent 8-K per S-1 CIK, same submissions JSON), SEC_8K_PER_CIK=5, "
+        "SEC_RSS_COUNT. Set SEC_SYNC_FORMS=S-1,10-K for a global 10-K RSS feed too. "
         "Lead desk: WEALTH_LEADS_LEAD_DESK_S1_ONLY=1 (default), "
         "WEALTH_LEADS_LEAD_DESK_MIN_SIGNAL_USD=300000 (max single-FY of SCT total vs stock+options; 0 disables). "
         "Legacy equity-only: WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD. "

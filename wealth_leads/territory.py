@@ -235,6 +235,27 @@ def strip_registrant_hq_contact_tail(s: str) -> str:
         t,
         flags=re.I,
     )
+    # Common SEC cover variants without "at this/that address" or without a colon.
+    t = re.sub(
+        r",?\s*and\s+our\s+telephone\s+number\s+is\s+.+$",
+        "",
+        t,
+        flags=re.I,
+    )
+    t = re.sub(
+        r",?\s*and\s+our\s+facsimile\s+number\s+is\s+.+$",
+        "",
+        t,
+        flags=re.I,
+    )
+    t = re.sub(r",?\s*and\s+our\s+telephone\b.*$", "", t, flags=re.I)
+    t = re.sub(r",?\s*and\s+our\s+facsimile\b.*$", "", t, flags=re.I)
+    t = re.sub(
+        r",?\s*including\s+area\s+code\b.*$",
+        "",
+        t,
+        flags=re.I,
+    )
     return t.rstrip(" ,")
 
 
@@ -308,6 +329,13 @@ def strip_hq_phone_tail_after_zip(s: str) -> str:
     t = (s or "").strip()
     if not t:
         return ""
+    # "Texas 78735 and our telephone number is …" (no comma before "and")
+    t = re.sub(
+        r"(\b\d{5}(?:-\d{4})?)\s+and\s+our\s+(?:telephone|facsimile)\b.*$",
+        r"\1",
+        t,
+        flags=re.I,
+    )
     for rx in (_HQ_TRAILING_PHONE_AFTER_ZIP, _HQ_TRAILING_PHONE_AFTER_ZIP_SPACE):
         m = rx.search(t)
         if m:
@@ -392,6 +420,10 @@ def hq_city_state_looks_like_filing_noise(s: str | None) -> bool:
             "hypothecate",
             "stockholders have agreed",
             "agree to sell",
+            "our telephone",
+            "telephone number",
+            "our facsimile",
+            "including area code",
         )
     ) or bool(
         re.search(r",\s*\d{3}[\s.-]+\d{4}\s*$", low)
@@ -414,6 +446,214 @@ _STREET_TYPE_WORD = re.compile(
     r"way|parkway|place|plaza|highway|hwy|court|ct\.?|circle|cir\.?|terrace|trail)\b",
     re.I,
 )
+
+# City side of "City, ST" must not look like a registrant street line or legal-entity name.
+_CORP_OR_ENTITY_TAIL = re.compile(
+    r"(?i)\b(?:incorporated|corporation|company|inc\.?|corp\.?|llc|l\.?l\.?c\.?|ltd\.?|plc)\s*$"
+)
+
+
+def _city_segment_plausible_for_city_state_field(seg: str) -> bool:
+    """
+    True if ``seg`` may appear as the city (left) side of a city/state pipeline label.
+    Rejects numbered streets, thoroughfare tokens, suites/boxes, and obvious issuer-name tails.
+    """
+    s = (seg or "").strip()
+    if not s or len(s) > 80:
+        return False
+    if re.match(r"^\d", s):
+        return False
+    if _STREET_TYPE_WORD.search(s):
+        return False
+    if _STREET_NOISE.search(s):
+        return False
+    if re.search(r"(?i)#\s*\d", s):
+        return False
+    if _CORP_OR_ENTITY_TAIL.search(s):
+        return False
+    return True
+
+
+def pipeline_hq_city_state_label_ok(cs: str | None) -> bool:
+    """
+    True if ``cs`` is safe for pipeline / materialized ``issuer_hq_city_state`` (city + state/region,
+    no US ZIP, no street-level left side).
+    """
+    t = (cs or "").strip()
+    if not t or hq_city_state_looks_like_filing_noise(t):
+        return False
+    if re.search(r"\b\d{5}(?:-\d{4})?\b", t):
+        return False
+    if len(t) > 88:
+        return False
+    parts = [p.strip() for p in t.split(",") if p.strip()]
+    if len(parts) < 2:
+        return False
+    city_side = ", ".join(parts[:-1]).strip()
+    st_side = parts[-1]
+    if not _city_segment_plausible_for_city_state_field(city_side):
+        return False
+    if len(st_side) > 40 or re.match(r"^\d", st_side):
+        return False
+    return True
+
+
+def hq_city_state_pipeline_only(hq: str | None) -> str:
+    """
+    Strict **city + state/region** for pipeline lists and ``issuer_hq_city_state`` materialization.
+    Returns ``""`` when :func:`hq_city_state_display` would include a street-like or issuer-name segment.
+    """
+    cs = hq_city_state_display(hq or "")
+    if cs and pipeline_hq_city_state_label_ok(cs):
+        return cs
+    return ""
+
+
+# SEC cover / MD&A sentences that sometimes remain attached to address blobs.
+_ADVISOR_CITY_ST_PROSE = re.compile(
+    r"\b(which\b|where\s+our|where\s+the|records\s+are|kept\s+and|"
+    r"principal\s+business|executive\s+offic|mailing\s+address|registered\s+agent|"
+    r"incorporated\s+in|located\s+at\s+our|business\s+address\s+for|"
+    r"our\s+records\s+are)\b",
+    re.I,
+)
+
+
+def _hq_blob_one_line(raw: str | None) -> str:
+    """Same single-line collapse as crm_ui.format_headquarters_for_ui (shared here to avoid import cycles)."""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    parts = [p.strip() for p in re.split(r"[\n\r]+", s) if p.strip()]
+    one = ", ".join(parts)
+    one = re.sub(r"[ \t]{2,}", " ", one).strip()
+    return normalize_registrant_hq_address_blob(one)
+
+
+def hq_normalize_ui_line(raw: str | None) -> str:
+    """Public alias: one-line HQ for UI compare / scoring (identical to format_headquarters_for_ui)."""
+    return _hq_blob_one_line(raw)
+
+
+def _hq_blob_trim_trailing_prose(blob: str) -> str:
+    """Drop SEC narrative often glued after the address (``..., which is where our ...``)."""
+    t = (blob or "").strip()
+    if not t:
+        return ""
+    low = t.lower()
+    for marker in (
+        ", which",
+        ", where",
+        "; which",
+        ", and is",
+        ", and our",
+    ):
+        i = low.find(marker)
+        if i > 16:
+            t = t[:i].strip().rstrip(",;")
+            low = t.lower()
+    return t
+
+
+def hq_advisor_city_state_only(hq: str | None) -> str:
+    """
+    **City, ST** only (known US state), for advisor territory / company desk — no street, ZIP,
+    country suffix, or filing prose. Returns ``""`` if we cannot produce a confident US city + state.
+    """
+    if not (hq or "").strip():
+        return ""
+    blob = _hq_blob_one_line(hq)
+    for sep in (" · ", " \u00b7 "):
+        if sep in blob:
+            blob = blob.split(sep, 1)[0].strip()
+            break
+    blob = _hq_blob_trim_trailing_prose(blob)
+    cs = hq_city_state_display(blob)
+    if not cs:
+        return ""
+    t = _finalize_city_state_no_zip(cs).strip()
+    if not t or hq_city_state_looks_like_filing_noise(t):
+        return ""
+    if _ADVISOR_CITY_ST_PROSE.search(t):
+        return ""
+    if len(t) > 44:
+        return ""
+    m = re.match(r"^(.+),\s*([A-Z]{2})\s*$", t)
+    if not m:
+        return ""
+    city = re.sub(r"\s+", " ", m.group(1).strip())
+    st_tok = m.group(2).upper()
+    st = _norm_state_token(st_tok)
+    if not st:
+        return ""
+    if re.match(r"^\d", city):
+        return ""
+    if len(city) < 2 or len(city) > 36:
+        return ""
+    return f"{city}, {st}"
+
+
+def hq_looks_like_street_plus_state_only(raw: str | None) -> bool:
+    """
+    True for strings like ``440 Stevens Ave, CA`` — street + 2-letter state (optional ZIP)
+    with no city segment. These parse poorly for territory and should not be shown as a full location.
+    """
+    s0 = _hq_blob_one_line(raw)
+    if not s0:
+        return False
+    s = _scrub_hq_for_location(normalize_registrant_hq_address_blob(s0)).strip(" ,")
+    if not s:
+        return False
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    if len(parts) != 2:
+        return False
+    street_seg, state_seg = parts[0], parts[1]
+    st = re.sub(r"\s+\d{5}(?:-\d{4})?\s*$", "", state_seg, flags=re.I).strip()
+    if len(st) != 2 or not st.isalpha():
+        return False
+    if not _norm_state_token(st.upper()):
+        return False
+    if not re.match(r"^\d+\s+", street_seg):
+        return False
+    if not _STREET_TYPE_WORD.search(street_seg):
+        return False
+    return True
+
+
+def company_registrant_location_display(hq: str | None, *, max_len: int = 140) -> str:
+    """
+    One line for company rosters: validated **City, ST** when parseable; optional street
+    after `` · `` when the first address segment is clearly a street line. Returns ``""``
+    when the only parseable form is street+state-only junk.
+    """
+    if not (hq or "").strip():
+        return ""
+    if hq_looks_like_street_plus_state_only(hq):
+        return ""
+    cs = hq_city_state_display(hq)
+    if cs and not hq_city_state_looks_like_filing_noise(cs):
+        s_scrub = _scrub_hq_for_location(
+            normalize_registrant_hq_address_blob(_hq_blob_one_line(hq))
+        ).strip(" ,")
+        if s_scrub and hq_has_registrant_address_detail(hq):
+            segs = [p.strip() for p in s_scrub.split(",") if p.strip()]
+            if segs:
+                street = segs[0]
+                city_part = cs.split(",")[0].strip().lower()
+                if (
+                    not _segment_is_location_noise(street)
+                    and re.match(r"^\d+\s+", street)
+                    and _STREET_TYPE_WORD.search(street)
+                    and (not city_part or city_part not in street.lower())
+                ):
+                    return f"{cs} · {street}"[:max_len]
+        return cs[:max_len]
+    if headquarters_looks_like_lease_narrative(_hq_blob_one_line(hq)):
+        return ""
+    pl = hq_principal_office_display_line(hq, max_len=max_len)
+    if pl and is_plausible_registrant_headquarters(hq):
+        return pl[:max_len]
+    return ""
 
 
 def hq_has_registrant_address_detail(hq: str | None) -> bool:
@@ -492,6 +732,11 @@ def _segment_is_location_noise(seg: str) -> bool:
         s,
     ):
         return True
+    if re.search(
+        r"(?i)\bour\s+telephone\b|\bour\s+facsimile\b|\btelephone\s+number\s+is\b",
+        s,
+    ):
+        return True
     low_seg = s.lower().strip()
     if len(low_seg) <= 3 and low_seg.isalpha() and low_seg not in (
         "usa",
@@ -533,7 +778,8 @@ def _us_state_abbr_from_token(tok: str) -> Optional[str]:
 def hq_city_state_display(hq: str | None) -> str:
     """
     City + US state (2-letter), or city + country / region — no street, no US ZIP.
-    For materialized ``issuer_hq_city_state`` and pipeline Location column.
+    Pipeline tables and ``issuer_hq_city_state`` should use :func:`hq_city_state_pipeline_only`
+    so labels never pick a street line or issuer-name segment as the city side.
     """
     def _emit(line: str) -> str:
         t = _finalize_city_state_no_zip((line or "").strip())
@@ -587,21 +833,34 @@ def hq_city_state_display(hq: str | None) -> str:
             if len(seg) < 2:
                 i -= 1
                 continue
-            return _emit(f"{_strip_zip_from_seg(seg)}, {st}")
+            seg_city = _strip_zip_from_seg(seg)
+            if not _city_segment_plausible_for_city_state_field(seg_city):
+                i -= 1
+                continue
+            return _emit(f"{seg_city}, {st}")
 
     if len(clean) >= 2:
         a, b = clean[-2], clean[-1]
         b2 = _strip_zip_from_seg(b)
         a2 = _strip_zip_from_seg(a)
         st_b = _us_state_abbr_from_token(b2)
-        if st_b:
+        if st_b and _city_segment_plausible_for_city_state_field(a2):
             return _emit(f"{a2}, {st_b}")
-        if not _segment_is_location_noise(a2) and not _segment_is_location_noise(b2):
-            if len(b2) <= 36 and len(a2) <= 80:
-                return _emit(f"{a2}, {b2}")
+        if (
+            not _segment_is_location_noise(a2)
+            and not _segment_is_location_noise(b2)
+            and _city_segment_plausible_for_city_state_field(a2)
+            and len(b2) <= 36
+            and len(a2) <= 80
+        ):
+            return _emit(f"{a2}, {b2}")
     one = _strip_zip_from_seg(clean[-1])
     if len(one) <= 48 and not re.match(r"^\d", one):
         if _segment_is_location_noise(one) or _MONTH_DAY_ONLY.match(one):
+            return ""
+        if _us_state_abbr_from_token(one):
+            return ""
+        if not _city_segment_plausible_for_city_state_field(one):
             return ""
         return _emit(one)
     return ""
@@ -653,6 +912,8 @@ def is_plausible_registrant_headquarters(hq: str | None) -> bool:
         return False
     scrub = _scrub_hq_for_location(s)
     if not scrub or len(scrub) < 8:
+        return False
+    if hq_looks_like_street_plus_state_only(s):
         return False
     if hq_principal_office_display_line(s) == "" and hq_city_state_display(s) == "":
         return False

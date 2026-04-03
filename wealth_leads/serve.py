@@ -27,10 +27,14 @@ from wealth_leads.config import (
     email_smtp_probe_max_candidates,
     email_smtp_verify_enabled,
     lead_desk_equity_only_min_usd,
+    lead_desk_exclude_issuer_risk_high,
     lead_desk_include_beneficial_only_leads,
+    lead_desk_include_visibility_tier,
     lead_desk_min_signal_usd,
     lead_desk_s1_only,
     lead_desk_us_registrant_hq_only,
+    lead_page_stale_issuer_months,
+    desk_company_preview_blur,
 )
 from wealth_leads.advisor_pack import (
     apply_smtp_probes_to_candidates,
@@ -41,9 +45,12 @@ from wealth_leads.db import (
     connect,
     get_lead_client_research,
     issuer_listing_stage_map,
+    lead_suppress_pair_set,
     list_beneficial_owner_outreach_targets_for_cik,
     list_beneficial_owner_stakes_for_cik,
+    max_filing_date_for_cik,
 )
+from wealth_leads.issuer_lead_quality import issuer_adverse_signal_map
 from wealth_leads.lead_research import row_to_client_research_dict
 from wealth_leads.management import issuer_summary_looks_spammy, why_surfaced_line
 from wealth_leads.profile_build import _effective_other_comp
@@ -53,10 +60,16 @@ from wealth_leads.person_quality import (
     refine_lead_person_name,
 )
 from wealth_leads.territory import (
+    hq_advisor_city_state_only,
     hq_city_state_display,
+    hq_city_state_pipeline_only,
     hq_city_state_looks_like_filing_noise,
+    hq_has_registrant_address_detail,
+    hq_looks_like_street_plus_state_only,
+    hq_normalize_ui_line,
     hq_principal_office_display_line,
     is_plausible_registrant_headquarters,
+    pipeline_hq_city_state_label_ok,
     registrant_hq_line_parses_as_united_states,
 )
 from wealth_leads.title_badge import advisor_title_badge
@@ -521,6 +534,47 @@ def _annotate_lead_tier_fields(p: dict) -> None:
     p["why_surfaced"] = (base + suffix).strip()
 
 
+def profile_sales_bundle(p: dict) -> str:
+    """Sales SKU for one person: premium vs economy (same issuer can be sold as two bundles)."""
+    return sales_bundle_from_lead_tier(p.get("lead_tier") or _profile_lead_tier(p))
+
+
+def filter_profiles_sales_bundle(profiles: list[dict], sales_bundle: str) -> list[dict]:
+    cur = normalize_sales_bundle_query(sales_bundle)
+    return [p for p in profiles if profile_sales_bundle(p) == cur]
+
+
+def desk_sales_bundle_company_counts(profiles: list[dict]) -> tuple[int, int]:
+    """How many distinct CIKs have at least one premium vs economy person (after pay/listing filters)."""
+    prem: set[str] = set()
+    eco: set[str] = set()
+    for p in profiles:
+        ck = str(p.get("cik") or "").strip()
+        if not ck:
+            continue
+        tier = profile_sales_bundle(p)
+        if tier == "premium":
+            prem.add(ck)
+        elif tier == "economy":
+            eco.add(ck)
+    return len(prem), len(eco)
+
+
+def filter_rows_sales_bundle(rows: list[Any], sales_bundle: str) -> list[Any]:
+    """Pipeline ``lead_profile`` rows: filter by premium vs economy tier."""
+    cur = normalize_sales_bundle_query(sales_bundle)
+    out: list[Any] = []
+    for r in rows:
+        lt = ""
+        try:
+            lt = r["lead_tier"]
+        except (KeyError, TypeError, IndexError):
+            pass
+        if sales_bundle_from_lead_tier(lt) == cur:
+            out.append(r)
+    return out
+
+
 def _issuer_listing_stage_ui(p: dict) -> tuple[str, str, str]:
     """Return (stage_key, short_label, title_tooltip)."""
     st = (p.get("issuer_listing_stage") or "unknown").strip().lower()
@@ -553,6 +607,67 @@ def _issuer_listing_stage_badge_html(p: dict) -> str:
     )
 
 
+def _issuer_risk_lead_banner_html(p: dict) -> str:
+    lvl = (p.get("issuer_risk_level") or "none").strip().lower()
+    if lvl not in ("elevated", "high"):
+        return ""
+    raw_rs = p.get("issuer_risk_reasons") or []
+    reasons = raw_rs if isinstance(raw_rs, list) else []
+    detail = html.escape(
+        "; ".join(str(x) for x in reasons[:8] if x),
+        quote=False,
+    )
+    if lvl == "high":
+        return (
+            '<div class="lead-issuer-risk lead-issuer-risk-high" role="alert">'
+            "<p style=\"margin:0\"><strong>High issuer risk (filing text scan).</strong> "
+            "Stored issuer summary matches phrases often tied to distress, bankruptcy, or "
+            "delisting — verify with recent 8-Ks and periodic reports before advising.</p>"
+            f"{('<p class=\"meta dim\" style=\"margin:0.35rem 0 0\">' + detail + '</p>') if detail else ''}"
+            "</div>"
+        )
+    return (
+        '<div class="lead-issuer-risk lead-issuer-risk-elevated" role="note">'
+        "<p style=\"margin:0\"><strong>Elevated issuer flags (filing text scan).</strong> "
+        "Summary text mentions items worth verifying (e.g. material weakness, reverse split).</p>"
+        f"{('<p class=\"meta dim\" style=\"margin:0.35rem 0 0\">' + detail + '</p>') if detail else ''}"
+        "</div>"
+    )
+
+
+def _cross_company_lead_note_html(p: dict) -> str:
+    if not int(p.get("cross_company_hint") or 0):
+        return ""
+    raw_oth = p.get("cross_company_other_ciks") or []
+    oth = raw_oth if isinstance(raw_oth, list) else []
+    bits = ", ".join(html.escape(str(x)) for x in oth[:12])
+    return (
+        '<div class="lead-cross-company-note" role="note">'
+        "<p style=\"margin:0\"><strong>Same name, multiple CIKs.</strong> "
+        "This normalized name also appears under CIK(s): "
+        f"{bits or '—'}. Confirm identity before outreach.</p>"
+        "</div>"
+    )
+
+
+def _sec_edgar_company_filings_url(cik: object) -> str:
+    """
+    SEC ``browse-edgar`` page for the registrant — all filings for this CIK, not one accession.
+    The profile's ``index_url`` points at a single submission (e.g. S-1); this finds 10-K / 8-K / etc.
+    """
+    digits = "".join(c for c in str(cik or "").strip() if c.isdigit())
+    if not digits:
+        return ""
+    try:
+        cik_param = str(int(digits))
+    except ValueError:
+        cik_param = digits.lstrip("0") or "0"
+    return (
+        "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany"
+        f"&CIK={quote(cik_param, safe='')}&type=&dateb=&owner=exclude&count=100"
+    )
+
+
 def _desk_sort_tuple(p: dict) -> tuple:
     tier = p.get("lead_tier") or _profile_lead_tier(p)
     tr = {"premium": 2, "standard": 1, "visibility": 0}.get(tier, 0)
@@ -565,9 +680,13 @@ def _desk_sort_tuple(p: dict) -> tuple:
         tot = float(p.get("total") or 0)
     except (TypeError, ValueError):
         tot = 0.0
+    try:
+        sig = float(p.get("signal_hwm") or 0)
+    except (TypeError, ValueError):
+        sig = 0.0
     return (
         tr,
-        float(p.get("signal_hwm") or 0),
+        sig,
         _filing_date_sort_key(p.get("filing_date") or ""),
         fy_i,
         tot,
@@ -874,7 +993,7 @@ def _visibility_profile_dict(
         "narrative_age": narrative_age,
         "issuer_website": issuer_web,
         "issuer_headquarters": issuer_hq,
-        "issuer_hq_city_state": hq_city_state_display(issuer_hq),
+        "issuer_hq_city_state": hq_city_state_pipeline_only(issuer_hq),
         "issuer_industry": issuer_ind,
         "issuer_revenue_text": rev_txt,
         "mgmt_bio_role": (mgmt_nar or {}).get("role_heading") or "",
@@ -1033,6 +1152,164 @@ def _beneficial_owner_pipeline_profiles(
         _annotate_lead_tier_fields(vprof)
         out.append(vprof)
     return out
+
+
+def _norm_cik_for_hints_lookup(cik: str) -> str:
+    try:
+        return str(int(str(cik or "").strip()))
+    except ValueError:
+        return str(cik or "").strip()
+
+
+def _issuer_sec_hints_map_for_ciks(
+    conn: sqlite3.Connection, ciks: set[str]
+) -> dict[str, dict[str, list[str]]]:
+    if not ciks:
+        return {}
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for c in ciks:
+        nk = _norm_cik_for_hints_lookup(c)
+        if nk and nk not in seen:
+            seen.add(nk)
+            uniq.append(nk)
+    if not uniq:
+        return {}
+    qm = ",".join("?" * len(uniq))
+    try:
+        cur = conn.execute(
+            f"SELECT cik, tickers_json, exchanges_json FROM issuer_sec_hints WHERE cik IN ({qm})",
+            tuple(uniq),
+        )
+    except sqlite3.OperationalError:
+        return {}
+    out: dict[str, dict[str, list[str]]] = {}
+    for r in cur.fetchall():
+        ck = str(r["cik"] or "").strip()
+        try:
+            t = json.loads(r["tickers_json"] or "[]")
+        except json.JSONDecodeError:
+            t = []
+        try:
+            e = json.loads(r["exchanges_json"] or "[]")
+        except json.JSONDecodeError:
+            e = []
+        out[ck] = {
+            "tickers": [str(x) for x in t] if isinstance(t, list) else [],
+            "exchanges": [str(x) for x in e] if isinstance(e, list) else [],
+        }
+    return out
+
+
+def lead_issuer_recency_bundle(conn: sqlite3.Connection, cik: str) -> dict[str, Any]:
+    maxd = max_filing_date_for_cik(conn, cik)
+    thresh = lead_page_stale_issuer_months()
+    stale = False
+    months_approx: Optional[float] = None
+    if maxd and thresh > 0:
+        try:
+            fd = date.fromisoformat(maxd[:10])
+            delta_days = (date.today() - fd).days
+            months_approx = delta_days / 30.44
+            stale = months_approx >= float(thresh)
+        except ValueError:
+            stale = True
+            months_approx = None
+    return {
+        "newest_filing_date": maxd,
+        "months_since_approx": months_approx,
+        "stale": stale,
+        "threshold_months": thresh,
+    }
+
+
+def lead_feedback_form_html(
+    cik: str,
+    person_norm: str,
+    *,
+    action_url: str = "/lead/feedback",
+) -> str:
+    ck = (cik or "").strip()
+    pn = (person_norm or "").strip()
+    if not ck or not pn:
+        return ""
+    cats = [
+        ("wrong_person", "Wrong person"),
+        ("duplicate", "Duplicate"),
+        ("bad_issuer", "Bad issuer / wrong company"),
+        ("other", "Other"),
+    ]
+    opts = "".join(
+        f'<option value="{html.escape(v)}">{html.escape(lab)}</option>' for v, lab in cats
+    )
+    return f"""
+    <details class="lead-more lead-advisor-feedback" style="margin-top:0.75rem">
+      <summary>Advisor feedback (review queue)</summary>
+      <form method="post" action="{html.escape(action_url)}" style="margin-top:0.5rem;max-width:28rem">
+        <input type="hidden" name="cik" value="{html.escape(ck)}"/>
+        <input type="hidden" name="person_norm" value="{html.escape(pn)}"/>
+        <label class="meta" style="display:block;margin:0.35rem 0">Category</label>
+        <select name="category" style="width:100%;max-width:20rem;font:inherit">{opts}</select>
+        <label class="meta" style="display:block;margin:0.65rem 0 0.25rem">Note (optional)</label>
+        <textarea name="note" rows="3" style="width:100%;max-width:28rem;font:inherit;background:#0a0e12;color:#e8ecf0;border:1px solid #2a3340;border-radius:4px;padding:0.35rem"></textarea>
+        <label class="meta" style="display:block;margin:0.65rem 0 0.25rem"><input type="checkbox" name="also_suppress" value="1"/> Also suppress this lead from desk</label>
+        <button type="submit" style="margin-top:0.5rem;padding:0.35rem 0.75rem;border-radius:4px;border:1px solid #2a3340;background:#1a2634;color:#d8dee4;cursor:pointer">Submit feedback</button>
+      </form>
+      <p class="meta dim" style="font-size:0.72rem;margin:0.5rem 0 0;line-height:1.4">Recorded for admin review. Suppression applies only if you check the box above.</p>
+    </details>
+    """
+
+
+def lead_outreach_form_html(
+    cik: str,
+    person_norm: str,
+    *,
+    action_url: str = "/lead/outreach",
+    current: Optional[dict[str, Any]] = None,
+) -> str:
+    """Per-advisor outreach log: email, status, notes (stored in ``advisor_lead_outreach``)."""
+    ck = (cik or "").strip()
+    pn = (person_norm or "").strip()
+    if not ck or not pn:
+        return ""
+    cur = current if isinstance(current, dict) else {}
+    em = html.escape(str(cur.get("email") or ""))
+    note_s = html.escape(str(cur.get("notes") or ""))
+    st_cur = str(cur.get("status") or "none").strip().lower()
+    opts_spec = [
+        ("none", "Not contacted"),
+        ("planned", "Plan to reach out"),
+        ("sent", "Outreach sent"),
+        ("replied", "They replied"),
+        ("no_response", "No response yet"),
+        ("declined", "Declined / not a fit"),
+    ]
+    opts = "".join(
+        f'<option value="{html.escape(v)}"{" selected" if v == st_cur else ""}>'
+        f"{html.escape(lab)}</option>"
+        for v, lab in opts_spec
+    )
+    return f"""
+    <div class="card lead-outreach-card" style="margin-top:0.75rem">
+      <h2 class="lead-section-h">Your outreach (mini CRM)</h2>
+      <p class="meta" style="margin-bottom:0.5rem;line-height:1.45">
+        Private to your login — track email, status, and notes. Nothing is sent from this form.
+      </p>
+      <form method="post" action="{html.escape(action_url)}" style="max-width:28rem">
+        <input type="hidden" name="cik" value="{html.escape(ck)}"/>
+        <input type="hidden" name="person_norm" value="{html.escape(pn)}"/>
+        <label class="meta" style="display:block;margin:0.35rem 0">Email (optional)</label>
+        <input type="email" name="email" value="{em}" autocomplete="email"
+          placeholder="you@firm.com or prospect hint"
+          style="width:100%;max-width:28rem;font:inherit;background:#0a0e12;color:#e8ecf0;border:1px solid #2a3340;border-radius:4px;padding:0.35rem"/>
+        <label class="meta" style="display:block;margin:0.65rem 0 0.25rem">Status</label>
+        <select name="status" style="width:100%;max-width:20rem;font:inherit">{opts}</select>
+        <label class="meta" style="display:block;margin:0.65rem 0 0.25rem">Notes</label>
+        <textarea name="notes" rows="3" style="width:100%;max-width:28rem;font:inherit;background:#0a0e12;color:#e8ecf0;border:1px solid #2a3340;border-radius:4px;padding:0.35rem">{note_s}</textarea>
+        <button type="submit" style="margin-top:0.5rem;padding:0.35rem 0.75rem;border-radius:4px;border:1px solid #2a3340;background:#1a2634;color:#d8dee4;cursor:pointer">Save outreach</button>
+      </form>
+    </div>
+    """
 
 
 def _build_profiles(
@@ -1336,7 +1613,16 @@ def _build_profiles(
                     total_hwm = max(total_hwm, float(t))
                 except (TypeError, ValueError):
                     pass
-        signal_hwm = max(total_hwm, equity_hwm)
+        head_eq = _row_equity_usd(head)
+        head_tot = 0.0
+        if head.get("total") is not None:
+            try:
+                head_tot = float(head["total"])
+            except (TypeError, ValueError):
+                pass
+        # Pay bar, $1M+ filter, and desk sort use headline FY (same row as Latest total column),
+        # not max across all fiscal years (older years can have higher equity/total).
+        signal_hwm = max(head_tot, head_eq)
         has_s1_comp = any(
             _is_s1_form_type(str(r.get("filing_form_type") or "")) for r in items
         )
@@ -1392,7 +1678,7 @@ def _build_profiles(
             "narrative_age": narrative_age,
             "issuer_website": issuer_web,
             "issuer_headquarters": issuer_hq,
-            "issuer_hq_city_state": hq_city_state_display(issuer_hq),
+            "issuer_hq_city_state": hq_city_state_pipeline_only(issuer_hq),
             "issuer_industry": issuer_ind,
             "issuer_revenue_text": rev_txt,
             "mgmt_bio_role": (mgmt_nar or {}).get("role_heading") or "",
@@ -1454,24 +1740,52 @@ def _build_profiles(
         if str(p.get("cik") or "").strip()
     }
     stage_map = issuer_listing_stage_map(conn, stage_ciks)
+    adv_map = issuer_adverse_signal_map(conn, stage_ciks)
+    hints_map = _issuer_sec_hints_map_for_ciks(conn, stage_ciks)
+    norm_ciks: dict[str, set[str]] = defaultdict(set)
+    for prof in profiles:
+        nn = (prof.get("norm_name") or "").strip()
+        ck0 = str(prof.get("cik") or "").strip()
+        if nn and ck0:
+            norm_ciks[nn].add(ck0)
 
     for prof in profiles:
         ck = str(prof.get("cik") or "").strip()
         prof["issuer_listing_stage"] = stage_map.get(ck, "unknown")
+        adv = adv_map.get(ck) or {"level": "none", "reasons": []}
+        prof["issuer_risk_level"] = str(adv.get("level") or "none")
+        rs = adv.get("reasons") or []
+        prof["issuer_risk_reasons"] = list(rs) if isinstance(rs, list) else []
+        nn = (prof.get("norm_name") or "").strip()
+        oth = sorted(norm_ciks.get(nn, set()) - {ck})
+        prof["cross_company_hint"] = 1 if oth else 0
+        prof["cross_company_other_ciks"] = oth
+        hk = _norm_cik_for_hints_lookup(ck)
+        hrow = hints_map.get(hk) or {}
+        prof["issuer_tickers"] = hrow.get("tickers") or []
+        prof["issuer_exchanges"] = hrow.get("exchanges") or []
 
     profiles.sort(key=_desk_sort_tuple, reverse=True)
     return profiles
 
 
-def _lead_desk_filter_profiles(profiles: list[dict]) -> list[dict]:
+def _lead_desk_filter_profiles(
+    profiles: list[dict], conn: sqlite3.Connection
+) -> list[dict]:
     """
     Desk list: S-1 context (summary comp and/or S-1 officer/director table).
     Premium pay bar no longer drops rows — low-signal SCT and officer-only profiles
     stay on the desk as standard / visibility tiers (see lead_tier).
+
+    Also applies manual suppress list, optional visibility-tier exclusion, and
+    high issuer-risk exclusion (heuristic scan of stored issuer summaries).
     """
     s1_only = lead_desk_s1_only()
     us_hq_only = lead_desk_us_registrant_hq_only()
     incl_beneficial_only = lead_desk_include_beneficial_only_leads()
+    incl_visibility = lead_desk_include_visibility_tier()
+    excl_risk_high = lead_desk_exclude_issuer_risk_high()
+    suppressed = lead_suppress_pair_set(conn)
     out: list[dict] = []
     for p in profiles:
         if s1_only and not (
@@ -1481,6 +1795,14 @@ def _lead_desk_filter_profiles(profiles: list[dict]) -> list[dict]:
         ):
             continue
         if not incl_beneficial_only and _is_beneficial_only_lead(p):
+            continue
+        if not incl_visibility and (p.get("lead_tier") or "") == "visibility":
+            continue
+        if excl_risk_high and (p.get("issuer_risk_level") or "").lower() == "high":
+            continue
+        ck = str(p.get("cik") or "").strip()
+        pn = (p.get("norm_name") or "").strip()
+        if ck and pn and (ck, pn) in suppressed:
             continue
         if us_hq_only and not registrant_hq_line_parses_as_united_states(
             (p.get("issuer_headquarters") or "").strip()
@@ -1496,7 +1818,7 @@ _PAY_BAND_QUARTER = 250_000.0
 
 
 def _profile_pay_signal_usd(p: dict) -> float:
-    """Same basis as premium tier: best FY total vs equity, per desk env (signal_hwm / equity_hwm)."""
+    """Headline FY: max(SCT total, stock+options) for the desk row; legacy equity-only uses max equity."""
     if lead_desk_equity_only_min_usd():
         try:
             return float(p.get("equity_hwm") or 0)
@@ -1510,8 +1832,13 @@ def _profile_pay_signal_usd(p: dict) -> float:
 
 def filter_profiles_pay_band(profiles: list[dict], band: str) -> list[dict]:
     """
-    Filter by filing-derived pay signal (summary comp / equity high-water mark in DB).
+    Filter by headline fiscal-year pay signal (same FY as Latest total on the desk).
+    Uses ``signal_hwm`` (headline total vs that year's stock+options), not best-ever across FYs.
     Not personal AUM — advisors use it as a comparable disclosed-comp lens.
+
+    When you **group the desk by company**, apply this filter to **people first**, then group:
+    a company row appears if **at least one** person on the desk matches the band (the bundle
+    can also list teammates outside the band unless you filter those rows out separately).
     """
     b = (band or "all").strip().lower()
     if b in ("", "all"):
@@ -1541,6 +1868,175 @@ def normalize_listing_stage_query(v: object) -> str:
     return "all"
 
 
+def normalize_sales_bundle_query(v: object) -> str:
+    """Per-issuer roster tab: premium | economy only (default premium). Legacy ``all`` → premium."""
+    x = str(v or "").strip().lower().replace("-", "_")
+    if x == "economy":
+        return "economy"
+    return "premium"
+
+
+def sales_bundle_from_lead_tier(lead_tier: object) -> str:
+    """Premium bundle: SCT meets desk pay bar. Economy: standard + visibility tiers."""
+    return "premium" if str(lead_tier or "").strip().lower() == "premium" else "economy"
+
+
+def sales_bundle_tab_label(v: object) -> str:
+    """Short tab label (company/desk roster). URLs stay ``sales_bundle=premium|economy``."""
+    return "Exec" if normalize_sales_bundle_query(v) == "premium" else "Other"
+
+
+def sales_bundle_tab_hint(v: object) -> str:
+    """Tooltip for tier tabs: high-signal exec roster vs everyone else in the bundle."""
+    if normalize_sales_bundle_query(v) == "premium":
+        return "High-signal execs — verified pay-bar compensation signal from filings."
+    return "Other named people — directors, standard tiers, and visibility-only rows."
+
+
+def sales_bundle_section_heading(v: object) -> str:
+    """Heading copy for desk sections (empty states, counts)."""
+    return (
+        "Executive network"
+        if normalize_sales_bundle_query(v) == "premium"
+        else "Other people"
+    )
+
+
+def _bundle_hq_quality_score(hq_fmt: str) -> int:
+    """Higher = better source for company Location (advisor City, ST from filings/profiles)."""
+    try:
+        if not (hq_fmt or "").strip():
+            return -999999
+        if hq_looks_like_street_plus_state_only(hq_fmt):
+            return -50000
+        sc = 0
+        adv = hq_advisor_city_state_only(hq_fmt)
+        if adv:
+            sc += 10000
+        if is_plausible_registrant_headquarters(hq_fmt):
+            sc += 800
+        if hq_has_registrant_address_detail(hq_fmt):
+            sc += 200
+        sc += min(len(hq_fmt) // 25, 40)
+        return sc
+    except Exception:
+        return -888888
+
+
+def _pick_best_bundle_hq_raw(
+    cik: str, members: list[dict], conn: Optional[sqlite3.Connection]
+) -> str:
+    """Prefer CIK-wide filing HQ when strong; else best-scored HQ among member profiles."""
+    ck = (cik or "").strip()
+    seen: set[str] = set()
+    scored: list[tuple[int, str]] = []
+    for p in members:
+        raw = (p.get("issuer_headquarters") or "").strip()
+        if not raw:
+            continue
+        fmt = hq_normalize_ui_line(raw)
+        if not fmt or fmt in seen:
+            continue
+        seen.add(fmt)
+        scored.append((_bundle_hq_quality_score(fmt), fmt))
+    if conn and ck:
+        try:
+            db_raw = _best_issuer_headquarters_for_cik(conn, ck)
+        except sqlite3.Error:
+            db_raw = ""
+        db_fmt = hq_normalize_ui_line(db_raw) if db_raw else ""
+        if db_fmt and db_fmt not in seen:
+            scored.append((_bundle_hq_quality_score(db_fmt) + 800, db_fmt))
+    if not scored:
+        return ""
+    scored.sort(key=lambda x: (-x[0], -len(x[1])))
+    return scored[0][1]
+
+
+def _company_bundle_location_display(
+    cik: str,
+    members: list[dict],
+    conn: Optional[sqlite3.Connection],
+) -> str:
+    """US **City, ST** only — no streets or filing sentences (advisor territory scan)."""
+    try:
+        raw = _pick_best_bundle_hq_raw(cik, members, conn)
+        if raw:
+            cs = hq_advisor_city_state_only(raw)
+            if cs:
+                return cs
+    except sqlite3.Error:
+        pass
+    except Exception:
+        pass
+    for p in members:
+        mat = (p.get("issuer_hq_city_state") or "").strip()
+        if mat:
+            cs = hq_advisor_city_state_only(mat)
+            if cs:
+                return cs
+    return ""
+
+
+def group_desk_profiles_by_company(
+    profiles: list[dict],
+    conn: Optional[sqlite3.Connection] = None,
+) -> list[dict]:
+    """
+    One entry per CIK with aggregate fields for a company-bundle desk view.
+    Members are sorted like the person desk (``_desk_sort_tuple``).
+    ``location_display`` is US **City, ST** only (``hq_advisor_city_state_only``), using member HQs plus the best filing HQ when ``conn`` is set.
+    """
+    buckets: dict[str, list[dict]] = defaultdict(list)
+    order: list[str] = []
+    for p in profiles:
+        ck = str(p.get("cik") or "").strip()
+        if not ck:
+            continue
+        if ck not in buckets:
+            order.append(ck)
+        buckets[ck].append(p)
+    out: list[dict] = []
+    for ck in order:
+        members = buckets[ck]
+        members.sort(key=_desk_sort_tuple, reverse=True)
+        first = members[0]
+        co = (first.get("company_name") or "").strip() or "—"
+        sigs = [_profile_pay_signal_usd(p) for p in members]
+        sum_pay = sum(sigs)
+        max_pay = max(sigs) if sigs else 0.0
+        eqs: list[float] = []
+        for p in members:
+            try:
+                eqs.append(float(p.get("equity_hwm") or 0))
+            except (TypeError, ValueError):
+                eqs.append(0.0)
+        max_eq = max(eqs) if eqs else 0.0
+        sum_eq = sum(eqs)
+        loc = _company_bundle_location_display(ck, members, conn)
+        out.append(
+            {
+                "cik": ck,
+                "company_name": co,
+                "members": members,
+                "people_count": len(members),
+                "location_display": loc,
+                "sum_pay_signal": sum_pay,
+                "max_pay_signal": max_pay,
+                "sum_equity_hwm": sum_eq,
+                "max_equity_hwm": max_eq,
+                "issuer_listing_stage": (first.get("issuer_listing_stage") or "unknown"),
+                "issuer_website": first.get("issuer_website") or "",
+                "primary_doc_url": first.get("primary_doc_url") or "",
+            }
+        )
+    out.sort(
+        key=lambda b: (b["max_pay_signal"], b["sum_pay_signal"], b["company_name"]),
+        reverse=True,
+    )
+    return out
+
+
 def filter_profiles_listing_stage(profiles: list[dict], listing: str) -> list[dict]:
     want = normalize_listing_stage_query(listing)
     if want == "all":
@@ -1553,7 +2049,12 @@ def filter_profiles_listing_stage(profiles: list[dict], listing: str) -> list[di
     return out
 
 
-def _pay_band_nav_html(*, current: str, base_path: str, extra_qs: Optional[dict] = None) -> str:
+def _pay_band_nav_html(
+    *,
+    current: str,
+    base_path: str,
+    extra_qs: Optional[dict] = None,
+) -> str:
     """Segment control for desk or finder (preserve non-band query keys)."""
     cur = (current or "all").strip().lower() or "all"
     extra: dict[str, str] = {}
@@ -1565,9 +2066,9 @@ def _pay_band_nav_html(*, current: str, base_path: str, extra_qs: Optional[dict]
             extra[k] = s
     pairs = [
         ("all", "All"),
-        ("million_plus", "$1M+ signal"),
+        ("million_plus", "$1M+"),
         ("quarter_to_million", "$250k–$1M"),
-        ("under_quarter", "Under $250k"),
+        ("under_quarter", "<$250k"),
     ]
     links: list[str] = []
     path = (base_path or "/").split("?")[0]
@@ -1578,17 +2079,19 @@ def _pay_band_nav_html(*, current: str, base_path: str, extra_qs: Optional[dict]
             f'<a class="pay-band-tab{active}" href="{html.escape(href)}">{html.escape(label)}</a>'
         )
     return (
-        "<div class='pay-band-wrap'><p class='pay-band-hint'><strong>Pay signal</strong> from "
-        "parsed <abbr title='Summary compensation table'>SCT</abbr> in your DB (best fiscal year "
-        "— not household AUM). Same basis as Premium vs Standard tier.</p>"
-        "<nav class='pay-band-nav' aria-label='Pay signal band'>" + " · ".join(links) + "</nav></div>"
+        '<div class="filter-strip"><nav class="pay-band-nav" aria-label="Pay band">'
+        + " · ".join(links)
+        + "</nav></div>"
     )
 
 
 def _listing_stage_nav_html(
-    *, current: str, base_path: str, extra_qs: Optional[dict] = None
+    *,
+    current: str,
+    base_path: str,
+    extra_qs: Optional[dict] = None,
 ) -> str:
-    """Tabs for Pre-IPO vs Listed vs Unknown (preserves pay band / finder / pipeline query keys)."""
+    """Tabs for Pre-IPO vs Listed vs Unknown (preserves non-listing query keys)."""
     cur = normalize_listing_stage_query(current)
     extra: dict[str, str] = {}
     for k, v in (extra_qs or {}).items():
@@ -1598,7 +2101,7 @@ def _listing_stage_nav_html(
         if s:
             extra[k] = s
     pairs = [
-        ("all", "All listings"),
+        ("all", "All"),
         ("pre_ipo", "Pre-IPO"),
         ("public", "Listed"),
         ("unknown", "Unknown"),
@@ -1613,10 +2116,111 @@ def _listing_stage_nav_html(
             f"{html.escape(label)}</a>"
         )
     return (
-        "<div class='pay-band-wrap' style='margin-top:0.35rem'>"
-        "<p class='pay-band-hint'><strong>Listing stage</strong> — filter by registration vs "
-        "periodic reports in your DB (same as Listing column).</p>"
-        "<nav class='pay-band-nav' aria-label='Listing stage'>" + " · ".join(links) + "</nav></div>"
+        '<div class="filter-strip"><nav class="pay-band-nav" aria-label="Listing stage">'
+        + " · ".join(links)
+        + "</nav></div>"
+    )
+
+
+def _sales_bundle_nav_html(
+    *,
+    current: str,
+    base_path: str,
+    extra_qs: Optional[dict] = None,
+    premium_count: Optional[int] = None,
+    economy_count: Optional[int] = None,
+    nav_context: str = "company",
+    compact: bool = False,
+) -> str:
+    """Two visible tabs: company drill-in roster, or main desk index (``nav_context``)."""
+    cur = normalize_sales_bundle_query(current)
+    extra: dict[str, str] = {}
+    for k, v in (extra_qs or {}).items():
+        if v is None or k == "sales_bundle":
+            continue
+        s = str(v).strip()
+        if s:
+            extra[k] = s
+    path = (base_path or "/").split("?")[0]
+    pairs: list[tuple[str, str]] = []
+    for key in ("premium", "economy"):
+        base_label = sales_bundle_tab_label(key)
+        if (
+            not compact
+            and key == "premium"
+            and premium_count is not None
+        ):
+            lab = f"{base_label} ({premium_count})"
+        elif (
+            not compact
+            and key == "economy"
+            and economy_count is not None
+        ):
+            lab = f"{base_label} ({economy_count})"
+        else:
+            lab = base_label
+        pairs.append((key, lab))
+    parts: list[str] = []
+    for key, label in pairs:
+        href = path + "?" + urlencode({**extra, "sales_bundle": key})
+        active = " desk-tier-tab--active" if key == cur else ""
+        a_sel = "true" if key == cur else "false"
+        hint = html.escape(sales_bundle_tab_hint(key), quote=True)
+        parts.append(
+            f'<a class="desk-tier-tab{active}" role="tab" aria-selected="{a_sel}" '
+            f'title="{hint}" href="{html.escape(href, quote=True)}">{html.escape(label)}</a>'
+        )
+    sep = '<span class="desk-tier-sep dim" aria-hidden="true"> · </span>'
+    inner = sep.join(parts)
+    if compact:
+        return (
+            '<nav class="desk-tier-compact" aria-label="Exec roster vs other people at this company">'
+            '<div class="desk-tier-tabs" role="tablist">'
+            f"{inner}"
+            "</div></nav>"
+        )
+    ctx = (nav_context or "company").strip().lower()
+    if ctx == "desk":
+        row_cls = "desk-tier-row desk-tier-row--stacked desk-tier-row--desk-index"
+        title = "Desk segment"
+        hint = (
+            "Exec = high-signal pay-bar roster; Other = directors, standard, and visibility tiers. "
+            "Counts are issuers with at least one person in that segment; "
+            "company links open that roster."
+        )
+        aria = "Exec vs other people desk segment"
+    else:
+        row_cls = "desk-tier-row desk-tier-row--stacked desk-tier-row--after-scope"
+        title = "Roster segment"
+        hint = "Exec = high-signal tier; Other = directors and remaining named roles."
+        aria = "Exec vs other people roster segment"
+    return (
+        f'<div class="{row_cls}" role="group">'
+        '<div class="desk-tier-row-head">'
+        f'<span class="desk-tier-row-title">{html.escape(title)}</span>'
+        f'<span class="desk-tier-hint dim">{html.escape(hint)}</span>'
+        "</div>"
+        f'<div class="desk-tier-tabs" role="tablist" aria-label="{html.escape(aria, quote=True)}">'
+        f"{inner}"
+        "</div></div>"
+    )
+
+
+def _desk_company_scope_filters_html(
+    *,
+    company_base: str,
+    cik_s: str,
+    sales_bundle: str = "premium",
+) -> str:
+    """Exec vs Other roster tabs only (compact; no counts or extra copy)."""
+    path = (company_base or "/").split("?")[0]
+    ck = (cik_s or "").strip()
+    sb_cur = normalize_sales_bundle_query(sales_bundle)
+    return _sales_bundle_nav_html(
+        current=sb_cur,
+        base_path=path,
+        extra_qs={"cik": ck},
+        compact=True,
     )
 
 
@@ -1677,8 +2281,6 @@ def finder_export_csv_bytes(
     industry: str,
     q: str,
     all_neo: bool,
-    pay_band: str = "all",
-    listing_stage: str = "all",
 ) -> bytes:
     base = profiles_all if all_neo else profiles_desk
     filtered = filter_profiles_geo_industry_text(
@@ -1687,8 +2289,6 @@ def finder_export_csv_bytes(
         industry_sub=industry,
         text_sub=q,
     )
-    filtered = filter_profiles_pay_band(filtered, pay_band)
-    filtered = filter_profiles_listing_stage(filtered, listing_stage)
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(
@@ -2090,6 +2690,46 @@ def _hq_one_line_for_maps(raw: str | None) -> str:
     return re.sub(r"[ \t]{2,}", " ", one).strip()
 
 
+def _registrant_office_maps_anchor_html(p: dict) -> str:
+    """
+    Google Maps search for the **issuer’s SEC registrant / principal office** address.
+    Shown under Company, not under the person header, so it is not read as home location.
+    """
+    hq_txt = (p.get("issuer_headquarters") or "").strip()
+    co_nm = (p.get("company_name") or "").strip()
+    street = hq_principal_office_display_line(hq_txt) or _hq_one_line_for_maps(hq_txt)
+    hq_loc = hq_city_state_pipeline_only(hq_txt)
+    if not hq_loc:
+        mat = (p.get("issuer_hq_city_state") or "").strip()
+        if mat and pipeline_hq_city_state_label_ok(mat):
+            hq_loc = mat
+    if street:
+        map_query = f"{co_nm}, {street}" if co_nm else street
+    elif hq_loc:
+        map_query = f"{co_nm}, {hq_loc}" if co_nm else hq_loc
+    elif co_nm:
+        map_query = f"{co_nm} corporate headquarters"
+    else:
+        return ""
+    map_query = map_query.strip()
+    if not map_query:
+        return ""
+    maps_url = "https://www.google.com/maps/search/?api=1&query=" + quote(
+        map_query, safe=""
+    )
+    tip = (
+        "SEC registrant principal office (company address). Not this person’s residence. "
+        "In Maps, use Street View (Pegman) if you want a building photo — we do not host images."
+    )
+    return (
+        f'<a class="lead-registrant-maps" href="{html.escape(maps_url)}" '
+        f'target="_blank" rel="noopener" title="{html.escape(tip, quote=True)}">'
+        "Company office · Maps</a>"
+        '<span class="dim" style="display:block;font-size:0.7rem;margin-top:0.25rem;line-height:1.35">'
+        "Opens a search for this issuer’s filing address — use Street View inside Maps for the building.</span>"
+    )
+
+
 def _best_issuer_headquarters_for_cik(
     conn: sqlite3.Connection, cik_s: str
 ) -> str:
@@ -2139,11 +2779,158 @@ def _resolve_issuer_headquarters_for_profile(
     return _best_issuer_headquarters_for_cik(conn, cik_s)
 
 
+def _desk_company_page_base_path(nav_base_path: str) -> str:
+    """Path segment for per-issuer desk drill-in (e.g. ``/admin/desk/company`` or ``/desk/company``)."""
+    root = (nav_base_path or "/").split("?")[0].rstrip("/")
+    return "/desk/company" if not root or root == "/" else f"{root}/company"
+
+
+def _desk_company_scope_href(
+    *,
+    nav_base_path: str,
+    cik: str,
+    sales_bundle: str = "premium",
+) -> str:
+    """Internal URL for the per-company people table (``cik`` + ``sales_bundle``)."""
+    path = _desk_company_page_base_path(nav_base_path)
+    q: dict[str, str] = {
+        "cik": str(cik or "").strip(),
+        "sales_bundle": normalize_sales_bundle_query(sales_bundle),
+    }
+    return path + "?" + urlencode(q)
+
+
+def _desk_index_href(
+    nav_base_path: str,
+    sales_bundle: str = "premium",
+) -> str:
+    """Main desk index URL with roster section."""
+    path = (nav_base_path or "/").split("?")[0]
+    q: dict[str, str] = {"sales_bundle": normalize_sales_bundle_query(sales_bundle)}
+    return path + "?" + urlencode(q)
+
+
+def _desk_row_attr_float(v: object) -> str:
+    try:
+        x = float(v or 0)
+    except (TypeError, ValueError):
+        return "0"
+    return f"{x:.6f}"
+
+
+def _desk_company_bundles_table(
+    bundles: list[dict],
+    stats: dict,
+    *,
+    nav_base_path: str = "/",
+    sales_bundle: str = "premium",
+) -> str:
+    """One row per CIK: teaser-style aggregates; company name opens per-issuer people view."""
+    if not bundles:
+        n_all = int(stats.get("profile_count_all") or 0)
+        hidden = n_all > 0
+        extra = ""
+        if hidden:
+            s1 = bool(stats.get("lead_desk_s1_only"))
+            min_e = float(stats.get("lead_desk_min_signal_usd") or 0)
+            extra = (
+                f"<p class='meta dim'>{n_all} profiles in DB; none match current filters"
+                f"{' (S-1 context)' if s1 else ''}.</p>"
+            )
+        sb_lab = sales_bundle_section_heading(sales_bundle)
+        return f"""
+  <h2>Companies — {html.escape(sb_lab)}</h2>
+  <p class='meta dim'>No rows for these filters.</p>
+  {extra}"""
+
+    sb_cur = normalize_sales_bundle_query(sales_bundle)
+    sb_lab = sales_bundle_section_heading(sb_cur)
+    rows: list[str] = []
+    for b in bundles:
+        company = html.escape(b["company_name"] or "")
+        cik_raw = str(b["cik"] or "").strip()
+        cik_e = html.escape(cik_raw)
+        scope_href = _desk_company_scope_href(
+            nav_base_path=nav_base_path,
+            cik=cik_raw,
+            sales_bundle=sb_cur,
+        )
+        scope_h_e = html.escape(scope_href)
+        co_cell = (
+            f'<a href="{scope_h_e}" title="People on the desk for this issuer">'
+            f"{company}</a>"
+        )
+        scope_data = html.escape(scope_href)
+        stage_badge = _issuer_listing_stage_badge_html(
+            {"issuer_listing_stage": b.get("issuer_listing_stage")}
+        )
+        loc_e = html.escape((b.get("location_display") or "").strip() or "—")
+        n_people = int(b.get("people_count") or 0)
+        st_raw = (b.get("issuer_listing_stage") or "unknown").strip().lower()
+        if st_raw not in ("pre_ipo", "public", "unknown"):
+            st_raw = "unknown"
+        max_pay = _desk_row_attr_float(b.get("max_pay_signal"))
+        sum_pay = _desk_row_attr_float(b.get("sum_pay_signal"))
+        max_eq = _desk_row_attr_float(b.get("max_equity_hwm"))
+        tip = f"Open people · {n_people} on desk"
+        tip_e = html.escape(tip, quote=True)
+        rows.append(
+            "<tr class='desk-row' tabindex='0' role='link' "
+            f"data-href='{scope_data}' title='{tip_e}' data-listing='{html.escape(st_raw)}' "
+            f"data-people='{n_people}' data-max-pay='{max_pay}' data-sum-pay='{sum_pay}' "
+            f"data-max-eq='{max_eq}'>"
+            f"<td class='co-name'>{co_cell}</td>"
+            f"<td class='cik'>{cik_e}</td>"
+            f"<td class='people-count'>{n_people}</td>"
+            f"<td class='hq-cell'>{loc_e}</td>"
+            f"<td class='listing-cell'>{stage_badge}</td>"
+            f"<td class='num mono-money strong'>{_money(b.get('max_pay_signal'))}</td>"
+            f"<td class='num mono-money'>{_money(b.get('sum_pay_signal'))}</td>"
+            f"<td class='num mono-money'>{_money(b.get('max_equity_hwm'))}</td>"
+            "</tr>"
+        )
+    inner = "".join(rows)
+    return f"""
+  <h2>Companies — {html.escape(sb_lab)}</h2>
+  <p class='meta dim'>One row per issuer in this section. Location is US city and state. Click a row for people.</p>
+  <div class="table-wrap">
+  <table id="desk" class="desk-by-company">
+    <thead>
+      <tr>
+        <th class="co-th">Company</th>
+        <th class="cik-th">CIK</th>
+        <th class="people-th" title="Officers on the desk for this issuer">People</th>
+        <th class="loc-th" title="US city and state only — for advisor territory matching">Location</th>
+        <th class="listing-th">Listing</th>
+        <th class="num-th" title="Largest headline filing-year comp signal among people at this issuer — primary anchor">Top comp</th>
+        <th class="num-th" title="Sum of each person’s headline signal — rough combined disclosed footprint, not company value">Combined</th>
+        <th class="num-th" title="Largest single-year stock + options in DB for anyone at this issuer">Top equity</th>
+      </tr>
+      <tr class="desk-filter-row" aria-hidden="false">
+        <th><input type="search" class="desk-th-filter-input" data-desk-col="co" placeholder="Contains…" aria-label="Filter company name"/></th>
+        <th><input type="search" class="desk-th-filter-input" data-desk-col="cik" placeholder="CIK…" aria-label="Filter CIK"/></th>
+        <th><input type="number" class="desk-th-filter-input" data-desk-col="minpeople" min="0" step="1" placeholder="Min" title="Minimum people" aria-label="Minimum people count"/></th>
+        <th><input type="search" class="desk-th-filter-input" data-desk-col="loc" placeholder="Contains…" aria-label="Filter location"/></th>
+        <th><select class="desk-th-filter-input" data-desk-col="listing" aria-label="Filter listing stage">
+            <option value="">All</option>
+            <option value="pre_ipo">Pre-IPO</option>
+            <option value="public">Listed</option>
+            <option value="unknown">Unknown</option>
+          </select></th>
+        <th><input type="number" class="desk-th-filter-input" data-desk-col="mintop" min="0" step="1000" placeholder="Min $" title="Min top comp (USD)" aria-label="Minimum top comp USD"/></th>
+        <th><input type="number" class="desk-th-filter-input" data-desk-col="minsum" min="0" step="1000" placeholder="Min $" title="Min combined comp (USD)" aria-label="Minimum combined comp USD"/></th>
+        <th><input type="number" class="desk-th-filter-input" data-desk-col="mineq" min="0" step="1000" placeholder="Min $" title="Min top equity (USD)" aria-label="Minimum top equity USD"/></th>
+      </tr>
+    </thead>
+    <tbody id="desk-body">{inner}</tbody>
+  </table>
+  </div>"""
+
+
 def _filings_for_profile(conn: sqlite3.Connection, cik: str, _norm_name: str) -> list[dict]:
     """
-    Issuer filing timeline for cross-reference: every S-1 and 10-K (incl. /A) we have for
-    this CIK, newest first — not only filings where this person has a comp row (10-K often
-    parses officers without hitting NEO comp).
+    Issuer filing timeline for cross-reference: S-1, 10-K, and 8-K family rows we have for
+    this CIK, newest first — not only filings where this person has a comp row.
     """
     cik_s = str(cik or "").strip()
     cur = conn.execute(
@@ -2151,9 +2938,13 @@ def _filings_for_profile(conn: sqlite3.Connection, cik: str, _norm_name: str) ->
         SELECT f.id, f.accession, f.form_type, f.filing_date, f.index_url, f.primary_doc_url
         FROM filings f
         WHERE f.cik = ?
-          AND (form_type LIKE '%S-1%' OR form_type LIKE '%10-K%')
+          AND (
+            form_type LIKE '%S-1%'
+            OR form_type LIKE '%10-K%'
+            OR form_type LIKE '8-K%'
+          )
         ORDER BY COALESCE(f.filing_date, '') DESC, f.id DESC
-        LIMIT 50
+        LIMIT 60
         """,
         (cik_s,),
     )
@@ -2170,6 +2961,154 @@ def _filings_for_profile(conn: sqlite3.Connection, cik: str, _norm_name: str) ->
             }
         )
     return out
+
+
+def _desk_profile_row_tr(p: dict, *, hide_company: bool = False) -> str:
+    """One desk person row; ``hide_company`` when the page is scoped to a single issuer."""
+    company = html.escape(p["company_name"] or "")
+    title = html.escape(p["title"] or "—")
+    href = html.escape(_profile_lead_url(p))
+    nm = html.escape(p["display_name"] or "")
+    idx = html.escape(p["index_url"] or "")
+    doc = html.escape(p["primary_doc_url"] or "")
+    idx_l = f'<a href="{idx}" target="_blank" rel="noopener" onclick="event.stopPropagation()">EDGAR</a>' if idx else "—"
+    doc_l = f'<a href="{doc}" target="_blank" rel="noopener" onclick="event.stopPropagation()">Doc</a>' if doc else "—"
+    tier = p.get("lead_tier") or _profile_lead_tier(p)
+    tier_lbl = {"premium": "Premium", "standard": "Standard", "visibility": "Visibility"}.get(
+        tier, tier
+    )
+    tier_title = (
+        "Full SCT disclosure meets desk pay-signal bar (or bar is off)."
+        if tier == "premium"
+        else (
+            "S-1 summary comp below desk pay bar — still a sellable lead."
+            if tier == "standard"
+            else "S-1 officer/director table only — no SCT row in DB; referral-tier."
+        )
+    )
+    badge = (
+        f'<span class="badge badge-tier-{html.escape(tier)}" '
+        f'title="{html.escape(tier_title)}">{html.escape(tier_lbl)}</span>'
+    )
+    why_s = html.escape((p.get("why_surfaced") or "")[:160])
+    why_cell = f'<span class="lead-why">{why_s}</span>' if why_s else ""
+    oa_row = p.get("officer_age")
+    age_cell = "—"
+    if oa_row is not None:
+        try:
+            age_cell = str(int(oa_row))
+        except (TypeError, ValueError):
+            pass
+    bio_full = (p.get("mgmt_bio_text") or "").strip()
+    bio_one = re.sub(r"\s+", " ", bio_full)[:220]
+    age_tip = ""
+    st = p.get("age_stated_in_filing")
+    anch = (p.get("age_anchor_date") or "").strip()
+    if st is not None and anch:
+        try:
+            st_i = int(st)
+            disp_i = int(oa_row) if oa_row is not None else st_i
+            if disp_i != st_i:
+                age_tip = (
+                    f"Age ~{disp_i} est. (stated {st_i} as of filing {anch}; "
+                    "calendar years to today; birthday not in filing)."
+                )
+            else:
+                age_tip = f"Age {st_i} (anchor filing date {anch})."
+        except (TypeError, ValueError):
+            pass
+    tip_parts = []
+    if bio_one:
+        tip_parts.append(bio_one + ("…" if len(bio_full) > 220 else ""))
+    if age_tip:
+        tip_parts.append(age_tip)
+    combined_tip = " \u00b7 ".join(tip_parts) if tip_parts else "Open profile"
+    row_tip = html.escape(combined_tip, quote=True)
+    tip_attr = f' title="{row_tip}"'
+    web_u = (p.get("issuer_website") or "").strip()
+    co_link = _canonical_external_url(web_u)
+    if not co_link and p.get("primary_doc_url"):
+        co_link = _canonical_external_url((p.get("primary_doc_url") or "").strip())
+    co_href = html.escape(co_link)
+    if co_link:
+        co_cell = (
+            f'<a href="{co_href}" target="_blank" rel="noopener" '
+            f'onclick="event.stopPropagation()" title="Issuer site or filing">'
+            f"{company}</a>"
+        )
+    else:
+        co_cell = company
+    stage_badge = _issuer_listing_stage_badge_html(p)
+    co_td = "" if hide_company else f"<td class='co-name'>{co_cell}</td>"
+    return (
+        "<tr class='desk-row' tabindex='0' role='link' "
+        f"data-href='{href}'{tip_attr}>"
+        f"<td class='num'>{html.escape(age_cell)}</td>"
+        f"<td class='profile-name'><a href='{href}'>{nm}</a>{why_cell}</td>"
+        f"<td>{title}</td>"
+        f"{co_td}"
+        f"<td>{stage_badge}</td>"
+        f"<td><span class='badge'>{badge}</span></td>"
+        f"<td class='num strong'>{_money(p['total'])}</td>"
+        f"<td class='num'>{_money(p.get('equity_hwm'))}</td>"
+        f"<td class='num dim'>{html.escape(str(p['headline_year'] or '—'))}</td>"
+        f"<td>{html.escape(p['filing_date'] or '')}</td>"
+        f"<td class='cik'>{html.escape(str(p['cik'] or ''))}</td>"
+        f"<td>{idx_l} · {doc_l}</td>"
+        "</tr>"
+    )
+
+
+def _desk_person_location_cell(p: dict) -> str:
+    """US city/state only for desk company table (no street)."""
+    mat = (p.get("issuer_hq_city_state") or "").strip()
+    if mat and pipeline_hq_city_state_label_ok(mat):
+        cs = hq_advisor_city_state_only(mat)
+        if cs:
+            return cs
+    raw = (p.get("issuer_headquarters") or "").strip()
+    if raw:
+        fmt = hq_normalize_ui_line(raw) or raw
+        cs = hq_advisor_city_state_only(fmt)
+        if cs:
+            return cs
+    return ""
+
+
+def _desk_profile_row_tr_company_minimal(p: dict, *, blur_preview: bool = False) -> str:
+    """One person row for issuer drill-in; optional preview blur (location stays clear)."""
+    loc = html.escape(_desk_person_location_cell(p) or "—")
+    title = html.escape(p["title"] or "—")
+    href = html.escape(_profile_lead_url(p))
+    nm = html.escape(p["display_name"] or "")
+    idx = html.escape(p["index_url"] or "")
+    doc = html.escape(p["primary_doc_url"] or "")
+    idx_l = f'<a href="{idx}" target="_blank" rel="noopener" onclick="event.stopPropagation()">EDGAR</a>' if idx else "—"
+    doc_l = f'<a href="{doc}" target="_blank" rel="noopener" onclick="event.stopPropagation()">Doc</a>' if doc else "—"
+    fd = html.escape(p.get("filing_date") or "")
+    blur = " desk-co-preview-blur" if blur_preview else ""
+    if blur_preview:
+        name_cell = f"<td class='profile-name{blur}'><span>{nm}</span></td>"
+        title_cell = f"<td{blur}>{title}</td>"
+        tot_cell = f"<td class='num mono-money strong{blur}'>{_money(p.get('total'))}</td>"
+        fd_cell = f"<td class='dim{blur}'>{fd}</td>"
+        links_cell = f"<td{blur}><span class='dim'>—</span></td>"
+        tr_cls = "desk-co-preview-row"
+        tr_attr = ' title="Preview: location only"'
+    else:
+        name_cell = f"<td class='profile-name'><a href='{href}'>{nm}</a></td>"
+        title_cell = f"<td>{title}</td>"
+        tot_cell = f"<td class='num mono-money strong'>{_money(p.get('total'))}</td>"
+        fd_cell = f"<td class='dim'>{fd}</td>"
+        links_cell = f"<td>{idx_l} · {doc_l}</td>"
+        tr_cls = "desk-row"
+        tr_attr = f" data-href='{href}' role='link' title='Open profile'"
+    return (
+        f"<tr class='{tr_cls}' tabindex='0'{tr_attr}>"
+        f"<td class='desk-co-loc'>{loc}</td>"
+        f"{name_cell}{title_cell}{tot_cell}{fd_cell}{links_cell}"
+        "</tr>"
+    )
 
 
 def _desk_table(profiles: list[dict], stats: dict) -> str:
@@ -2194,104 +3133,13 @@ def _desk_table(profiles: list[dict], stats: dict) -> str:
   {extra}
   <p class="meta">If the database is empty, run <code>sync</code> / <code>backfill-comp</code>, or open <b>Source rows</b> below.</p>"""
 
-    rows: list[str] = []
-    for p in profiles:
-        company = html.escape(p["company_name"] or "")
-        title = html.escape(p["title"] or "—")
-        href = html.escape(_profile_lead_url(p))
-        nm = html.escape(p["display_name"] or "")
-        idx = html.escape(p["index_url"] or "")
-        doc = html.escape(p["primary_doc_url"] or "")
-        idx_l = f'<a href="{idx}" target="_blank" rel="noopener" onclick="event.stopPropagation()">EDGAR</a>' if idx else "—"
-        doc_l = f'<a href="{doc}" target="_blank" rel="noopener" onclick="event.stopPropagation()">Doc</a>' if doc else "—"
-        tier = p.get("lead_tier") or _profile_lead_tier(p)
-        tier_lbl = {"premium": "Premium", "standard": "Standard", "visibility": "Visibility"}.get(
-            tier, tier
-        )
-        tier_title = (
-            "Full SCT disclosure meets desk pay-signal bar (or bar is off)."
-            if tier == "premium"
-            else (
-                "S-1 summary comp below desk pay bar — still a sellable lead."
-                if tier == "standard"
-                else "S-1 officer/director table only — no SCT row in DB; referral-tier."
-            )
-        )
-        badge = (
-            f'<span class="badge badge-tier-{html.escape(tier)}" '
-            f'title="{html.escape(tier_title)}">{html.escape(tier_lbl)}</span>'
-        )
-        why_s = html.escape((p.get("why_surfaced") or "")[:160])
-        why_cell = f'<span class="lead-why">{why_s}</span>' if why_s else ""
-        oa_row = p.get("officer_age")
-        age_cell = "—"
-        if oa_row is not None:
-            try:
-                age_cell = str(int(oa_row))
-            except (TypeError, ValueError):
-                pass
-        bio_full = (p.get("mgmt_bio_text") or "").strip()
-        bio_one = re.sub(r"\s+", " ", bio_full)[:220]
-        age_tip = ""
-        st = p.get("age_stated_in_filing")
-        anch = (p.get("age_anchor_date") or "").strip()
-        if st is not None and anch:
-            try:
-                st_i = int(st)
-                disp_i = int(oa_row) if oa_row is not None else st_i
-                if disp_i != st_i:
-                    age_tip = (
-                        f"Age ~{disp_i} est. (stated {st_i} as of filing {anch}; "
-                        "calendar years to today; birthday not in filing)."
-                    )
-                else:
-                    age_tip = f"Age {st_i} (anchor filing date {anch})."
-            except (TypeError, ValueError):
-                pass
-        tip_parts = []
-        if bio_one:
-            tip_parts.append(bio_one + ("…" if len(bio_full) > 220 else ""))
-        if age_tip:
-            tip_parts.append(age_tip)
-        combined_tip = " \u00b7 ".join(tip_parts) if tip_parts else "Open profile"
-        row_tip = html.escape(combined_tip, quote=True)
-        tip_attr = f' title="{row_tip}"'
-        web_u = (p.get("issuer_website") or "").strip()
-        co_link = _canonical_external_url(web_u)
-        if not co_link and p.get("primary_doc_url"):
-            co_link = _canonical_external_url((p.get("primary_doc_url") or "").strip())
-        co_href = html.escape(co_link)
-        if co_link:
-            co_cell = (
-                f'<a href="{co_href}" target="_blank" rel="noopener" '
-                f'onclick="event.stopPropagation()" title="Issuer site or filing">'
-                f"{company}</a>"
-            )
-        else:
-            co_cell = company
-        stage_badge = _issuer_listing_stage_badge_html(p)
-        rows.append(
-            "<tr class='desk-row' tabindex='0' role='link' "
-            f"data-href='{href}'{tip_attr}>"
-            f"<td class='num'>{html.escape(age_cell)}</td>"
-            f"<td class='profile-name'><a href='{href}'>{nm}</a>{why_cell}</td>"
-            f"<td>{title}</td>"
-            f"<td class='co-name'>{co_cell}</td>"
-            f"<td>{stage_badge}</td>"
-            f"<td><span class='badge'>{badge}</span></td>"
-            f"<td class='num strong'>{_money(p['total'])}</td>"
-            f"<td class='num'>{_money(p.get('equity_hwm'))}</td>"
-            f"<td class='num dim'>{html.escape(str(p['headline_year'] or '—'))}</td>"
-            f"<td>{html.escape(p['filing_date'] or '')}</td>"
-            f"<td class='cik'>{html.escape(str(p['cik'] or ''))}</td>"
-            f"<td>{idx_l} · {doc_l}</td>"
-            "</tr>"
-        )
+    rows = [_desk_profile_row_tr(p, hide_company=False) for p in profiles]
     inner = "".join(rows)
     return f"""
   <h2>Lead desk</h2>
   <p class="meta">
-    <b>Person-first leads from S-1-era filings.</b> Desk = <b>S-1 family</b> profiles: <b>Premium</b> (SCT meets pay bar), <b>Standard</b> (SCT below bar, e.g. many directors), and <b>Visibility</b> (officer/director on S-1, no SCT row in DB). <b>Listing</b> uses form types in your DB: <b>Pre-IPO</b> = S-1/F-1 on file but no 10-K/10-Q yet; <b>Public</b> = at least one periodic report (already listed or filing history); <b>Unknown</b> = inconclusive snapshot. Pay bar (<code>WEALTH_LEADS_LEAD_DESK_MIN_SIGNAL_USD</code>) tiers only — it does not remove rows. <b>Company</b> links to issuer site when parsed, else filing doc. <b>Latest total</b> = headline FY SCT (— if none); <b>Max equity</b> = best single-year stock+options.
+    <b>Person-first leads from S-1-era filings.</b> Desk = <b>S-1 family</b> profiles: <b>Premium</b> (SCT meets pay bar), <b>Standard</b> (SCT below bar, e.g. many directors), and <b>Visibility</b> (officer/director on S-1, no SCT row in DB). <b>Listing</b> uses form types in your DB: <b>Pre-IPO</b> = S-1/F-1 on file but no 10-K/10-Q yet; <b>Public</b> = at least one periodic report (already listed or filing history); <b>Unknown</b> = inconclusive snapshot. Pay bar (<code>WEALTH_LEADS_LEAD_DESK_MIN_SIGNAL_USD</code>) tiers only — it does not remove rows. <b>Company</b> links to issuer site when parsed, else filing doc.     <b>Latest total</b> = headline FY SCT (— if none); <b>Max equity</b> = best single-year stock+options.
+    <b>Pay band</b> ($1M+, etc.) uses the <b>headline</b> FY (that total vs that year's stock+options), not older fiscal years.
     <b>Age</b> = stated in the filing, then + full calendar years to today (no birthday in EDGAR text); hover a row for <b>bio + age detail</b>.
     Full narrative + HQ on the profile page.
     <b>Click the row</b> for detail. Raw rows: <b>Source rows</b> below.
@@ -2300,7 +3148,7 @@ def _desk_table(profiles: list[dict], stats: dict) -> str:
   <table id="desk">
     <thead>
       <tr>
-        <th title="Stated age in the filing, plus full calendar years to today (birthday not disclosed)">Age</th><th>Person</th><th>Role</th><th>Company</th><th title="Premium vs standard vs visibility (see desk note)">Tier</th>
+        <th title="Stated age in the filing, plus full calendar years to today (birthday not disclosed)">Age</th><th>Person</th><th>Role</th><th>Company</th><th>Listing</th><th title="Premium vs standard vs visibility (see desk note)">Tier</th>
         <th>Latest total</th><th title='Max single-FY stock + options (SCT)'>Max equity</th>
         <th>FY</th><th>Filing</th><th>CIK</th><th>Quick source</th>
       </tr>
@@ -2310,12 +3158,46 @@ def _desk_table(profiles: list[dict], stats: dict) -> str:
   </div>"""
 
 
+def _desk_company_people_table(
+    profiles: list[dict],
+    stats: dict,
+    *,
+    company_name: str,
+    blur_preview: bool = False,
+) -> str:
+    """Person rows for one issuer — Location column first; optional preview blur."""
+    co_plain = (company_name or "").strip() or "This issuer"
+    co_e = html.escape(co_plain)
+    if not profiles:
+        return f"""<p class="meta dim">No people in this roster for {co_e}. Try the other tab.</p>"""
+    rows = [
+        _desk_profile_row_tr_company_minimal(p, blur_preview=blur_preview)
+        for p in profiles
+    ]
+    inner = "".join(rows)
+    return f"""
+  <div class="table-wrap" style="margin-top:0.35rem">
+  <table id="desk-co-people" class="desk-company-people">
+    <thead>
+      <tr>
+        <th title="US city and state from registrant office (no street)">Location</th>
+        <th>Person</th>
+        <th>Role</th>
+        <th class="num-th" title="Headline fiscal-year total from SCT">Total</th>
+        <th>Filing date</th>
+        <th>EDGAR / doc</th>
+      </tr>
+    </thead>
+    <tbody id="desk-co-body">{inner}</tbody>
+  </table>
+  </div>"""
+
+
 def _finder_table(profiles: list[dict]) -> str:
     if not profiles:
         return """
-  <h2>Matching leads</h2>
-  <p class="meta">No rows match these filters. Widen the search, check <b>All NEO profiles</b>, or run
-  <code>python -m wealth_leads backfill-comp --force</code> to re-parse HQ and SIC/NAICS from filings.</p>"""
+  <h2>Results</h2>
+  <p class="meta dim">No matches. Widen filters or enable <b>All profiles in DB</b>.</p>"""
 
     rows_html: list[str] = []
     for p in profiles:
@@ -2328,7 +3210,8 @@ def _finder_table(profiles: list[dict]) -> str:
         idx_l = f'<a href="{idx}" target="_blank" rel="noopener" onclick="event.stopPropagation()">EDGAR</a>' if idx else "—"
         doc_l = f'<a href="{doc}" target="_blank" rel="noopener" onclick="event.stopPropagation()">Doc</a>' if doc else "—"
         hq_raw = (p.get("issuer_headquarters") or "").strip()
-        hq_disp = html.escape(hq_raw[:140] + ("…" if len(hq_raw) > 140 else ""))
+        hq_line = hq_principal_office_display_line(hq_raw) if hq_raw else ""
+        hq_disp = html.escape(hq_line[:140] + ("…" if len(hq_line) > 140 else ""))
         ind_raw = (p.get("issuer_industry") or "").strip()
         ind_disp = html.escape(ind_raw[:160] + ("…" if len(ind_raw) > 160 else ""))
         if not hq_disp:
@@ -2343,9 +3226,13 @@ def _finder_table(profiles: list[dict]) -> str:
             except (TypeError, ValueError):
                 pass
         st_badge = _issuer_listing_stage_badge_html(p)
+        st_raw = (p.get("issuer_listing_stage") or "unknown").strip().lower()
+        if st_raw not in ("pre_ipo", "public", "unknown"):
+            st_raw = "unknown"
+        tot_attr = _desk_row_attr_float(p.get("total"))
         rows_html.append(
             "<tr class='desk-row' tabindex='0' role='link' "
-            f"data-href='{href}'>"
+            f"data-href='{href}' data-listing='{html.escape(st_raw)}' data-total='{tot_attr}'>"
             f"<td class='num'>{html.escape(age_cell)}</td>"
             f"<td class='profile-name'><a href='{href}'>{nm}</a></td>"
             f"<td>{title}</td>"
@@ -2361,8 +3248,8 @@ def _finder_table(profiles: list[dict]) -> str:
         )
     inner = "".join(rows_html)
     return f"""
-  <h2>Matching leads</h2>
-  <p class="meta"><b>{len(profiles)}</b> profile(s) match the current filters. Click a row for the full profile and filing links.</p>
+  <h2>Results</h2>
+  <p class="meta dim">{len(profiles)} match(es). Click a row for profile.</p>
   <div class="table-wrap">
   <table id="finder">
     <thead>
@@ -2372,6 +3259,24 @@ def _finder_table(profiles: list[dict]) -> str:
         <th title="Registrant principal office / HQ from filing text">Registrant HQ</th>
         <th title="SIC or NAICS line when parsed from the filing">Industry (SIC/NAICS)</th>
         <th>Latest total</th><th>Filing</th><th>CIK</th><th>Sources</th>
+      </tr>
+      <tr class="desk-filter-row">
+        <th><span class="dim" style="font-size:0.68rem">—</span></th>
+        <th><input type="search" class="desk-th-filter-input" data-finder-col="person" placeholder="Contains…" aria-label="Filter person"/></th>
+        <th><input type="search" class="desk-th-filter-input" data-finder-col="role" placeholder="Contains…" aria-label="Filter role"/></th>
+        <th><input type="search" class="desk-th-filter-input" data-finder-col="co" placeholder="Contains…" aria-label="Filter company"/></th>
+        <th><select class="desk-th-filter-input" data-finder-col="listing" aria-label="Filter listing">
+            <option value="">All</option>
+            <option value="pre_ipo">Pre-IPO</option>
+            <option value="public">Listed</option>
+            <option value="unknown">Unknown</option>
+          </select></th>
+        <th><input type="search" class="desk-th-filter-input" data-finder-col="hq" placeholder="Contains…" aria-label="Filter HQ"/></th>
+        <th><input type="search" class="desk-th-filter-input" data-finder-col="ind" placeholder="Contains…" aria-label="Filter industry"/></th>
+        <th><input type="number" class="desk-th-filter-input" data-finder-col="mintot" min="0" step="1000" placeholder="Min $" aria-label="Min latest total USD"/></th>
+        <th><input type="search" class="desk-th-filter-input" data-finder-col="file" placeholder="Contains…" aria-label="Filter filing date"/></th>
+        <th><input type="search" class="desk-th-filter-input" data-finder-col="cik" placeholder="CIK…" aria-label="Filter CIK"/></th>
+        <th><span class="dim" style="font-size:0.68rem">—</span></th>
       </tr>
     </thead>
     <tbody id="finder-body">{inner}</tbody>
@@ -2386,23 +3291,17 @@ def _finder_form(
     q: str,
     all_neo: bool,
     export_href: str,
-    pay_band: str = "all",
-    listing_stage: str = "all",
     form_action: str = "/finder",
 ) -> str:
     hq_e = html.escape(hq)
     ind_e = html.escape(industry)
     q_e = html.escape(q)
-    band_e = html.escape((pay_band or "all").strip() or "all")
-    list_e = html.escape(normalize_listing_stage_query(listing_stage))
     action_e = html.escape(form_action)
     return f"""
   <div class="card" style="margin-bottom:1rem">
     <h2 style="margin-top:0">Search</h2>
-    <p class="meta" style="margin-top:0">Filter by <b>registrant location</b> (HQ address text) and <b>SIC/NAICS</b> (parsed code line from the filing, if any) plus issuer summary text. All matching is substring, case-insensitive.</p>
+    <p class="meta dim" style="margin-top:0">HQ, industry line, and text — substring match. Narrow results with column filters on the table.</p>
     <form method="get" action="{action_e}" style="max-width:40rem">
-      <input type="hidden" name="band" value="{band_e}"/>
-      <input type="hidden" name="listing" value="{list_e}"/>
       <label class="sr" for="hq">Registrant HQ contains</label>
       <input type="search" id="hq" name="hq" placeholder="e.g. California, Austin, 94105" value="{hq_e}" style="width:100%;max-width:100%;margin-bottom:0.5rem"/>
       <label class="sr" for="industry">SIC / NAICS or summary contains</label>
@@ -2411,7 +3310,7 @@ def _finder_form(
       <input type="search" id="fq" name="q" placeholder="Person name, company, or CIK…" value="{q_e}" style="width:100%;max-width:100%;margin-bottom:0.5rem"/>
       <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.8125rem;color:#8b96a3;cursor:pointer;margin:0.5rem 0">
         <input type="checkbox" name="all_neo" value="1"{' checked' if all_neo else ''}/>
-        All profiles in DB (ignore lead-desk S-1-context filter; includes every tier)
+        All profiles in DB (bypass desk filter)
       </label>
       <button type="submit" style="margin-top:0.35rem;padding:0.45rem 0.9rem;border-radius:4px;border:1px solid #238636;background:#238636;color:#fff;cursor:pointer;font:inherit">Apply filters</button>
       <a href="{html.escape(export_href)}" style="margin-left:0.75rem;font-size:0.8125rem">Download CSV</a>
@@ -2429,32 +3328,12 @@ def _page_finder(
     q: str,
     all_neo: bool,
     base_count: int,
-    pay_band: str = "all",
-    listing_stage: str = "all",
     nav_base_path: str = "/finder",
     form_action: str = "/finder",
     desk_href: str = "/",
     export_path: str = "/export/finder.csv",
 ) -> str:
     banner = _stats_banner(stats, rendered_at)
-    list_cur = normalize_listing_stage_query(listing_stage)
-    finder_extra = {
-        "hq": hq,
-        "industry": industry,
-        "q": q,
-        **({"all_neo": "1"} if all_neo else {}),
-        **({} if list_cur == "all" else {"listing": list_cur}),
-    }
-    band_nav = _pay_band_nav_html(
-        current=pay_band,
-        base_path=nav_base_path,
-        extra_qs=finder_extra,
-    )
-    listing_nav = _listing_stage_nav_html(
-        current=list_cur,
-        base_path=nav_base_path,
-        extra_qs={**finder_extra, "band": (pay_band or "all").strip() or "all"},
-    )
     css = _shared_css()
     extra_css = """
     td.hq-cell, td.ind-cell { font-size: 0.72rem; color: #a8b0ba; max-width: 14rem; }
@@ -2466,9 +3345,7 @@ def _page_finder(
             "hq": hq or "",
             "industry": industry or "",
             "q": q or "",
-            "band": (pay_band or "all").strip() or "all",
             **({"all_neo": "1"} if all_neo else {}),
-            **({} if list_cur == "all" else {"listing": list_cur}),
         }
     )
     export_href = export_path + "?" + exp_q
@@ -2478,15 +3355,12 @@ def _page_finder(
         q=q,
         all_neo=all_neo,
         export_href=export_href,
-        pay_band=pay_band,
-        listing_stage=list_cur,
         form_action=form_action,
     )
     tbl = _finder_table(profiles)
     scope = (
-        f"<p class='meta'>Showing <b>{len(profiles)}</b> row(s) after HQ / SIC·NAICS·summary / text, pay-signal band, and listing stage. "
-        f"Universe before filters: <b>{base_count}</b> "
-        f"({'all in database' if all_neo else 'after lead-desk S-1-context filters'}).</p>"
+        f"<p class='meta dim'>{len(profiles)} shown · universe {base_count} "
+        f"({'full DB' if all_neo else 'desk scope'}).</p>"
     )
     desk_link_e = html.escape(desk_href)
     return f"""<!DOCTYPE html>
@@ -2498,32 +3372,74 @@ def _page_finder(
   <style>{css}{extra_css}</style>
 </head>
 <body class="wide">
-  <h1>WealthPipeline <span class="tag">lead finder · local</span></h1>
-  <p class="meta">
-    Search people tied to issuers in your database. <b>HQ</b> is the registrant’s principal office line from filings (not a home address).
-    <b>SIC/NAICS</b> matches the parsed code line from the filing when present; you can also match keywords in the issuer business summary.
-    <a href="{desk_link_e}">Lead desk</a>
-  </p>
+  <h1>Lead finder</h1>
+  <p class="meta"><a href="{desk_link_e}">Lead desk</a></p>
   {banner}
-  {band_nav}
-  {listing_nav}
   {form}
   {scope}
-  {tbl}
   <label class="sr" for="filter-finder">Narrow results in this table</label>
-  <input type="search" id="filter-finder" placeholder="Quick filter this table…" autocomplete="off"/>
+  <input type="search" id="filter-finder" placeholder="Search any text in the table…" autocomplete="off"/>
+  <p class="meta dim" style="margin-top:0">Use inputs under column headers to filter by listing, comp, HQ, etc.</p>
+  {tbl}
   <script>
   (function() {{
     var input = document.getElementById('filter-finder');
-    if (input) {{
-      input.addEventListener('input', function() {{
-        var q = (input.value || '').toLowerCase().trim();
-        document.querySelectorAll('#finder-body tr').forEach(function(tr) {{
-          if (!q) {{ tr.classList.remove('hidden'); return; }}
-          tr.classList.toggle('hidden', (tr.textContent || '').toLowerCase().indexOf(q) < 0);
+    var tbody = document.getElementById('finder-body');
+    var table = document.getElementById('finder');
+    var filterRow = table && table.querySelector('thead tr.desk-filter-row');
+    function parseF(s) {{
+      if (s == null || s === '') return null;
+      var x = parseFloat(String(s).replace(/,/g, ''));
+      return isNaN(x) ? null : x;
+    }}
+    function cellLower(tr, i) {{
+      var td = tr.cells[i];
+      return td ? (td.innerText || '').toLowerCase().trim() : '';
+    }}
+    function applyFinderFilters() {{
+      if (!tbody) return;
+      var gq = input ? (input.value || '').toLowerCase().trim() : '';
+      var fPerson = '', fRole = '', fCo = '', fCik = '', fHq = '', fInd = '', fFile = '', fList = '';
+      var minTot = null;
+      if (filterRow) {{
+        filterRow.querySelectorAll('[data-finder-col]').forEach(function(el) {{
+          var k = el.getAttribute('data-finder-col');
+          var v = (el.value || '').trim();
+          if (k === 'person') fPerson = v.toLowerCase();
+          else if (k === 'role') fRole = v.toLowerCase();
+          else if (k === 'co') fCo = v.toLowerCase();
+          else if (k === 'cik') fCik = v.toLowerCase();
+          else if (k === 'hq') fHq = v.toLowerCase();
+          else if (k === 'ind') fInd = v.toLowerCase();
+          else if (k === 'file') fFile = v.toLowerCase();
+          else if (k === 'listing') fList = v;
+          else if (k === 'mintot') minTot = parseF(v);
         }});
+      }}
+      tbody.querySelectorAll('tr').forEach(function(tr) {{
+        var ok = true;
+        if (gq && (tr.textContent || '').toLowerCase().indexOf(gq) < 0) ok = false;
+        if (ok && fPerson && cellLower(tr, 1).indexOf(fPerson) < 0) ok = false;
+        if (ok && fRole && cellLower(tr, 2).indexOf(fRole) < 0) ok = false;
+        if (ok && fCo && cellLower(tr, 3).indexOf(fCo) < 0) ok = false;
+        if (ok && fCik && cellLower(tr, 9).indexOf(fCik) < 0) ok = false;
+        if (ok && fHq && cellLower(tr, 5).indexOf(fHq) < 0) ok = false;
+        if (ok && fInd && cellLower(tr, 6).indexOf(fInd) < 0) ok = false;
+        if (ok && fFile && cellLower(tr, 8).indexOf(fFile) < 0) ok = false;
+        if (ok && fList && (tr.getAttribute('data-listing') || '') !== fList) ok = false;
+        if (ok && minTot != null) {{
+          var t = parseF(tr.getAttribute('data-total'));
+          if (t == null || t < minTot) ok = false;
+        }}
+        tr.classList.toggle('hidden', !ok);
       }});
     }}
+    if (input) input.addEventListener('input', applyFinderFilters);
+    if (filterRow) filterRow.querySelectorAll('input,select').forEach(function(el) {{
+      el.addEventListener('input', applyFinderFilters);
+      el.addEventListener('change', applyFinderFilters);
+    }});
+    applyFinderFilters();
     document.querySelectorAll('#finder-body tr.desk-row').forEach(function(tr) {{
       function go() {{
         var h = tr.getAttribute('data-href');
@@ -2579,7 +3495,7 @@ def _leads_table(rows: list[sqlite3.Row]) -> str:
     )
     return f"""
   <h2>Officers by filing (raw)</h2>
-  <p class="meta">One row per officer line in the filing. Comp columns match the summary table by name when available.</p>
+  <p class="meta dim">Officer lines from filings.</p>
   <table>
     <thead>
       <tr>
@@ -2623,7 +3539,7 @@ def _comp_table(rows: list[sqlite3.Row]) -> str:
     )
     return f"""
   <h2>NEO summary compensation lines (raw)</h2>
-  <p class="meta">Every parsed comp row — the desk rolls these up by person + company (CIK).</p>
+  <p class="meta dim">Parsed SCT rows.</p>
   <table>
     <thead>
       <tr>
@@ -2644,14 +3560,11 @@ def _comp_missing_callout(stats: dict) -> str:
     if stats.get("filings", 0) == 0:
         return ""
     return """<div class="callout">
-    <strong>No compensation rows in your database yet.</strong>
-    CIK is only SEC’s company ID (not pay). Run <code>python -m wealth_leads sync</code> (sync now auto-runs a comp backfill), or
-    <code>python -m wealth_leads backfill-comp</code>, then refresh. Use <code>backfill-comp --force</code> after upgrading the parser.
-    Many small S-1s have no parseable summary table.
+    <strong>No compensation rows yet.</strong> Run <code>sync</code> or <code>python -m wealth_leads backfill-comp</code>, then refresh.
   </div>"""
 
 
-def _stats_banner(stats: dict, rendered_at: str) -> str:
+def _stats_banner(stats: dict, _rendered_at: str) -> str:
     if stats.get("missing_db"):
         return """<div class="banner warn"><strong>No database file yet.</strong> Run sync once, then refresh this page.</div>"""
     nf, no, nc = stats["filings"], stats["officers"], stats["comp_rows"]
@@ -2659,14 +3572,12 @@ def _stats_banner(stats: dict, rendered_at: str) -> str:
     np_all = int(stats.get("profile_count_all", np))
     latest = html.escape(str(stats.get("latest_filing_date") or "—"))
     mtime = html.escape(str(stats.get("db_file_modified") or "—"))
-    rat = html.escape(rendered_at)
     desk_lbl = f"{np} desk leads"
     if np_all != np:
-        desk_lbl = f"{np} desk leads <span style='color:#6b7785'>({np_all} NEO profiles before filters)</span>"
-    return f"""<div class="banner">
-    <strong>This database</strong>
-    <span class="stats"><span>{desk_lbl}</span><span>{nf} filings</span><span>{no} officer rows</span><span>{nc} comp rows</span></span>
-    <span class="sub">Lead desk row count is filtered (e.g. S-1 context); it is <b>not</b> the same as &ldquo;My leads&rdquo; for a signed-in advisor. Newest filing: <b>{latest}</b> · DB updated: <b>{mtime}</b> · Page: <b>{rat}</b></span>
+        desk_lbl = f"{np} desk leads <span class='dim'>({np_all} before filters)</span>"
+    return f"""<div class="banner banner-compact">
+    <span class="stats-compact">{desk_lbl}</span>
+    <span class="dim"> · {nf} filings · {no} officers · {nc} comp · newest {latest} · DB {mtime}</span>
   </div>"""
 
 
@@ -2687,6 +3598,9 @@ def _shared_css() -> str:
     h2:first-of-type { margin-top: 0.5rem; }
     p.meta { color: #6b7785; font-size: 0.8125rem; margin-bottom: 0.85rem; line-height: 1.5; }
     .banner { background: #121820; border: 1px solid #2a3340; border-radius: 6px; padding: 0.75rem 0.9rem; margin-bottom: 0.85rem; }
+    .banner.banner-compact { padding: 0.5rem 0.75rem; margin-bottom: 0.7rem; font-size: 0.8125rem; line-height: 1.45; }
+    .banner.banner-compact .stats-compact { color: #e8ecf0; }
+    .filter-strip { margin: 0 0 0.65rem 0; padding: 0.45rem 0.7rem; background: #101820; border: 1px solid #2a3340; border-radius: 6px; }
     .banner.warn { border-color: #8b4040; background: #1f1515; }
     .banner .stats { display: flex; flex-wrap: wrap; gap: 0.5rem 1.1rem; margin: 0.4rem 0; font-size: 0.84rem; }
     .banner .stats span { color: #6b7785; }
@@ -2707,6 +3621,37 @@ def _shared_css() -> str:
     #desk .num, .detail-page .num { font-family: ui-monospace, "Cascadia Mono", "Consolas", monospace; }
     th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid #222a33; vertical-align: top; }
     thead th { background: #0f1318; color: #8b96a3; font-weight: 600; position: sticky; top: 0; z-index: 1; }
+    table.desk-by-company tbody td { vertical-align: middle; }
+    table.desk-by-company th.people-th,
+    table.desk-by-company td.people-count {
+      text-align: center;
+      width: 3.5rem;
+      min-width: 3.25rem;
+      font-variant-numeric: tabular-nums;
+      font-family: ui-monospace, "Cascadia Mono", "Consolas", monospace;
+      font-size: 0.8125rem;
+      font-weight: 600;
+      color: #c5ccd4;
+    }
+    table.desk-by-company th.people-th { font-size: 0.72rem; font-weight: 600; color: #8b96a3; }
+    table.desk-by-company td.hq-cell {
+      font-size: 0.78rem;
+      max-width: 14rem;
+      line-height: 1.35;
+    }
+    table.desk-by-company td.listing-cell { vertical-align: middle; }
+    table.desk-by-company td.listing-cell .badge { vertical-align: middle; }
+    table.desk-by-company th.num-th,
+    table.desk-by-company td.mono-money {
+      text-align: right;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+      font-family: ui-monospace, "Cascadia Mono", "Consolas", monospace;
+      font-size: 0.8125rem;
+      padding-left: 0.65rem;
+      padding-right: 0.65rem;
+    }
+    table.desk-by-company th.num-th { font-size: 0.72rem; }
     th { color: #8b96a3; font-weight: 600; }
     td.num { text-align: right; }
     td.strong { font-weight: 600; color: #e8ecf0; }
@@ -2728,6 +3673,69 @@ def _shared_css() -> str:
     .badge-listing-pre_ipo { background: #1a1e28; color: #79c0ff; border-color: #3d5280; }
     .badge-listing-public { background: #1e2220; color: #8ddb9a; border-color: #2d4d3a; }
     .badge-listing-unknown { background: #22252c; color: #8b96a3; border-color: #3d424d; }
+    .desk-tier-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.5rem 0.85rem;
+      margin: 0 0 0.85rem 0;
+      padding: 0.55rem 0.75rem;
+      background: #101820;
+      border: 1px solid #2a3340;
+      border-radius: 6px;
+    }
+    .desk-tier-row-label {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      font-weight: 600;
+    }
+    .desk-tier-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      align-items: center;
+    }
+    a.desk-tier-tab {
+      display: inline-block;
+      padding: 0.35rem 0.85rem;
+      border-radius: 5px;
+      border: 1px solid #3d424d;
+      background: #0a0e12;
+      color: #8ecfff;
+      font-size: 0.8125rem;
+      font-weight: 500;
+      text-decoration: none;
+    }
+    a.desk-tier-tab:hover {
+      border-color: #58a6ff;
+      color: #c5ccd4;
+    }
+    a.desk-tier-tab--active {
+      border-color: #58a6ff;
+      background: #1a2634;
+      color: #e8ecf0;
+      font-weight: 600;
+    }
+    .desk-tier-row--stacked {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 0.45rem;
+    }
+    .desk-tier-row--desk-index { margin: 0 0 0.85rem 0; }
+    .desk-tier-row--after-scope { margin-top: 0.5rem; }
+    .desk-tier-row-head {
+      display: flex;
+      flex-direction: column;
+      gap: 0.12rem;
+    }
+    .desk-tier-row-title {
+      font-size: 0.875rem;
+      font-weight: 600;
+      color: #e8ecf0;
+    }
+    .desk-tier-hint { font-size: 0.72rem; line-height: 1.4; }
+    .desk-tier-sep { user-select: none; padding: 0 0.1rem; }
     p.lead-tier-strip { margin-top: 0.35rem; margin-bottom: 0.5rem; }
     .client-research-card { border-color: #316d9a; background: linear-gradient(180deg, #141c24 0%, #121820 100%); }
     .client-research-card h2 { color: #79c0ff; }
@@ -2823,6 +3831,33 @@ def _shared_css() -> str:
       color: #c5b896;
       font-size: 0.72rem;
       line-height: 1.4;
+    }
+    .lead-issuer-risk {
+      margin: 0 0 0.55rem 0;
+      padding: 0.5rem 0.65rem;
+      border-radius: 5px;
+      font-size: 0.74rem;
+      line-height: 1.45;
+    }
+    .lead-issuer-risk-high {
+      border: 1px solid #8b4040;
+      background: linear-gradient(180deg, #1f1515 0%, #161010 100%);
+      color: #e8c9c9;
+    }
+    .lead-issuer-risk-elevated {
+      border: 1px solid #5c4a2a;
+      background: linear-gradient(180deg, #1a1610 0%, #14120e 100%);
+      color: #d4c4a8;
+    }
+    .lead-cross-company-note {
+      margin: 0 0 0.55rem 0;
+      padding: 0.45rem 0.6rem;
+      border-radius: 5px;
+      border: 1px solid #2a4a6a;
+      background: #121a22;
+      font-size: 0.74rem;
+      line-height: 1.45;
+      color: #c5d4e8;
     }
     p.lead-important-people-beneficial-note {
       margin: 0 0 0.5rem 0;
@@ -3033,6 +4068,12 @@ def _shared_css() -> str:
       .lead-company-card .lead-company-dl dt:first-child { margin-top: 0; }
       .lead-company-card .lead-company-dl dd { margin-bottom: 0.1rem; }
     }
+    .lead-company-map-wrap {
+      margin-top: 0.45rem;
+      padding-top: 0.4rem;
+      border-top: 1px solid #2a3340;
+    }
+    a.lead-registrant-maps { color: #58a6ff; font-size: 0.84rem; }
     .lead-col-hint {
       font-size: 0.72rem;
       color: #6b7785;
@@ -3063,6 +4104,41 @@ def _shared_css() -> str:
     .pay-band-nav { font-size: 0.84rem; line-height: 1.6; }
     a.pay-band-tab { color: #58a6ff; margin-right: 0.35rem; }
     a.pay-band-tab--active { font-weight: 600; color: #c5ccd4; text-decoration: underline; }
+    .desk-company-filters { margin: 0 0 0.85rem 0; font-size: 0.8125rem; line-height: 1.65; color: #c5ccd4; }
+    .desk-company-h1 { font-size: 1.2rem; font-weight: 600; margin: 0 0 0.35rem 0; letter-spacing: -0.02em; color: #e8ecf0; }
+    .desk-co-facts { margin: 0 0 0.65rem 0; font-size: 0.8125rem; line-height: 1.45; }
+    .desk-tier-compact { margin: 0 0 1rem 0; }
+    .desk-tier-compact .desk-tier-tabs { margin: 0; }
+    td.desk-co-loc { color: #a8b0ba; font-size: 0.8125rem; white-space: nowrap; }
+    td.desk-co-preview-blur {
+      filter: blur(6px);
+      user-select: none;
+    }
+    tr.desk-co-preview-row { cursor: default; }
+    tr.desk-co-preview-row:hover td { background: transparent; }
+    table.desk-company-people thead th.num-th { text-align: right; }
+    table.desk-company-people td.num { text-align: right; }
+    tr.desk-filter-row th {
+      padding: 0.25rem 0.35rem 0.45rem;
+      vertical-align: bottom;
+      font-weight: 400;
+      border-bottom: 1px solid #2a3340;
+    }
+    .desk-th-filter-input,
+    tr.desk-filter-row select {
+      width: 100%;
+      max-width: 8.5rem;
+      box-sizing: border-box;
+      font: inherit;
+      font-size: 0.72rem;
+      padding: 0.28rem 0.4rem;
+      border-radius: 4px;
+      border: 1px solid #2a3340;
+      background: #0a0e12;
+      color: #c5ccd4;
+    }
+    tr.desk-filter-row select { max-width: 6.25rem; }
+    table#finder tr.desk-filter-row .desk-th-filter-input { max-width: 7rem; }
     """
 
 
@@ -3073,38 +4149,43 @@ def _page_desk(
     stats: dict,
     rendered_at: str,
     *,
-    pay_band: str = "all",
-    listing_stage: str = "all",
     nav_base_path: str = "/",
     desk_universe_count: Optional[int] = None,
+    sales_bundle: str = "premium",
+    premium_company_count: Optional[int] = None,
+    economy_company_count: Optional[int] = None,
 ) -> str:
     banner = _stats_banner(stats, rendered_at)
-    list_cur = normalize_listing_stage_query(listing_stage)
-    desk_extra = {**({} if list_cur == "all" else {"listing": list_cur})}
-    band_nav = _pay_band_nav_html(
-        current=pay_band,
+    sb_cur = normalize_sales_bundle_query(sales_bundle)
+    desk_tier_nav = _sales_bundle_nav_html(
+        current=sb_cur,
         base_path=nav_base_path,
-        extra_qs=desk_extra,
+        extra_qs={},
+        premium_count=premium_company_count,
+        economy_count=economy_company_count,
+        nav_context="desk",
     )
-    listing_nav = _listing_stage_nav_html(
-        current=list_cur,
-        base_path=nav_base_path,
-        extra_qs={
-            "band": (pay_band or "all").strip() or "all",
-            **desk_extra,
-        },
-    )
-    if (
-        desk_universe_count is not None
-        and (pay_band or "all").strip().lower() != "all"
-    ):
+    try:
+        with connect() as _conn:
+            bundles = group_desk_profiles_by_company(profiles, _conn)
+    except sqlite3.Error:
+        bundles = group_desk_profiles_by_company(profiles, None)
+    sb_label = sales_bundle_section_heading(sb_cur)
+    n_p = sum(int(b.get("people_count") or 0) for b in bundles)
+    if desk_universe_count is not None:
         band_counts = (
-            f"<p class='meta'>This pay-signal band: <b>{len(profiles)}</b> of "
-            f"<b>{desk_universe_count}</b> desk lead(s).</p>"
+            f"<p class='meta dim'>{len(bundles)} companies · {n_p} people in view "
+            f"({sb_label}) · {desk_universe_count} people on desk overall.</p>"
         )
     else:
         band_counts = ""
     css = _shared_css()
+    bundles_html = _desk_company_bundles_table(
+        bundles,
+        stats,
+        nav_base_path=nav_base_path,
+        sales_bundle=sb_cur,
+    )
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3114,42 +4195,168 @@ def _page_desk(
   <style>{css}</style>
 </head>
 <body class="wide">
-  <h1>WealthPipeline <span class="tag">lead desk · local</span></h1>
-  <p class="meta">
-    <a href="{html.escape('/finder' if nav_base_path == '/' else '/admin/finder')}">Lead finder</a> — filter by registrant HQ and SIC/NAICS (or summary keywords).
-    SEC filing–native timing: <b>S-1</b> from RSS, then <b>10-K</b> for the <b>same CIKs</b> via SEC submissions (cross-reference). Data updates when you run <code>sync</code>.
-    Database: <code>{html.escape(str(Path(database_path()).resolve()))}</code>
-  </p>
+  <h1>Lead desk</h1>
+  <p class="meta"><a href="{html.escape('/finder' if nav_base_path == '/' else '/admin/finder')}">Lead finder</a></p>
   {banner}
-  {band_nav}
-  {listing_nav}
+  {desk_tier_nav}
   {band_counts}
+  <p class="meta dim" style="margin-top:0">Use the search box for any text, or the inputs under column headers to narrow by listing, comp, etc.</p>
   {_comp_missing_callout(stats)}
   <label class="sr" for="filter">Filter desk + audit tables</label>
-  <input type="search" id="filter" placeholder="Company, person, or CIK…" autocomplete="off"/>
-  {_desk_table(profiles, stats)}
+  <input type="search" id="filter" placeholder="Search any text in the table…" autocomplete="off"/>
+  {bundles_html}
   <details class="audit">
-    <summary>Source rows (audit) — officers × filings and raw NEO comp lines</summary>
+    <summary>Raw filing rows</summary>
     {_leads_table(leads)}
     {_comp_table(comp)}
   </details>
   <script>
   (function() {{
     var input = document.getElementById('filter');
-    if (input) {{
-      input.addEventListener('input', function() {{
-        var q = (input.value || '').toLowerCase().trim();
-        document.querySelectorAll('#desk-body tr').forEach(function(tr) {{
-          if (!q) {{ tr.classList.remove('hidden'); return; }}
-          tr.classList.toggle('hidden', (tr.textContent || '').toLowerCase().indexOf(q) < 0);
+    var tbody = document.getElementById('desk-body');
+    var table = document.getElementById('desk');
+    var filterRow = table && table.querySelector('thead tr.desk-filter-row');
+    function parseF(s) {{
+      if (s == null || s === '') return null;
+      var x = parseFloat(String(s).replace(/,/g, ''));
+      return isNaN(x) ? null : x;
+    }}
+    function cellLower(tr, i) {{
+      var td = tr.cells[i];
+      return td ? (td.innerText || '').toLowerCase().trim() : '';
+    }}
+    function applyDeskFilters() {{
+      if (!tbody) return;
+      var gq = input ? (input.value || '').toLowerCase().trim() : '';
+      var fCo = '', fCik = '', fLoc = '', fList = '';
+      var minP = null, minTop = null, minSum = null, minEq = null;
+      if (filterRow) {{
+        filterRow.querySelectorAll('[data-desk-col]').forEach(function(el) {{
+          var k = el.getAttribute('data-desk-col');
+          var v = (el.value || '').trim();
+          if (k === 'co') fCo = v.toLowerCase();
+          else if (k === 'cik') fCik = v.toLowerCase();
+          else if (k === 'loc') fLoc = v.toLowerCase();
+          else if (k === 'listing') fList = v;
+          else if (k === 'minpeople') minP = parseF(v);
+          else if (k === 'mintop') minTop = parseF(v);
+          else if (k === 'minsum') minSum = parseF(v);
+          else if (k === 'mineq') minEq = parseF(v);
         }});
-        document.querySelectorAll('details.audit table tbody tr').forEach(function(tr) {{
-          if (!q) {{ tr.classList.remove('hidden'); return; }}
-          tr.classList.toggle('hidden', (tr.textContent || '').toLowerCase().indexOf(q) < 0);
-        }});
+      }}
+      tbody.querySelectorAll('tr').forEach(function(tr) {{
+        var ok = true;
+        if (gq && (tr.textContent || '').toLowerCase().indexOf(gq) < 0) ok = false;
+        if (ok && fCo && cellLower(tr, 0).indexOf(fCo) < 0) ok = false;
+        if (ok && fCik && cellLower(tr, 1).indexOf(fCik) < 0) ok = false;
+        if (ok && minP != null) {{
+          var np = parseInt(tr.getAttribute('data-people') || '0', 10) || 0;
+          if (np < minP) ok = false;
+        }}
+        if (ok && fLoc && cellLower(tr, 3).indexOf(fLoc) < 0) ok = false;
+        if (ok && fList && (tr.getAttribute('data-listing') || '') !== fList) ok = false;
+        if (ok && minTop != null) {{
+          var mp = parseF(tr.getAttribute('data-max-pay'));
+          if (mp == null || mp < minTop) ok = false;
+        }}
+        if (ok && minSum != null) {{
+          var sp = parseF(tr.getAttribute('data-sum-pay'));
+          if (sp == null || sp < minSum) ok = false;
+        }}
+        if (ok && minEq != null) {{
+          var eq = parseF(tr.getAttribute('data-max-eq'));
+          if (eq == null || eq < minEq) ok = false;
+        }}
+        tr.classList.toggle('hidden', !ok);
+      }});
+      document.querySelectorAll('details.audit table tbody tr').forEach(function(tr) {{
+        if (!gq) {{ tr.classList.remove('hidden'); return; }}
+        tr.classList.toggle('hidden', (tr.textContent || '').toLowerCase().indexOf(gq) < 0);
       }});
     }}
+    if (input) input.addEventListener('input', applyDeskFilters);
+    if (filterRow) filterRow.querySelectorAll('input,select').forEach(function(el) {{
+      el.addEventListener('input', applyDeskFilters);
+      el.addEventListener('change', applyDeskFilters);
+    }});
+    applyDeskFilters();
     document.querySelectorAll('#desk-body tr.desk-row').forEach(function(tr) {{
+      function go() {{
+        var h = tr.getAttribute('data-href');
+        if (h) window.location = h;
+      }}
+      tr.addEventListener('click', function(e) {{
+        if (e.target.closest('a')) return;
+        go();
+      }});
+      tr.addEventListener('keydown', function(e) {{
+        if (e.key === 'Enter') {{ e.preventDefault(); go(); }}
+      }});
+    }});
+    }})();
+  </script>
+  {_live_reload_snippet()}
+</body>
+</html>"""
+
+
+def _page_desk_company(
+    profiles: list[dict],
+    leads: list[sqlite3.Row],
+    comp: list[sqlite3.Row],
+    stats: dict,
+    rendered_at: str,
+    *,
+    cik: str,
+    company_name: str,
+    nav_base_path: str = "/",
+    sales_bundle: str = "premium",
+    blur_preview: Optional[bool] = None,
+) -> str:
+    sb_cur = normalize_sales_bundle_query(sales_bundle)
+    cik_s = str(cik or "").strip()
+    company_base = _desk_company_page_base_path(nav_base_path)
+    back_href = html.escape(_desk_index_href(nav_base_path, sb_cur))
+    co_plain = (company_name or "").strip() or cik_s or "Issuer"
+    co_title = html.escape(co_plain)
+    if blur_preview is None:
+        blur_preview = desk_company_preview_blur()
+    loc_line = ""
+    if profiles:
+        loc_one = _company_bundle_location_display(cik_s, profiles, None)
+        if (loc_one or "").strip():
+            loc_line = f" · {html.escape(loc_one.strip())}"
+    co_facts = f'<p class="desk-co-facts dim">CIK {html.escape(cik_s)}{loc_line}</p>'
+    css = _shared_css()
+    scope_filters = _desk_company_scope_filters_html(
+        company_base=company_base,
+        cik_s=cik_s,
+        sales_bundle=sb_cur,
+    )
+    people_block = _desk_company_people_table(
+        profiles,
+        stats,
+        company_name=co_plain,
+        blur_preview=blur_preview,
+    )
+    row_sel = "#desk-co-body tr.desk-row[data-href]"
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>{co_title} — desk</title>
+  <style>{css}</style>
+</head>
+<body class="wide">
+  <p class="meta" style="margin-bottom:0.35rem"><a href="{back_href}">← All companies</a></p>
+  <h1 class="desk-company-h1">{co_title}</h1>
+  {co_facts}
+  {scope_filters}
+  {people_block}
+  <script>
+  (function() {{
+    document.querySelectorAll('{row_sel}').forEach(function(tr) {{
       function go() {{
         var h = tr.getAttribute('data-href');
         if (h) window.location = h;
@@ -3285,10 +4492,10 @@ def _lead_company_public_card_html(p: dict) -> str:
         web_dd = "<span class='dim'>—</span>"
 
     hq_txt = (p.get("issuer_headquarters") or "").strip()
-    hq_loc = hq_city_state_display(hq_txt)
+    hq_loc = hq_city_state_pipeline_only(hq_txt)
     if not hq_loc:
         mat = (p.get("issuer_hq_city_state") or "").strip()
-        if mat and not hq_city_state_looks_like_filing_noise(mat):
+        if mat and pipeline_hq_city_state_label_ok(mat):
             hq_loc = mat
     hq_detail_line = hq_principal_office_display_line(hq_txt)
     if hq_detail_line:
@@ -3302,9 +4509,35 @@ def _lead_company_public_card_html(p: dict) -> str:
     else:
         addr_dd = "<span class='dim'>—</span>"
 
+    maps_dd = _registrant_office_maps_anchor_html(p)
+    if maps_dd:
+        addr_dd = f"{addr_dd}<div class='lead-company-map-wrap'>{maps_dd}</div>"
+
+    tickers = p.get("issuer_tickers") or []
+    exchanges = p.get("issuer_exchanges") or []
+    if isinstance(tickers, list) and isinstance(exchanges, list) and (
+        tickers or exchanges
+    ):
+        tj = html.escape(", ".join(str(x) for x in tickers[:16] if str(x).strip()))
+        ej = html.escape(", ".join(str(x) for x in exchanges[:16] if str(x).strip()))
+        tj_dd = tj if tj else "<span class='dim'>—</span>"
+        ej_dd = ej if ej else "<span class='dim'>—</span>"
+        trad_dd = f"{tj_dd} <span class='dim'>·</span> {ej_dd}"
+        trad_note = (
+            '<span class="dim" style="font-size:0.72rem"> (SEC company submissions JSON)</span>'
+        )
+        trading_row = ("Trading (SEC)", trad_dd + trad_note)
+    else:
+        trading_row = (
+            "Trading (SEC)",
+            "<span class='dim'>—</span>"
+            '<span class="dim" style="font-size:0.72rem"> (sync loads tickers/exchanges when available)</span>',
+        )
+
     rows: list[tuple[str, str]] = [
         ("Company", f"<strong>{co}</strong>"),
         ("CIK", f'<span class="cik">{cik}</span>'),
+        trading_row,
         ("Website", web_dd),
         ("Headquarters", addr_dd),
     ]
@@ -3956,6 +5189,10 @@ def _page_lead(
     important_people_llm: Optional[list[dict]] = None,
     beneficial_stake_detail: Optional[dict] = None,
     beneficial_filing_caveats: str = "",
+    lead_recency: Optional[dict[str, Any]] = None,
+    lead_feedback_html: str = "",
+    lead_outreach_html: str = "",
+    lead_page_msg: str = "",
 ) -> str:
     css = _shared_css()
     if profile is None:
@@ -4039,11 +5276,6 @@ def _page_lead(
       </p>
     </div>"""
 
-    _bm_nm = (p.get("norm_name") or "").strip() or _norm_person_name(
-        p.get("display_name") or ""
-    )
-    bookmark_q = urlencode({"cik": str(p.get("cik") or ""), "name": _bm_nm})
-
     oa = p.get("officer_age")
     stated = p.get("age_stated_in_filing")
     anchor = (p.get("age_anchor_date") or "").strip()
@@ -4080,10 +5312,10 @@ def _page_lead(
     else:
         age_hero_title = "Not in filing roster or bio — backfill if needed."
     hq_txt = (p.get("issuer_headquarters") or "").strip()
-    hq_loc = hq_city_state_display(hq_txt)
+    hq_loc = hq_city_state_pipeline_only(hq_txt)
     if not hq_loc:
         mat = (p.get("issuer_hq_city_state") or "").strip()
-        if mat and not hq_city_state_looks_like_filing_noise(mat):
+        if mat and pipeline_hq_city_state_label_ok(mat):
             hq_loc = mat
     hq_loc_esc = html.escape(hq_loc) if hq_loc else ""
     web_raw = (p.get("issuer_website") or "").strip()
@@ -4105,27 +5337,23 @@ def _page_lead(
         f'<div class="lead-snapshot-inner">{snapshot_card}</div></details>'
     )
 
-    hq_one = _hq_one_line_for_maps(hq_txt)
-    co_nm = (p.get("company_name") or "").strip()
-    map_query = (hq_loc or hq_one or (f"{co_nm} headquarters" if co_nm else ""))
-    maps_link = ""
-    if map_query.strip():
-        maps_url = "https://www.google.com/maps/search/?api=1&query=" + quote(
-            map_query, safe=""
-        )
-        maps_link = (
-            f'<a href="{html.escape(maps_url)}" target="_blank" rel="noopener">Map</a>'
-        )
-
+    cik_s = str(p.get("cik") or "").strip()
+    sec_co = _sec_edgar_company_filings_url(cik_s)
+    co_link = (
+        f'<a href="{html.escape(sec_co)}" target="_blank" rel="noopener">'
+        "All SEC filings (CIK)</a>"
+        if sec_co
+        else ""
+    )
     idx_u = (p.get("index_url") or "").strip()
     idx_link = (
-        f'<a href="{html.escape(idx_u)}" target="_blank" rel="noopener">EDGAR index</a>'
+        f'<a href="{html.escape(idx_u)}" target="_blank" rel="noopener" '
+        'title="Index for this submission only (e.g. S-1 package) — 10-K is a different filing">'
+        "This filing index</a>"
         if idx_u
         else ""
     )
-    quick_links = " · ".join(
-        x for x in (idx_link, doc_link, maps_link) if x
-    )
+    quick_links = " · ".join(x for x in (co_link, idx_link, doc_link) if x)
 
     loc_display = (
         hq_loc_esc
@@ -4138,15 +5366,52 @@ def _page_lead(
         if age_hero_val != "—"
         else "<span class='dim'>—</span>"
     )
+    issuer_cross_banners = _issuer_risk_lead_banner_html(p) + _cross_company_lead_note_html(
+        p
+    )
+    rec = lead_recency if isinstance(lead_recency, dict) else {}
+    msg_html = ""
+    if (lead_page_msg or "").strip():
+        msg_html = (
+            '<p class="meta" style="color:#58a6ff;margin:0.5rem 0 0;line-height:1.45">'
+            f"{html.escape((lead_page_msg or '').strip())}</p>"
+        )
+    stale_banner = ""
+    if rec.get("stale") and int(rec.get("threshold_months") or 0) > 0:
+        nf = str(rec.get("newest_filing_date") or "—")
+        th = int(rec.get("threshold_months") or 0)
+        mo = rec.get("months_since_approx")
+        mo_s = (
+            f" (~{float(mo):.1f} mo since that filing)"
+            if isinstance(mo, (int, float))
+            else ""
+        )
+        stale_banner = (
+            '<div class="lead-stale-banner" role="status" style="margin:0.65rem 0 0;padding:0.55rem 0.75rem;'
+            "background:#2d2410;border:1px solid #8b6914;border-radius:6px;font-size:0.82rem;line-height:1.45\">"
+            f"<strong>Stale data.</strong> Newest filing <code>{html.escape(nf)}</code>{mo_s}; threshold {th} mo. "
+            "Run <code>sync</code> or check sec.gov."
+            "</div>"
+        )
+    headline_ft = (p.get("filing_form_type") or "").strip()
+    headline_fd = (p.get("filing_date") or "").strip()
+    headline_bits = [x for x in (headline_ft, headline_fd) if x]
+    headline_src = html.escape(" · ".join(headline_bits) if headline_bits else "—")
+    ndb = (rec.get("newest_filing_date") or "").strip()
+    ndb_row = ""
+    if ndb:
+        ndb_row = f"""      <div class="lead-kv"><span class="lead-kv-l">Newest filing (DB)</span>
+        <span class="lead-kv-v">{html.escape(ndb)}</span></div>
+"""
     hero_kv = f"""
     <div class="lead-hero-kv" role="group" aria-label="Key facts">
       <div class="lead-kv"><span class="lead-kv-l">Age</span>
         <span class="lead-kv-v"{age_ttl}>{age_inner}</span></div>
       <div class="lead-kv"><span class="lead-kv-l">HQ location</span>
         <span class="lead-kv-v">{loc_display}</span></div>
-      <div class="lead-kv"><span class="lead-kv-l">Latest filing</span>
-        <span class="lead-kv-v">{html.escape(p.get('filing_date') or '—')}</span></div>
-      <div class="lead-kv"><span class="lead-kv-l">Listing</span>
+      <div class="lead-kv"><span class="lead-kv-l">Headline source</span>
+        <span class="lead-kv-v">{headline_src}</span></div>
+{ndb_row}      <div class="lead-kv"><span class="lead-kv-l">Listing</span>
         <span class="lead-kv-v">{_issuer_listing_stage_badge_html(p)}</span></div>
       <div class="lead-kv"><span class="lead-kv-l">Desk tier</span>
         <span class="lead-kv-v">{tier_badge}</span></div>
@@ -4175,15 +5440,22 @@ def _page_lead(
         filing_mailing_anchor=_bo_mail_anchor if beneficial_only else "",
     )
 
+    _browse_all = _sec_edgar_company_filings_url(p.get("cik"))
+    _browse_all_html = (
+        f' <a href="{html.escape(_browse_all)}" target="_blank" rel="noopener">'
+        "See every filing on sec.gov</a> (10-K, 8-K, etc. — not limited to this S-1 index)."
+        if _browse_all
+        else ""
+    )
     filings_block = f"""
     <h3 class="lead-section-h" style="margin-top:0.75rem">Issuer filings</h3>
-    <p class="meta dim" style="font-size:0.78rem">S-1 / 10-K for this CIK in your DB (newest first).</p>
+    <p class="meta dim" style="font-size:0.78rem">Synced DB, newest first.{_browse_all_html}</p>
     {_filings_table_html(filings)}
     """
 
     source_details = f"""
     <details class="lead-more">
-      <summary>More SEC source detail</summary>
+      <summary>More filing detail</summary>
       <p class="meta" style="margin-top:0.65rem; margin-bottom:0"><strong>Issuer summary (extracted)</strong></p>
       <p class="meta" style="margin-top:0.35rem">{summ_html}</p>
       {director_card}
@@ -4216,18 +5488,20 @@ def _page_lead(
     </section>"""
 
     _person_note = (
-        '<p class="lead-data-note">'
-        "Use <strong>Filing contact clues</strong> for the footnote mailing address when we parsed one — "
-        "not company directory contact. Email guesses are omitted for major shareholders.</p>"
+        '<p class="lead-data-note dim">Filing-sourced contact clues; not a company directory.</p>'
         if beneficial_only
-        else "<p class=\"lead-data-note\">Address/phone here is registrant-level from SEC — not personal home contact.</p>"
+        else '<p class="lead-data-note dim">Registrant address from SEC filings.</p>'
     )
+    _fb_html = (lead_feedback_html or "").strip()
+    _out_html = (lead_outreach_html or "").strip()
     col_person = f"""
     <main class="lead-col lead-col-person" aria-labelledby="lead-col-person">
       <div class="lead-col-title" id="lead-col-person">Person</div>
       {_person_note}
       {why_card}
+      {_out_html}
       {research_card}
+      {_fb_html}
       <details class="lead-more">
         <summary>Filing bio (full text)</summary>
         <div class="lead-mgmt-bio-wrap" style="margin-top:0.5rem">
@@ -4255,6 +5529,9 @@ def _page_lead(
       <span class="lead-hero-sep">·</span>
       <span class="cik">CIK {html.escape(str(p.get('cik') or ''))}</span>
     </p>
+    {issuer_cross_banners}
+    {msg_html}
+    {stale_banner}
     {hero_kv}
     <p class="lead-hero-links meta">{quick_links if quick_links else "<span class='dim'>No EDGAR links on file</span>"}</p>
   </header>
@@ -4263,7 +5540,6 @@ def _page_lead(
     {col_company}
     {col_person}
   </div>
-  <p class="meta dim" style="font-size:0.78rem;margin-top:1rem">Bookmark: <code>/lead?{html.escape(bookmark_q)}</code></p>
   {_live_reload_snippet()}
 </body>
 </html>"""
@@ -4308,7 +5584,9 @@ def _lead_page_db_stats(conn: sqlite3.Connection, *, db_mtime: str) -> dict:
 _LOAD_PAGE_DATA_CACHE: dict[str, Any] = {"key": None, "blob": None}
 
 
-def _load_page_data() -> tuple[list[dict], list[dict], list[sqlite3.Row], list[sqlite3.Row], dict]:
+def _load_page_data(
+    *, omit_audit_tables: bool = False
+) -> tuple[list[dict], list[dict], list[sqlite3.Row], list[sqlite3.Row], dict]:
     dbp = database_path()
     if not Path(dbp).is_file():
         empty = {"missing_db": True, "profile_count": 0, "profile_count_all": 0}
@@ -4321,7 +5599,8 @@ def _load_page_data() -> tuple[list[dict], list[dict], list[sqlite3.Row], list[s
         blob = _LOAD_PAGE_DATA_CACHE.get("blob")
         if blob is not None:
             profiles_all, leads, comp, nf, no, nc, latest, mtime_s = blob
-            profiles = _lead_desk_filter_profiles(profiles_all)
+            with connect() as conn:
+                profiles = _lead_desk_filter_profiles(profiles_all, conn)
             stats = {
                 "missing_db": False,
                 "filings": nf,
@@ -4335,13 +5614,15 @@ def _load_page_data() -> tuple[list[dict], list[dict], list[sqlite3.Row], list[s
                 "latest_filing_date": latest,
                 "db_file_modified": mtime_s,
             }
+            if omit_audit_tables:
+                return profiles, profiles_all, [], [], stats
             return profiles, profiles_all, leads, comp, stats
 
     mtime = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
 
     with connect() as conn:
         profiles_all = _build_profiles(conn)
-        profiles = _lead_desk_filter_profiles(profiles_all)
+        profiles = _lead_desk_filter_profiles(profiles_all, conn)
 
         if not conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='neo_compensation'"
@@ -4478,9 +5759,9 @@ def _app(environ, start_response):
         industry = (qs.get("industry") or [""])[0].strip()
         qtxt = (qs.get("q") or [""])[0].strip()
         all_neo = (qs.get("all_neo") or [""])[0] in ("1", "on", "true", "True")
-        band = ((qs.get("band") or ["all"])[0] or "all").strip() or "all"
-        listing = normalize_listing_stage_query((qs.get("listing") or ["all"])[0])
-        profiles, profiles_all, _leads, _comp, _stats = _load_page_data()
+        profiles, profiles_all, _leads, _comp, _stats = _load_page_data(
+            omit_audit_tables=True
+        )
         body = finder_export_csv_bytes(
             profiles_all=profiles_all,
             profiles_desk=profiles,
@@ -4488,8 +5769,6 @@ def _app(environ, start_response):
             industry=industry,
             q=qtxt,
             all_neo=all_neo,
-            pay_band=band,
-            listing_stage=listing,
         )
         start_response(
             "200 OK",
@@ -4517,11 +5796,14 @@ def _app(environ, start_response):
         )
         return [body]
 
-    if pi not in ("/", "/lead", "/finder"):
+    if pi not in ("/", "/lead", "/finder", "/desk/company"):
         start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
         return [b"Not Found"]
 
-    profiles, profiles_all, leads, comp, stats = _load_page_data()
+    omit_audit = pi in ("/desk/company", "/finder", "/lead")
+    profiles, profiles_all, leads, comp, stats = _load_page_data(
+        omit_audit_tables=omit_audit
+    )
     rendered_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     if pi == "/finder":
@@ -4530,8 +5812,6 @@ def _app(environ, start_response):
         industry = (qs.get("industry") or [""])[0].strip()
         qtxt = (qs.get("q") or [""])[0].strip()
         all_neo = (qs.get("all_neo") or [""])[0] in ("1", "on", "true", "True")
-        band = ((qs.get("band") or ["all"])[0] or "all").strip() or "all"
-        listing = normalize_listing_stage_query((qs.get("listing") or ["all"])[0])
         base = profiles_all if all_neo else profiles
         filtered = filter_profiles_geo_industry_text(
             base,
@@ -4539,8 +5819,6 @@ def _app(environ, start_response):
             industry_sub=industry,
             text_sub=qtxt,
         )
-        filtered = filter_profiles_pay_band(filtered, band)
-        filtered = filter_profiles_listing_stage(filtered, listing)
         html_out = _page_finder(
             filtered,
             stats=stats,
@@ -4550,8 +5828,6 @@ def _app(environ, start_response):
             q=qtxt,
             all_neo=all_neo,
             base_count=len(base),
-            pay_band=band,
-            listing_stage=listing,
         )
     elif pi == "/lead":
         qs = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
@@ -4567,6 +5843,8 @@ def _app(environ, start_response):
         important_llm: list[dict] = []
         beneficial_stake_detail: Optional[dict] = None
         beneficial_filing_caveats = ""
+        lead_recency: dict[str, Any] = {}
+        lead_page_msg = (qs.get("msg") or [""])[0].strip()
         if prof is not None and not stats.get("missing_db"):
             with connect() as conn:
                 filings = _filings_for_profile(conn, cik, norm)
@@ -4611,6 +5889,12 @@ def _app(environ, start_response):
                         )
                     except sqlite3.Error:
                         important_llm = []
+                try:
+                    lead_recency = lead_issuer_recency_bundle(
+                        conn, (cik or "").strip()
+                    )
+                except sqlite3.Error:
+                    lead_recency = {}
         html_out = _page_lead(
             prof,
             filings,
@@ -4624,23 +5908,61 @@ def _app(environ, start_response):
             important_people_llm=important_llm,
             beneficial_stake_detail=beneficial_stake_detail,
             beneficial_filing_caveats=beneficial_filing_caveats,
+            lead_recency=lead_recency,
+            lead_feedback_html="",
+            lead_outreach_html="",
+            lead_page_msg=lead_page_msg,
         )
+    elif pi == "/desk/company":
+        qs = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
+        cik_w = (qs.get("cik") or [""])[0].strip()
+        sb = normalize_sales_bundle_query((qs.get("sales_bundle") or ["premium"])[0])
+        if not cik_w:
+            html_out = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/><title>Desk — CIK required</title></head>
+<body style="font-family:system-ui;background:#0d1117;color:#e8ecf0;padding:2rem"><h1>CIK required</h1>
+<p>Open the <a href="/" style="color:#58a6ff">lead desk</a> and click a company row.</p></body></html>"""
+        else:
+            universe_cik = [
+                p for p in profiles if str(p.get("cik") or "").strip() == cik_w
+            ]
+            filtered_cik = [
+                p for p in profiles if str(p.get("cik") or "").strip() == cik_w
+            ]
+            filtered_cik.sort(key=_desk_sort_tuple, reverse=True)
+            filtered_cik = filter_profiles_sales_bundle(filtered_cik, sb)
+            co_name = ""
+            if filtered_cik:
+                co_name = (filtered_cik[0].get("company_name") or "").strip()
+            elif universe_cik:
+                co_name = (universe_cik[0].get("company_name") or "").strip()
+            html_out = _page_desk_company(
+                filtered_cik,
+                leads,
+                comp,
+                stats,
+                rendered_at,
+                cik=cik_w,
+                company_name=co_name,
+                nav_base_path="/",
+                sales_bundle=sb,
+                blur_preview=desk_company_preview_blur(),
+            )
     else:
         qs = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
-        band = ((qs.get("band") or ["all"])[0] or "all").strip() or "all"
-        listing = normalize_listing_stage_query((qs.get("listing") or ["all"])[0])
-        desk_view = filter_profiles_pay_band(profiles, band)
-        desk_view = filter_profiles_listing_stage(desk_view, listing)
+        n_prem_co, n_eco_co = desk_sales_bundle_company_counts(profiles)
+        sb = normalize_sales_bundle_query((qs.get("sales_bundle") or ["premium"])[0])
+        filtered = filter_profiles_sales_bundle(profiles, sb)
         html_out = _page_desk(
-            desk_view,
+            filtered,
             leads,
             comp,
             stats,
             rendered_at,
-            pay_band=band,
-            listing_stage=listing,
             nav_base_path="/",
             desk_universe_count=len(profiles),
+            sales_bundle=sb,
+            premium_company_count=n_prem_co,
+            economy_company_count=n_eco_co,
         )
 
     body = html_out.encode("utf-8")
@@ -4694,7 +6016,7 @@ def run_localhost(
         print(f"Could not listen on {url} (port {p}): {e}", file=sys.stderr)
         print("Another copy may be running, or the port is in use.", file=sys.stderr)
         raise SystemExit(1) from e
-    print(f"WealthPipeline legacy desk (/, /lead, /finder): {url}")
+    print(f"WealthPipeline legacy desk (/, /lead, /finder, /desk/company): {url}")
     print(
         "Advisor app with /login is separate — use serve_advisor.py or Start WealthPipeline Dashboard.bat (port 8765).",
         file=sys.stderr,

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator, Optional
@@ -11,6 +13,60 @@ from wealth_leads.config import database_path
 # Windows + uvicorn --reload can briefly open two processes on the same file; default timeout is brittle.
 _SQLITE_CONNECT_TIMEOUT_SEC = 60.0
 _SQLITE_BUSY_TIMEOUT_MS = 60_000
+# Full open + migrations retry: refresh storms + background sync can still briefly lock.
+_SQLITE_CONNECT_ATTEMPTS = 15
+_SQLITE_CONNECT_RETRY_BASE_SEC = 0.1
+
+
+def _sqlite_locked_exc(e: BaseException) -> bool:
+    if not isinstance(e, sqlite3.OperationalError):
+        return False
+    msg = str(e).lower()
+    return "locked" in msg or "busy" in msg
+
+
+def _prepare_sqlite_connection(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.Error:
+        pass
+    try:
+        conn.execute(f"PRAGMA busy_timeout = {_SQLITE_BUSY_TIMEOUT_MS}")
+    except sqlite3.Error:
+        pass
+    conn.executescript(SCHEMA)
+    _migrate_filings_compensation_column(conn)
+    _migrate_filings_issuer_summary(conn)
+    _migrate_filings_issuer_meta(conn)
+    _migrate_filings_issuer_hq_city_state(conn)
+    _migrate_officers_age(conn)
+    _migrate_filings_director_term(conn)
+    _migrate_filings_issuer_industry(conn)
+    _migrate_filings_s1_llm_lead_pack(conn)
+    _migrate_filings_issuer_scale_text(conn)
+    _migrate_app_auth(conn)
+    _migrate_allocation_system(conn)
+    _migrate_lead_profile(conn)
+    _migrate_lead_profile_llm_flag(conn)
+    _migrate_lead_profile_lead_tier(conn)
+    _migrate_lead_profile_headline_comp(conn)
+    _migrate_lead_profile_hq_materialized(conn)
+    _migrate_lead_profile_issuer_listing_stage(conn)
+    _migrate_lead_profile_beneficial_flag(conn)
+    _migrate_lead_profile_issuer_risk(conn)
+    _migrate_lead_profile_drop_quality_index(conn)
+    _migrate_lead_profile_search_text(conn)
+    _migrate_lead_profile_fts5(conn)
+    _migrate_lead_profile_issuer_revenue_text(conn)
+    _migrate_lead_suppress(conn)
+    _migrate_issuer_sec_hints(conn)
+    _migrate_lead_advisor_feedback(conn)
+    _migrate_advisor_lead_outreach(conn)
+    _migrate_lead_client_research(conn)
+    _migrate_issuer_advisor_snapshot(conn)
+    _migrate_lead_client_research_advisor_cols(conn)
+    _migrate_lead_client_research_photo_blob(conn)
+    _migrate_beneficial_owner_stake(conn)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS filings (
@@ -108,12 +164,12 @@ def _migrate_filings_issuer_hq_city_state(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE filings ADD COLUMN issuer_hq_city_state TEXT NOT NULL DEFAULT ''"
         )
-        from wealth_leads.territory import hq_city_state_display
+        from wealth_leads.territory import hq_city_state_pipeline_only
 
         for row in conn.execute("SELECT id, issuer_headquarters FROM filings"):
             hid = int(row["id"])
             hq = (row["issuer_headquarters"] or "").strip()
-            cs = hq_city_state_display(hq) if hq else ""
+            cs = hq_city_state_pipeline_only(hq) if hq else ""
             conn.execute(
                 "UPDATE filings SET issuer_hq_city_state = ? WHERE id = ?",
                 (cs, hid),
@@ -186,42 +242,32 @@ def _migrate_app_auth(conn: sqlite3.Connection) -> None:
 def connect(path: Optional[str] = None) -> Generator[sqlite3.Connection, None, None]:
     dbp = path or database_path()
     Path(dbp).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(dbp, timeout=_SQLITE_CONNECT_TIMEOUT_SEC)
-    conn.row_factory = sqlite3.Row
+    conn: Optional[sqlite3.Connection] = None
+    last_exc: Optional[BaseException] = None
+    for attempt in range(_SQLITE_CONNECT_ATTEMPTS):
+        c: Optional[sqlite3.Connection] = None
+        try:
+            c = sqlite3.connect(dbp, timeout=_SQLITE_CONNECT_TIMEOUT_SEC)
+            c.row_factory = sqlite3.Row
+            _prepare_sqlite_connection(c)
+            conn = c
+            break
+        except sqlite3.OperationalError as e:
+            last_exc = e
+            if c is not None:
+                try:
+                    c.close()
+                except sqlite3.Error:
+                    pass
+            if _sqlite_locked_exc(e) and attempt + 1 < _SQLITE_CONNECT_ATTEMPTS:
+                time.sleep(_SQLITE_CONNECT_RETRY_BASE_SEC * (attempt + 1))
+                continue
+            raise
+    if conn is None:
+        if last_exc is not None:
+            raise last_exc
+        raise sqlite3.OperationalError("could not open database")
     try:
-        # WAL + busy_timeout: fewer "database is locked" 500s under refresh + background sync / reload.
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-        except sqlite3.Error:
-            pass
-        try:
-            conn.execute(f"PRAGMA busy_timeout = {_SQLITE_BUSY_TIMEOUT_MS}")
-        except sqlite3.Error:
-            pass
-        conn.executescript(SCHEMA)
-        _migrate_filings_compensation_column(conn)
-        _migrate_filings_issuer_summary(conn)
-        _migrate_filings_issuer_meta(conn)
-        _migrate_filings_issuer_hq_city_state(conn)
-        _migrate_officers_age(conn)
-        _migrate_filings_director_term(conn)
-        _migrate_filings_issuer_industry(conn)
-        _migrate_filings_s1_llm_lead_pack(conn)
-        _migrate_filings_issuer_scale_text(conn)
-        _migrate_app_auth(conn)
-        _migrate_allocation_system(conn)
-        _migrate_lead_profile(conn)
-        _migrate_lead_profile_llm_flag(conn)
-        _migrate_lead_profile_lead_tier(conn)
-        _migrate_lead_profile_headline_comp(conn)
-        _migrate_lead_profile_hq_materialized(conn)
-        _migrate_lead_profile_issuer_listing_stage(conn)
-        _migrate_lead_profile_beneficial_flag(conn)
-        _migrate_lead_client_research(conn)
-        _migrate_issuer_advisor_snapshot(conn)
-        _migrate_lead_client_research_advisor_cols(conn)
-        _migrate_lead_client_research_photo_blob(conn)
-        _migrate_beneficial_owner_stake(conn)
         yield conn
         conn.commit()
     finally:
@@ -305,14 +351,14 @@ def update_filing_issuer_meta(
     so a model-extracted address replaces a bad prior HTML scrape.
 
     ``issuer_hq_city_state`` is always derived from the resolved full HQ line (city + state
-    or region, no US ZIP) for pipeline / materialized profiles.
+    or region, no US ZIP, no street) for pipeline / materialized profiles.
     """
-    from wealth_leads.territory import hq_city_state_display
+    from wealth_leads.territory import hq_city_state_pipeline_only
 
     tw = (website or "").strip()
     th = (headquarters or "").strip()
     if headquarters_force and th:
-        cs = hq_city_state_display(th)
+        cs = hq_city_state_pipeline_only(th)
         conn.execute(
             """
             UPDATE filings SET
@@ -325,7 +371,7 @@ def update_filing_issuer_meta(
         )
         return
     if th:
-        cs = hq_city_state_display(th)
+        cs = hq_city_state_pipeline_only(th)
         conn.execute(
             """
             UPDATE filings SET
@@ -709,9 +755,6 @@ def _migrate_lead_profile(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_lead_profile_quality ON lead_profile(quality_score DESC)"
-    )
-    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_lead_profile_filing_date ON lead_profile(filing_date_latest DESC)"
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_lead_profile_cik ON lead_profile(cik)")
@@ -778,6 +821,202 @@ def _migrate_lead_profile_beneficial_flag(conn: sqlite3.Connection) -> None:
             "ALTER TABLE lead_profile ADD COLUMN has_beneficial_owner_stake "
             "INTEGER NOT NULL DEFAULT 0"
         )
+
+
+def _migrate_lead_profile_issuer_risk(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(lead_profile)").fetchall()}
+    if "issuer_risk_level" not in cols:
+        conn.execute(
+            "ALTER TABLE lead_profile ADD COLUMN issuer_risk_level "
+            "TEXT NOT NULL DEFAULT 'none'"
+        )
+    if "issuer_risk_reasons_json" not in cols:
+        conn.execute(
+            "ALTER TABLE lead_profile ADD COLUMN issuer_risk_reasons_json "
+            "TEXT NOT NULL DEFAULT '[]'"
+        )
+
+
+def _migrate_lead_profile_drop_quality_index(conn: sqlite3.Connection) -> None:
+    """quality_score was always 0; same build path for all rows — index added no signal."""
+    try:
+        conn.execute("DROP INDEX IF EXISTS idx_lead_profile_quality")
+    except sqlite3.Error:
+        pass
+
+
+def _migrate_lead_profile_search_text(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(lead_profile)").fetchall()}
+    if "search_text" not in cols:
+        try:
+            conn.execute(
+                "ALTER TABLE lead_profile ADD COLUMN search_text TEXT NOT NULL DEFAULT ''"
+            )
+        except sqlite3.Error:
+            return
+    try:
+        conn.execute(
+            """
+            UPDATE lead_profile SET search_text = trim(lower(
+                coalesce(display_name,'') || ' ' || coalesce(company_name,'') || ' ' ||
+                coalesce(title,'') || ' ' || coalesce(person_norm,'') || ' ' ||
+                coalesce(cik,'') || ' ' || coalesce(issuer_headquarters,'') || ' ' ||
+                coalesce(issuer_industry,'')
+            ))
+            WHERE trim(coalesce(search_text,'')) = ''
+            """
+        )
+    except sqlite3.Error:
+        pass
+
+
+def _migrate_lead_profile_fts5(conn: sqlite3.Connection) -> None:
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lead_profile'"
+    ).fetchone():
+        return
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lead_profile_fts'"
+    ).fetchone():
+        return
+    try:
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE lead_profile_fts USING fts5(
+                search_text,
+                content='lead_profile',
+                content_rowid='id'
+            )
+            """
+        )
+    except sqlite3.OperationalError:
+        return
+    try:
+        conn.execute(
+            "INSERT INTO lead_profile_fts(lead_profile_fts) VALUES('rebuild')"
+        )
+    except sqlite3.OperationalError:
+        pass
+
+
+def _migrate_lead_profile_issuer_revenue_text(conn: sqlite3.Connection) -> None:
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lead_profile'"
+    ).fetchone():
+        return
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(lead_profile)").fetchall()}
+    if "issuer_revenue_text" not in cols:
+        conn.execute(
+            "ALTER TABLE lead_profile ADD COLUMN issuer_revenue_text TEXT NOT NULL DEFAULT ''"
+        )
+
+
+def rebuild_lead_profile_fts_index(conn: sqlite3.Connection) -> None:
+    """Refresh FTS5 shadow index after bulk lead_profile changes."""
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lead_profile_fts'"
+    ).fetchone():
+        return
+    try:
+        conn.execute(
+            "INSERT INTO lead_profile_fts(lead_profile_fts) VALUES('rebuild')"
+        )
+    except sqlite3.OperationalError:
+        pass
+
+
+def _lead_profile_fts_table_exists(conn: sqlite3.Connection) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lead_profile_fts'"
+        ).fetchone()
+        is not None
+    )
+
+
+def _lead_profile_fts_prefix_query(raw: str) -> Optional[str]:
+    toks = re.findall(r"[A-Za-z0-9][A-Za-z0-9\-]{0,63}", (raw or "").strip())
+    if not toks:
+        return None
+    parts: list[str] = []
+    for t in toks:
+        tl = t.lower()
+        parts.append(f"search_text:{tl}*")
+    return " AND ".join(parts)
+
+
+def _migrate_lead_suppress(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lead_suppress (
+            cik TEXT NOT NULL,
+            person_norm TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (cik, person_norm)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_lead_suppress_cik ON lead_suppress(cik)"
+    )
+
+
+def _migrate_issuer_sec_hints(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS issuer_sec_hints (
+            cik TEXT NOT NULL PRIMARY KEY,
+            tickers_json TEXT NOT NULL DEFAULT '[]',
+            exchanges_json TEXT NOT NULL DEFAULT '[]',
+            company_name TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """
+    )
+
+
+def _migrate_lead_advisor_feedback(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lead_advisor_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cik TEXT NOT NULL,
+            person_norm TEXT NOT NULL,
+            category TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            user_email TEXT NOT NULL DEFAULT '',
+            also_suppress INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_lead_fb_cik ON lead_advisor_feedback(cik)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_lead_fb_created ON lead_advisor_feedback(created_at)"
+    )
+
+
+def _migrate_advisor_lead_outreach(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS advisor_lead_outreach (
+            user_id INTEGER NOT NULL,
+            cik TEXT NOT NULL,
+            person_norm TEXT NOT NULL,
+            email TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'none',
+            notes TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (user_id, cik, person_norm)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_alo_user_cik ON advisor_lead_outreach(user_id, cik)"
+    )
 
 
 def issuer_listing_stage_map(
@@ -1381,6 +1620,314 @@ def count_lead_profiles(conn: sqlite3.Connection) -> int:
         return 0
 
 
+def is_lead_suppressed(
+    conn: sqlite3.Connection, cik: str, person_norm: str
+) -> bool:
+    ck = (cik or "").strip()
+    pn = (person_norm or "").strip()
+    if not ck or not pn:
+        return False
+    try:
+        r = conn.execute(
+            "SELECT 1 FROM lead_suppress WHERE cik = ? AND person_norm = ? LIMIT 1",
+            (ck, pn),
+        ).fetchone()
+        return r is not None
+    except sqlite3.OperationalError:
+        return False
+
+
+def lead_suppress_pair_set(conn: sqlite3.Connection) -> set[tuple[str, str]]:
+    """
+    All (cik, person_norm) pairs in lead_suppress — one query for desk filtering
+    instead of one query per profile.
+    """
+    out: set[tuple[str, str]] = set()
+    try:
+        for row in conn.execute("SELECT cik, person_norm FROM lead_suppress"):
+            ck = str(row[0] or "").strip()
+            pn = str(row[1] or "").strip()
+            if ck and pn:
+                out.add((ck, pn))
+    except sqlite3.OperationalError:
+        pass
+    return out
+
+
+def list_lead_suppress(
+    conn: sqlite3.Connection, *, limit: int = 500
+) -> list[sqlite3.Row]:
+    try:
+        cap = max(1, min(int(limit), 2000))
+        return list(
+            conn.execute(
+                """
+                SELECT cik, person_norm, reason, created_at
+                FROM lead_suppress
+                ORDER BY datetime(created_at) DESC, cik, person_norm
+                LIMIT ?
+                """,
+                (cap,),
+            ).fetchall()
+        )
+    except sqlite3.OperationalError:
+        return []
+
+
+def insert_lead_suppress(
+    conn: sqlite3.Connection,
+    *,
+    cik: str,
+    person_norm: str,
+    reason: str = "",
+) -> None:
+    ck = (cik or "").strip()
+    pn = (person_norm or "").strip()
+    if not ck or not pn:
+        return
+    conn.execute(
+        """
+        INSERT INTO lead_suppress (cik, person_norm, reason)
+        VALUES (?, ?, ?)
+        ON CONFLICT(cik, person_norm) DO UPDATE SET
+            reason = excluded.reason,
+            created_at = datetime('now')
+        """,
+        (ck, pn, (reason or "").strip()[:2000]),
+    )
+
+
+def delete_lead_suppress(
+    conn: sqlite3.Connection, *, cik: str, person_norm: str
+) -> None:
+    ck = (cik or "").strip()
+    pn = (person_norm or "").strip()
+    if not ck or not pn:
+        return
+    conn.execute(
+        "DELETE FROM lead_suppress WHERE cik = ? AND person_norm = ?",
+        (ck, pn),
+    )
+
+
+def _norm_cik_key(cik: str) -> str:
+    try:
+        return str(int(str(cik or "").strip()))
+    except ValueError:
+        return str(cik or "").strip()
+
+
+def upsert_issuer_sec_hints(
+    conn: sqlite3.Connection,
+    *,
+    cik: str,
+    tickers: list[str],
+    exchanges: list[str],
+    company_name: str = "",
+) -> None:
+    ck = _norm_cik_key(cik)
+    if not ck:
+        return
+    tj = json.dumps([str(x).strip() for x in tickers if str(x).strip()][:16])
+    ej = json.dumps([str(x).strip() for x in exchanges if str(x).strip()][:16])
+    nm = (company_name or "").strip()[:500]
+    conn.execute(
+        """
+        INSERT INTO issuer_sec_hints (cik, tickers_json, exchanges_json, company_name, updated_at)
+        VALUES (?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(cik) DO UPDATE SET
+            tickers_json = excluded.tickers_json,
+            exchanges_json = excluded.exchanges_json,
+            company_name = COALESCE(NULLIF(excluded.company_name, ''), issuer_sec_hints.company_name),
+            updated_at = datetime('now')
+        """,
+        (ck, tj, ej, nm),
+    )
+
+
+def get_issuer_sec_hints_row(
+    conn: sqlite3.Connection, cik: str
+) -> Optional[sqlite3.Row]:
+    ck = _norm_cik_key(cik)
+    if not ck:
+        return None
+    try:
+        return conn.execute(
+            "SELECT * FROM issuer_sec_hints WHERE cik = ? LIMIT 1", (ck,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+
+
+def max_filing_date_for_cik(conn: sqlite3.Connection, cik: str) -> str:
+    ck = (cik or "").strip()
+    if not ck:
+        return ""
+    variants = {ck}
+    try:
+        n = int(ck)
+        variants.add(str(n))
+        variants.add(f"{n:010d}")
+    except ValueError:
+        pass
+    best = ""
+    try:
+        for v in variants:
+            r = conn.execute(
+                "SELECT MAX(filing_date) AS m FROM filings WHERE cik = ?",
+                (v,),
+            ).fetchone()
+            d = str(r["m"] or "").strip() if r else ""
+            if d and (not best or d > best):
+                best = d
+        return best
+    except sqlite3.OperationalError:
+        return ""
+
+
+def insert_lead_advisor_feedback(
+    conn: sqlite3.Connection,
+    *,
+    cik: str,
+    person_norm: str,
+    category: str,
+    note: str = "",
+    user_email: str = "",
+    also_suppress: bool = False,
+) -> None:
+    ck = (cik or "").strip()
+    pn = (person_norm or "").strip()
+    cat = (category or "other").strip().lower()[:48]
+    if cat not in ("wrong_person", "duplicate", "bad_issuer", "other"):
+        cat = "other"
+    conn.execute(
+        """
+        INSERT INTO lead_advisor_feedback (
+            cik, person_norm, category, note, user_email, also_suppress
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            ck,
+            pn,
+            cat,
+            (note or "").strip()[:4000],
+            (user_email or "").strip()[:320],
+            1 if also_suppress else 0,
+        ),
+    )
+    if also_suppress and ck and pn:
+        insert_lead_suppress(
+            conn,
+            cik=ck,
+            person_norm=pn,
+            reason=f"advisor_feedback:{cat}",
+        )
+
+
+def list_lead_advisor_feedback(
+    conn: sqlite3.Connection, *, limit: int = 50
+) -> list[sqlite3.Row]:
+    try:
+        cap = max(1, min(int(limit), 500))
+        return list(
+            conn.execute(
+                """
+                SELECT id, cik, person_norm, category, note, user_email, also_suppress, created_at
+                FROM lead_advisor_feedback
+                ORDER BY datetime(created_at) DESC, id DESC
+                LIMIT ?
+                """,
+                (cap,),
+            ).fetchall()
+        )
+    except sqlite3.OperationalError:
+        return []
+
+
+def _normalize_advisor_outreach_status(raw: str) -> str:
+    x = (raw or "none").strip().lower().replace("-", "_")
+    if x in ("no_reply", "noresponse"):
+        x = "no_response"
+    allowed = frozenset(
+        ("none", "planned", "sent", "replied", "no_response", "declined")
+    )
+    return x if x in allowed else "none"
+
+
+def get_advisor_lead_outreach(
+    conn: sqlite3.Connection, user_id: int, cik: str, person_norm: str
+) -> Optional[sqlite3.Row]:
+    try:
+        return conn.execute(
+            """
+            SELECT user_id, cik, person_norm, email, status, notes, updated_at
+            FROM advisor_lead_outreach
+            WHERE user_id = ? AND cik = ? AND person_norm = ?
+            LIMIT 1
+            """,
+            (int(user_id), (cik or "").strip(), (person_norm or "").strip()),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+
+
+def upsert_advisor_lead_outreach(
+    conn: sqlite3.Connection,
+    user_id: int,
+    cik: str,
+    person_norm: str,
+    *,
+    email: str = "",
+    status: str = "none",
+    notes: str = "",
+) -> None:
+    ck = (cik or "").strip()
+    pn = (person_norm or "").strip()
+    st = _normalize_advisor_outreach_status(status)
+    conn.execute(
+        """
+        INSERT INTO advisor_lead_outreach (
+            user_id, cik, person_norm, email, status, notes, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(user_id, cik, person_norm) DO UPDATE SET
+            email = excluded.email,
+            status = excluded.status,
+            notes = excluded.notes,
+            updated_at = datetime('now')
+        """,
+        (
+            int(user_id),
+            ck,
+            pn,
+            (email or "").strip()[:320],
+            st,
+            (notes or "").strip()[:4000],
+        ),
+    )
+
+
+def list_advisor_lead_outreach_status_by_norm_for_cik(
+    conn: sqlite3.Connection, user_id: int, cik: str
+) -> dict[str, str]:
+    try:
+        ck = (cik or "").strip()
+        rows = conn.execute(
+            """
+            SELECT person_norm, status FROM advisor_lead_outreach
+            WHERE user_id = ? AND cik = ?
+            """,
+            (int(user_id), ck),
+        ).fetchall()
+        out: dict[str, str] = {}
+        for r in rows:
+            pn = str(r["person_norm"] or "").strip()
+            if pn:
+                out[pn] = str(r["status"] or "none")
+        return out
+    except sqlite3.OperationalError:
+        return {}
+
+
 def get_lead_profile_row(
     conn: sqlite3.Connection, cik: str, person_norm: str
 ) -> Optional[sqlite3.Row]:
@@ -1398,12 +1945,12 @@ def list_lead_profiles_for_review(
     *,
     search: str = "",
     limit: int = 500,
-    cross_only: bool = False,
     s1_only: bool = True,
     months_back: Optional[int] = 6,
     pay_band: str = "all",
     us_registrant_hq_only: bool = False,
     listing_stage: str = "all",
+    cik: Optional[str] = None,
 ) -> list[sqlite3.Row]:
     """
     Pipeline review rows. By default only NEO rows tied to an S-1-family filing
@@ -1411,7 +1958,43 @@ def list_lead_profiles_for_review(
     months_back: limit to filing_date_latest within this many calendar months (approximate);
     None or <=0 means no date window.
     Sorted newest filing first.
+
+    When ``us_registrant_hq_only`` is true, SQL fetch limits are increased in steps until
+    enough U.S.-HQ rows are found (or a cap), so the newest *eligible* rows are not dropped
+    by an early LIMIT.
+
+    Text search uses FTS5 on ``search_text`` when available; otherwise LIKE across name fields.
     """
+    from wealth_leads.person_quality import is_acceptable_lead_person_name
+    from wealth_leads.territory import registrant_hq_line_parses_as_united_states
+
+    limit_clamped = max(1, min(int(limit), 5000))
+
+    def _pipeline_row_display_name(r: sqlite3.Row) -> str:
+        d = (r["display_name"] or "").strip()
+        if d:
+            return d
+        pn = (r["person_norm"] or "").strip()
+        return " ".join(w.title() for w in pn.split()) if pn else ""
+
+    def _name_filter(rows_in: list[sqlite3.Row]) -> list[sqlite3.Row]:
+        return [
+            r
+            for r in rows_in
+            if is_acceptable_lead_person_name(_pipeline_row_display_name(r))
+        ]
+
+    def _us_filter(rows_in: list[sqlite3.Row]) -> list[sqlite3.Row]:
+        if not us_registrant_hq_only:
+            return rows_in
+        return [
+            r
+            for r in rows_in
+            if registrant_hq_line_parses_as_united_states(
+                (r["issuer_headquarters"] or "").strip()
+            )
+        ]
+
     try:
         from wealth_leads.config import lead_desk_equity_only_min_usd
 
@@ -1419,8 +2002,6 @@ def list_lead_profiles_for_review(
         params: list[object] = []
         if s1_only:
             sql += " AND (has_s1_comp = 1 OR lead_tier = 'visibility')"
-        if cross_only:
-            sql += " AND cross_company_hint = 1"
         b = (pay_band or "all").strip().lower()
         if b not in ("", "all"):
             col = "equity_hwm" if lead_desk_equity_only_min_usd() else "signal_hwm"
@@ -1442,47 +2023,71 @@ def list_lead_profiles_for_review(
             cutoff = (date.today() - timedelta(days=approx_days)).isoformat()
             sql += " AND filing_date_latest >= ?"
             params.append(cutoff)
-        if (search or "").strip():
-            pat = f"%{(search or '').strip()}%"
-            sql += (
-                " AND (display_name LIKE ? OR company_name LIKE ? OR title LIKE ? "
-                "OR issuer_headquarters LIKE ? OR person_norm LIKE ? OR cik LIKE ?)"
-            )
-            params.extend([pat, pat, pat, pat, pat, pat])
+        search_s = (search or "").strip()
+        use_fts = bool(
+            search_s
+            and _lead_profile_fts_table_exists(conn)
+            and _lead_profile_fts_prefix_query(search_s)
+        )
+        if search_s:
+            fts_q = _lead_profile_fts_prefix_query(search_s) if use_fts else None
+            if fts_q:
+                sql += (
+                    " AND id IN (SELECT rowid FROM lead_profile_fts "
+                    "WHERE lead_profile_fts MATCH ?)"
+                )
+                params.append(fts_q)
+            else:
+                pat = f"%{search_s}%"
+                sql += (
+                    " AND (display_name LIKE ? OR company_name LIKE ? OR title LIKE ? "
+                    "OR issuer_headquarters LIKE ? OR person_norm LIKE ? OR cik LIKE ? "
+                    "OR search_text LIKE ?)"
+                )
+                params.extend([pat, pat, pat, pat, pat, pat, pat])
         lst = str(listing_stage or "all").strip().lower().replace("-", "_")
         if lst in ("pre_ipo", "public", "unknown"):
             sql += " AND issuer_listing_stage = ?"
             params.append(lst)
-        sql += " ORDER BY filing_date_latest DESC, cik, person_norm LIMIT ?"
-        fetch_cap = max(1, min(int(limit), 5000))
-        if us_registrant_hq_only:
-            fetch_cap = max(1, min(fetch_cap * 5, 5000))
-        params.append(fetch_cap)
-        rows = list(conn.execute(sql, params).fetchall())
-        from wealth_leads.person_quality import is_acceptable_lead_person_name
+        ck_f = (cik or "").strip()
+        if ck_f:
+            variants = {ck_f}
+            try:
+                n = int(ck_f)
+                variants.add(str(n))
+                variants.add(f"{n:010d}")
+            except ValueError:
+                pass
+            qm = ",".join("?" * len(variants))
+            sql += f" AND cik IN ({qm})"
+            params.extend(sorted(variants))
 
-        def _pipeline_row_display_name(r: sqlite3.Row) -> str:
-            d = (r["display_name"] or "").strip()
-            if d:
-                return d
-            pn = (r["person_norm"] or "").strip()
-            return " ".join(w.title() for w in pn.split()) if pn else ""
+        order_sql = " ORDER BY filing_date_latest DESC, cik, person_norm"
 
-        rows = [
-            r
-            for r in rows
-            if is_acceptable_lead_person_name(_pipeline_row_display_name(r))
-        ]
-        if us_registrant_hq_only:
-            from wealth_leads.territory import registrant_hq_line_parses_as_united_states
+        def _fetch(sql_limit: int) -> list[sqlite3.Row]:
+            lim = max(1, min(int(sql_limit), 5000))
+            q = sql + order_sql + " LIMIT ?"
+            p = list(params) + [lim]
+            return list(conn.execute(q, p).fetchall())
 
-            rows = [
-                r
-                for r in rows
-                if registrant_hq_line_parses_as_united_states(
-                    (r["issuer_headquarters"] or "").strip()
-                )
-            ][: max(1, min(int(limit), 5000))]
-        return rows
+        if not us_registrant_hq_only:
+            rows = _fetch(limit_clamped)
+            rows = _name_filter(rows)
+            return rows[:limit_clamped]
+
+        sql_cap = limit_clamped
+        max_cap = 5000
+        while True:
+            rows = _fetch(sql_cap)
+            rows = _name_filter(rows)
+            rows_us = _us_filter(rows)
+            if len(rows_us) >= limit_clamped:
+                return rows_us[:limit_clamped]
+            if sql_cap >= max_cap:
+                return rows_us[:limit_clamped]
+            nxt = min(sql_cap * 2, max_cap)
+            if nxt <= sql_cap:
+                return rows_us[:limit_clamped]
+            sql_cap = nxt
     except sqlite3.OperationalError:
         return []

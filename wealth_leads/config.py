@@ -45,6 +45,51 @@ def submissions_10k_per_cik() -> int:
     """Max recent 10-K / 10-K/A filings to pull per CIK from data.sec.gov submissions."""
     return max(0, int(os.environ.get("SEC_10K_PER_CIK", "3")))
 
+
+def follow_8k_for_s1_ciks() -> bool:
+    """
+    After RSS sync, fetch recent 8-K / 8-K/A (etc.) per CIK that appears on an S-1 in DB.
+    Uses the same submissions JSON as the 10-K follow (one request per CIK when either is on).
+    """
+    v = os.environ.get("SEC_FOLLOW_8K", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def submissions_8k_per_cik() -> int:
+    """Max recent 8-K family filings to pull per CIK (newest first). Keep modest — 8-Ks are frequent."""
+    try:
+        return max(0, int(os.environ.get("SEC_8K_PER_CIK", "5")))
+    except ValueError:
+        return 5
+
+
+def issuer_sec_hints_min_refresh_days() -> int:
+    """Minimum days between re-fetching submissions JSON for ticker hints only (standalone path)."""
+    try:
+        return max(1, int(os.environ.get("SEC_ISSUER_HINTS_MIN_DAYS", "7")))
+    except ValueError:
+        return 7
+
+
+def fetch_standalone_issuer_sec_hints() -> bool:
+    """
+    If 10-K and 8-K follow are both off, still refresh ``issuer_sec_hints`` from submissions
+    JSON on sync (throttled by ``issuer_sec_hints_min_refresh_days``).
+    """
+    v = os.environ.get("SEC_ISSUER_HINTS_STANDALONE", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def lead_page_stale_issuer_months() -> int:
+    """
+    If > 0, the lead profile shows a warning when the newest filing in the DB for this CIK
+    is older than this many calendar months (approximate, 30.44 days/month).
+    """
+    try:
+        return max(0, int(os.environ.get("WEALTH_LEADS_LEAD_STALE_ISSUER_MONTHS", "18")))
+    except ValueError:
+        return 18
+
 # Stay under SEC fair-access guidance (~10 req/s); be conservative.
 REQUEST_DELAY_SEC = 0.15
 
@@ -87,6 +132,57 @@ def lead_desk_include_beneficial_only_leads() -> bool:
     return v not in ("0", "false", "no", "off")
 
 
+def lead_desk_include_visibility_tier() -> bool:
+    """
+    If true (default), the desk lists **visibility** tier leads (S-1 officer table / roster
+    without a parsed NEO summary-comp row). If false, those rows are hidden from desk,
+    pipeline materialization, and other paths that use ``_lead_desk_filter_profiles``.
+    """
+    v = os.environ.get("WEALTH_LEADS_LEAD_DESK_INCLUDE_VISIBILITY", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def lead_desk_exclude_issuer_risk_high() -> bool:
+    """
+    If true (default), omit leads whose issuer text (stored ``issuer_summary`` scan) matches
+    **high** distress patterns (e.g. bankruptcy, delisting phrasing).
+    """
+    v = os.environ.get("WEALTH_LEADS_DESK_EXCLUDE_ISSUER_RISK_HIGH", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def assign_exclude_visibility_tier() -> bool:
+    """If true (default), monthly allocation skips **visibility** tier profiles."""
+    v = os.environ.get("WEALTH_LEADS_ASSIGN_EXCLUDE_VISIBILITY", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def assign_exclude_issuer_risk_high() -> bool:
+    """If true (default), allocation skips issuers with **high** heuristic risk."""
+    v = os.environ.get("WEALTH_LEADS_ASSIGN_EXCLUDE_ISSUER_RISK_HIGH", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def assign_exclude_issuer_risk_elevated() -> bool:
+    """
+    If true, allocation also skips **elevated** heuristic risk (material weakness, reverse
+    split language, etc.). Default false — those leads may still be assigned but show a banner.
+    """
+    v = os.environ.get("WEALTH_LEADS_ASSIGN_EXCLUDE_ISSUER_RISK_ELEVATED", "0").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def assign_max_filing_stale_days() -> int:
+    """
+    If > 0, skip allocation for profiles whose ``filing_date`` is older than this many days.
+    0 (default) disables. Uses the profile headline filing date string (YYYY-MM-DD).
+    """
+    try:
+        return max(0, int(os.environ.get("WEALTH_LEADS_ASSIGN_MAX_FILING_STALE_DAYS", "0")))
+    except ValueError:
+        return 0
+
+
 def lead_desk_us_registrant_hq_only() -> bool:
     """
     If true, the lead desk and admin pipeline list/CSV hide rows whose registrant HQ line
@@ -110,12 +206,11 @@ def profile_stale_warning_days() -> int:
 
 def lead_desk_min_signal_usd() -> float:
     """
-    Minimum "best single fiscal year" pay signal for the desk: max(SCT total, stock+options)
-    for that person across FY rows (same DB rows as equity_hwm / per-year totals).
-    Set to 0 to disable the monetary gate (S-1-only may still apply).
+    Minimum headline fiscal-year pay signal for Premium vs Standard: max(SCT total, stock+options)
+    for the **headline** FY row (the same year as Latest total), not the best-ever year.
 
     Prefer WEALTH_LEADS_LEAD_DESK_MIN_SIGNAL_USD. If WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD is
-    set in the environment, it overrides (legacy: equity-only bar).
+    set in the environment, it overrides (legacy: equity-only bar uses max equity across FYs).
     """
     if "WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD" in os.environ:
         raw = os.environ["WEALTH_LEADS_LEAD_DESK_MIN_EQUITY_USD"].strip()
@@ -159,6 +254,19 @@ def pipeline_blur_comp_columns() -> bool:
     )
 
 
+def desk_company_preview_blur() -> bool:
+    """
+    When True, desk issuer drill-in shows city/state clearly but blurs names, pay, and links
+    (preview before purchase). Off by default for internal admin use.
+    """
+    return os.environ.get("WEALTH_LEADS_DESK_COMPANY_PREVIEW_BLUR", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def uvicorn_reload_enabled() -> bool:
     """
     When True, `py -m wealth_leads serve-app` runs uvicorn with --reload so code edits apply without a manual restart.
@@ -182,6 +290,28 @@ def require_app_auth() -> bool:
         "yes",
         "on",
     )
+
+
+def user_may_view_pipeline_exec_bundle(user: dict) -> bool:
+    """
+    Who may open ``/pipeline/company?...&sales_bundle=premium`` (exec / pay-bar roster).
+
+    Admins always qualify. Otherwise set ``WEALTH_LEADS_EXEC_BUNDLE_EMAIL_ALLOWLIST`` to a
+    comma-separated list of advisor emails, or ``WEALTH_LEADS_PIPELINE_EXEC_BUNDLE_ALL_ADVISORS=1``
+    to allow any signed-in user (dev only).
+    """
+    if user.get("is_admin"):
+        return True
+    if os.environ.get(
+        "WEALTH_LEADS_PIPELINE_EXEC_BUNDLE_ALL_ADVISORS", "0"
+    ).strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    allow = os.environ.get("WEALTH_LEADS_EXEC_BUNDLE_EMAIL_ALLOWLIST", "").strip()
+    if not allow:
+        return False
+    email = str(user.get("email") or "").strip().lower()
+    allowed = {x.strip().lower() for x in allow.split(",") if x.strip()}
+    return bool(email and email in allowed)
 
 
 def auto_sync_interval_hours() -> float:
