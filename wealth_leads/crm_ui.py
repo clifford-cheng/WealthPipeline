@@ -8,13 +8,14 @@ from typing import Any
 from urllib.parse import quote, urlencode
 
 from wealth_leads.serve import (
+    _norm_person_name,
     normalize_listing_stage_query,
     sales_bundle_tab_label,
 )
 from wealth_leads.territory import (
-    hq_city_state_pipeline_only,
     hq_principal_office_display_line,
-    pipeline_hq_city_state_label_ok,
+    issuer_hq_city_state_for_ui,
+    issuer_hq_city_state_materialized_ok,
     normalize_registrant_hq_address_blob,
 )
 from wealth_leads.title_badge import advisor_title_badge
@@ -71,6 +72,7 @@ def render_my_leads_page(
         nm_lead = (r.get("person_norm") or "").strip() or (prof.get("norm_name") or "").strip()
         if not nm_lead:
             nm_lead = prof.get("display_name") or snap.get("display_name") or ""
+        nm_lead = _norm_person_name(nm_lead)
         q = urlencode({"cik": r.get("cik") or "", "name": nm_lead})
         lead_href = f"/lead?{q}"
         ang = (r.get("outreach_angle") or "")[:140]
@@ -474,12 +476,12 @@ def pipeline_hq_city_state(r: Any) -> str:
         else ""
     )
     if raw_row:
-        live = hq_city_state_pipeline_only(format_headquarters_for_ui(raw_row))
+        live = issuer_hq_city_state_for_ui(format_headquarters_for_ui(raw_row))
         if live:
             return live
     if "issuer_hq_city_state" in r.keys():
         v = (r["issuer_hq_city_state"] or "").strip()
-        if v and pipeline_hq_city_state_label_ok(v):
+        if v and issuer_hq_city_state_materialized_ok(v):
             return v
     return ""
 
@@ -489,6 +491,126 @@ def _pipeline_row_filing_date_latest_str(r: Any) -> str:
         return str(r["filing_date_latest"] or "")
     except (KeyError, TypeError, IndexError):
         return ""
+
+
+_REG_FORM_PIPELINE_HEADER = re.compile(
+    r"^(S-1|F-1|S-1/A|F-1/A|S-11|S-11/A)",
+    re.I,
+)
+
+
+def _pipeline_pick_company_filing_for_sec_link(
+    rows: list[Any],
+) -> dict[str, str] | None:
+    """
+    One representative SEC filing for the company roster header (primary document + optional index).
+    Prefers S-1/F-1-family ``form_type_latest`` (or ``has_s1_comp``), then newest ``filing_date_latest``.
+    """
+    candidates: list[tuple[int, str, dict[str, str]]] = []
+    for r in rows:
+        try:
+            url = (r["primary_doc_url"] or "").strip()
+        except (KeyError, TypeError, IndexError):
+            continue
+        if not url or not url.lower().startswith("http"):
+            continue
+        try:
+            ft = (r["form_type_latest"] or "").strip()
+        except (KeyError, TypeError, IndexError):
+            ft = ""
+        try:
+            idx = (r["index_url"] or "").strip()
+        except (KeyError, TypeError, IndexError):
+            idx = ""
+        try:
+            acc = (r["accession_latest"] or "").strip()
+        except (KeyError, TypeError, IndexError):
+            acc = ""
+        fd = _pipeline_row_filing_date_latest_str(r)
+        if _REG_FORM_PIPELINE_HEADER.match(ft):
+            pri = 0
+        elif _profile_row_int(r, "has_s1_comp"):
+            pri = 1
+        else:
+            pri = 2
+        meta = {
+            "primary_doc_url": url,
+            "index_url": idx,
+            "form_type": ft,
+            "accession": acc,
+            "filing_date": fd,
+            "has_s1_comp": "1" if _profile_row_int(r, "has_s1_comp") else "",
+        }
+        candidates.append((pri, fd, meta))
+    if not candidates:
+        return None
+    best_pri = min(t[0] for t in candidates)
+    tier = [t for t in candidates if t[0] == best_pri]
+    _pri, _fd, meta = max(tier, key=lambda t: t[1])
+    return meta
+
+
+def _pipeline_company_sec_links_html(
+    rows: list[Any], *, cik_fallback: str = ""
+) -> str:
+    """Clickable SEC primary document (and index when distinct) for the pipeline company page."""
+    meta = _pipeline_pick_company_filing_for_sec_link(rows)
+    if not meta:
+        ck = (cik_fallback or "").strip()
+        if ck.isdigit():
+            try:
+                cik_n = int(ck, 10)
+            except ValueError:
+                cik_n = 0
+            if cik_n > 0:
+                browse = (
+                    "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany"
+                    f"&CIK={cik_n}&owner=exclude&count=40"
+                )
+                return (
+                    f'<p class="pl-co-sec dim" style="margin:0.35rem 0 0 0;font-size:0.88rem">'
+                    f'<span class="dim">SEC</span> · '
+                    f'<a href="{_attr(browse)}" target="_blank" rel="noopener noreferrer">'
+                    "Browse filings on SEC.gov</a></p>"
+                )
+        return ""
+    doc_u = meta["primary_doc_url"]
+    idx_u = (meta.get("index_url") or "").strip()
+    ft = (meta.get("form_type") or "").strip()
+    acc = (meta.get("accession") or "").strip()
+    fd = (meta.get("filing_date") or "").strip()
+    ft_u = ft.upper()
+    if _REG_FORM_PIPELINE_HEADER.match(ft):
+        if ft_u.startswith("F-1"):
+            doc_label = "View F-1"
+        else:
+            doc_label = "View S-1"
+    elif meta.get("has_s1_comp") == "1":
+        doc_label = "View S-1 filing"
+    elif ft:
+        doc_label = f"View {ft}"
+    else:
+        doc_label = "View SEC filing"
+    tip_parts = [x for x in (ft, acc, fd) if x]
+    tip = html_module.escape(" · ".join(tip_parts), quote=True)
+    hdoc = _attr(doc_u)
+    out = (
+        f'<p class="pl-co-sec dim" style="margin:0.35rem 0 0 0;font-size:0.88rem">'
+        f'<span class="dim">SEC</span> · '
+        f'<a href="{hdoc}" target="_blank" rel="noopener noreferrer" title="{tip}">'
+        f"{_esc(doc_label)}</a>"
+    )
+    if (
+        idx_u
+        and idx_u.lower().startswith("http")
+        and idx_u.rstrip("/") != doc_u.rstrip("/")
+    ):
+        out += (
+            f' · <a href="{_attr(idx_u)}" target="_blank" rel="noopener noreferrer" '
+            f'title="{tip}">Filing index</a>'
+        )
+    out += "</p>"
+    return out
 
 
 def _pl_bundle_numeric_data_attr(v: Any) -> str:
@@ -537,18 +659,6 @@ def pipeline_cash_excl_equity_from_row(r: Any) -> float | None:
             s += v
             n += 1
     return s if n > 0 else None
-
-
-def _outreach_status_short_label(status: str) -> str:
-    m = {
-        "none": "—",
-        "planned": "Planned",
-        "sent": "Sent",
-        "replied": "Replied",
-        "no_response": "No reply",
-        "declined": "Declined",
-    }
-    return m.get((status or "none").strip().lower(), "—")
 
 
 def _pipeline_bundle_summary_block_html(
@@ -611,11 +721,9 @@ def _pipeline_person_row_html(
     r: Any,
     *,
     blur_class: str,
-    show_outreach: bool = False,
-    outreach_status: str = "none",
     hide_company_column: bool = False,
 ) -> str:
-    """One `<tr>` for the pipeline person grid (bundle page adds optional outreach column)."""
+    """One `<tr>` for the pipeline person grid."""
     cross_badge = (
         "<span class=\"cross\">Multi-CIK</span>"
         if _profile_row_int(r, "cross_company_hint")
@@ -633,7 +741,10 @@ def _pipeline_person_row_html(
         dn_raw = r["display_name"]
     except (KeyError, TypeError, IndexError):
         dn_raw = ""
-    name_for_lead = (pn_raw or "").strip() or (dn_raw or "").strip()
+    # Same normalization as /lead and _profile_lead_url so drill-in always matches _find_profile.
+    name_for_lead = _norm_person_name(
+        (pn_raw or "").strip() or (dn_raw or "").strip()
+    )
     profile_q = urlencode({"cik": cik_s, "name": name_for_lead})
     profile_href = html_module.escape(f"/lead?{profile_q}", quote=True)
     try:
@@ -698,16 +809,6 @@ def _pipeline_person_row_html(
         "Opens full profile page (/lead). Click the row or ›. Enter when focused.",
         quote=True,
     )
-    out_tt = html_module.escape(
-        "Your outreach status (saved on /lead — mini CRM).",
-        quote=True,
-    )
-    out_cell = ""
-    if show_outreach:
-        out_cell = (
-            f'<td class="dim pl-outreach-cell" title="{out_tt}">'
-            f"{_esc(_outreach_status_short_label(outreach_status))}</td>"
-        )
     try:
         co_nm = r["company_name"]
     except (KeyError, TypeError, IndexError):
@@ -736,7 +837,6 @@ def _pipeline_person_row_html(
         + f'<td class="num{blur_class}" title="{cash_tt}">{_money_cell(cash_v)}</td>'
         + f'<td class="num{blur_class}" title="{stock_tt}">{_money_cell(stk_v)}</td>'
         + f"<td class='dim'>{_esc(_pipeline_flags(r))}</td>"
-        + out_cell
         + f'<td class="pl-row-cue"><a class="pl-row-profile" href="{profile_href}" '
         + 'aria-label="Open full profile">›</a></td>'
         + "</tr>"
@@ -1095,6 +1195,24 @@ body {
   border-bottom: 1px solid var(--line);
 }
 .pl-brand { display: flex; align-items: baseline; gap: 0.65rem; flex-wrap: wrap; }
+/* Company drill-in: SEC links — muted accent, not default browser blue */
+.pl-co-sec a {
+  color: #b8a882;
+  text-decoration: none;
+  font-weight: 500;
+  border-bottom: 1px solid rgba(184, 168, 130, 0.42);
+}
+.pl-co-sec a:hover {
+  color: var(--amber);
+  border-bottom-color: rgba(226, 160, 18, 0.55);
+}
+.pl-co-sec a:visited {
+  color: #a89870;
+  border-bottom-color: rgba(168, 152, 112, 0.35);
+}
+.pl-co-sec a:visited:hover {
+  color: var(--amber);
+}
 .pl-logo {
   font-weight: 700;
   letter-spacing: 0.04em;
@@ -1269,6 +1387,23 @@ table.pl-grid {
 .pl-row { cursor: pointer; }
 .pl-row:hover { background: rgba(226,160,18,0.08) !important; }
 .pl-row:focus { outline: 1px solid var(--amber); outline-offset: -2px; }
+/* Bundle row is role=link — avoid OS “hyperlink” blue on company names */
+tr.pl-row-bundle {
+  color: var(--text);
+}
+tr.pl-row-bundle td strong {
+  color: var(--text);
+  font-weight: 600;
+}
+tr.pl-row-bundle:hover td:first-child strong {
+  color: var(--amber);
+}
+tr.pl-row-bundle td.dim {
+  color: var(--faint);
+}
+tr.pl-row-bundle td.pl-loc {
+  color: #b0b0b8;
+}
 .pl-col-profile {
   width: 4.5rem;
   text-align: center;
@@ -1491,7 +1626,6 @@ a.desk-tier-tab--active {
   margin: 0;
   color: var(--text);
 }
-.pl-outreach-cell { max-width: 6.5rem; font-size: 0.72rem; }
 thead tr.pl-filter-row th {
   padding: 0.3rem 0.45rem;
   font-weight: 400;
@@ -1823,24 +1957,20 @@ def _pipeline_company_tbody_rows_html(
     rows: list[Any],
     *,
     blur_class: str,
-    obn: dict[str, str],
     empty_message: str,
 ) -> str:
     trs: list[str] = []
     for r in rows:
-        pn = (r["person_norm"] or "").strip()
         trs.append(
             _pipeline_person_row_html(
                 r,
                 blur_class=blur_class,
-                show_outreach=True,
-                outreach_status=obn.get(pn, "none"),
                 hide_company_column=True,
             )
         )
     if trs:
         return "".join(trs)
-    return f"<tr><td colspan='10' class='dim empty'>{_esc(empty_message)}</td></tr>"
+    return f"<tr><td colspan='9' class='dim empty'>{_esc(empty_message)}</td></tr>"
 
 
 def render_pipeline_company_page(
@@ -1850,7 +1980,6 @@ def render_pipeline_company_page(
     company_name: str,
     back_href: str,
     blur_comp: bool,
-    outreach_by_norm: dict[str, str] | None = None,
     pipeline_path: str = "/admin/pipeline",
     search: str = "",
     months: int = 6,
@@ -1858,7 +1987,6 @@ def render_pipeline_company_page(
 ) -> str:
     """One CIK, one roster per request — tier chosen by ``sales_bundle`` (no dual view)."""
     blur_class = " pl-blur-comp" if blur_comp else ""
-    obn = outreach_by_norm if outreach_by_norm is not None else {}
     sb = (sales_bundle or "").strip().lower().replace("-", "_")
     if sb != "premium":
         sb = "economy"
@@ -1894,10 +2022,16 @@ def render_pipeline_company_page(
             f'<p class="pl-co-principal dim" style="margin:0.35rem 0 0 0;font-size:0.88rem;'
             f"line-height:1.35;max-width:44rem\">{_esc(hq_detail_co)}</p>"
         )
+    cik_fb = ""
+    if rows:
+        try:
+            cik_fb = str(rows[0]["cik"] or "").strip()
+        except (KeyError, TypeError, IndexError):
+            cik_fb = ""
+    co_sec_html = _pipeline_company_sec_links_html(rows, cik_fallback=cik_fb)
     tbody_html = _pipeline_company_tbody_rows_html(
         rows,
         blur_class=blur_class,
-        obn=obn,
         empty_message=empty_msg,
     )
     thead_html = """<thead><tr>
@@ -1909,7 +2043,6 @@ def render_pipeline_company_page(
 <th scope="col" class="num" title="Non-equity-award SCT bundle">Cash and bonus</th>
 <th scope="col" class="num" title="Stock awards + option awards, same FY (grant-date fair value)">Stock + options</th>
 <th scope="col">Sources</th>
-<th scope="col" title="Your outreach status (edit on each person’s /lead page)">Outreach</th>
 <th scope="col" class="pl-col-profile" title="Open full profile">Profile</th>
 </tr><tr class="pl-filter-row">
 <th><input type="search" class="pl-th-filter" data-plp-col="person" placeholder="Contains…" aria-label="Filter person"/></th>
@@ -1922,7 +2055,6 @@ def render_pipeline_company_page(
 <th><input type="number" class="pl-th-filter" data-plp-col="mincash" min="0" step="1000" placeholder="Min $" aria-label="Min cash USD"/></th>
 <th><input type="number" class="pl-th-filter" data-plp-col="minstk" min="0" step="1000" placeholder="Min $" aria-label="Min stock USD"/></th>
 <th><input type="search" class="pl-th-filter" data-plp-col="src" placeholder="Contains…" aria-label="Filter sources"/></th>
-<th><span class="dim" style="font-size:0.68rem">—</span></th>
 <th><span class="dim" style="font-size:0.68rem">—</span></th>
 </tr></thead>"""
     back_attr = html_module.escape(back_href, quote=True)
@@ -1939,6 +2071,7 @@ def render_pipeline_company_page(
   <div class="pl-brand">
     <span class="pl-title">{_esc(company_name)}</span>
     {co_addr_html}
+    {co_sec_html}
   </div>
   <div class="pl-actions">
     <a href="{back_attr}">← Back</a>

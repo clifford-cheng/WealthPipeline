@@ -475,6 +475,47 @@ def llm_person_advisor_story(
         return ""
 
 
+def llm_filing_narrative_advisor_bullets(
+    *,
+    display_name: str,
+    title: str,
+    company_name: str,
+    s1_bio: str,
+) -> str:
+    """
+    Filing-text-only bullet list for advisor diligence (no website context).
+    Persisted from ``enrich-client-research`` when LLM is configured.
+    """
+    if not advisor_llm_available():
+        return ""
+    bio = (s1_bio or "").strip()
+    if not bio:
+        return ""
+    system = (
+        "You extract advisor-relevant facts from SEC registration-statement management bios. "
+        "Output ONLY a bullet list of 3–6 lines. Each line MUST start with '- ' (hyphen space). "
+        "SKIP anything already obvious from the profile header: do NOT restate the person’s name, "
+        "current employer, or current title/role at that issuer. "
+        "DO include: prior employers and roles, education, other boards or public service, "
+        "relevant dates or tenure, anything explicit about equity, options, or ownership, "
+        "and other material facts not implied by title alone. "
+        "No speculation or 'may' / 'likely'. Omit marketing fluff. "
+        "If the bio only restates the header, output a single bullet: '- (Filing bio adds no extra material facts beyond role line.)'. "
+        "Do not mention websites, email, or outreach."
+    )
+    user = (
+        f"Context (do not repeat in bullets — user already sees this on screen):\n"
+        f"Name: {display_name}\nCurrent title: {title}\nIssuer: {company_name}\n\n"
+        f"--- Filing management narrative (source) ---\n{bio[:6500]}\n"
+    )
+    try:
+        return advisor_llm_chat_text(
+            system=system, user=user, temperature=0.15, max_tokens=380, timeout=90.0
+        )
+    except Exception:
+        return ""
+
+
 _EMAIL_RE = re.compile(
     r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
     re.I,

@@ -24,6 +24,7 @@ from wealth_leads.advisor_pack import (
     advisor_llm_chat_json,
     ensure_issuer_advisor_snapshot,
     fetch_s1_bio_for_person,
+    llm_filing_narrative_advisor_bullets,
     llm_person_advisor_story,
     outreach_pattern_pack_from_website,
     run_email_ping_suite,
@@ -516,8 +517,8 @@ def enrich_lead_profile_row(
                 status, bio_website, photo_url, leadership_page_url,
                 linkedin_profile_url, linkedin_search_url, research_summary,
                 source_excerpt, raw_json, error_message, enriched_at,
-                person_story, outreach_json, photo_blob, photo_mime
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                person_story, filing_narrative_bullets, outreach_json, photo_blob, photo_mime
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(cik, person_norm) DO UPDATE SET
                 display_name = excluded.display_name,
                 company_name = excluded.company_name,
@@ -534,6 +535,7 @@ def enrich_lead_profile_row(
                 error_message = excluded.error_message,
                 enriched_at = excluded.enriched_at,
                 person_story = excluded.person_story,
+                filing_narrative_bullets = COALESCE(excluded.filing_narrative_bullets, filing_narrative_bullets),
                 outreach_json = excluded.outreach_json,
                 photo_blob = excluded.photo_blob,
                 photo_mime = excluded.photo_mime
@@ -556,6 +558,7 @@ def enrich_lead_profile_row(
                 payload.get("error_message"),
                 payload["enriched_at"],
                 payload.get("person_story"),
+                payload.get("filing_narrative_bullets"),
                 payload.get("outreach_json"),
                 payload.get("photo_blob"),
                 payload.get("photo_mime"),
@@ -566,15 +569,30 @@ def enrich_lead_profile_row(
     s1_bio = fetch_s1_bio_for_person(conn, cik, person_norm)
     person_story_val: Optional[str] = None
     outreach_val: Optional[str] = None
+    filing_narrative_bullets_val: Optional[str] = None
+    _s1_strip = str(s1_bio or "").strip()
+    if use_llm and advisor_llm_available() and _s1_strip:
+        try:
+            filing_narrative_bullets_val = (
+                llm_filing_narrative_advisor_bullets(
+                    display_name=display_name,
+                    title=title,
+                    company_name=company_name,
+                    s1_bio=_s1_strip,
+                ).strip()
+                or None
+            )
+        except Exception:
+            filing_narrative_bullets_val = None
 
     if not base_root:
-        if use_llm and advisor_llm_available() and s1_bio:
+        if use_llm and advisor_llm_available() and _s1_strip:
             try:
                 person_story_val = llm_person_advisor_story(
                     display_name=display_name,
                     title=title,
                     company_name=company_name,
-                    s1_bio=s1_bio,
+                    s1_bio=_s1_strip,
                     website_bio="",
                     website_summary="",
                 )
@@ -591,6 +609,7 @@ def enrich_lead_profile_row(
             source_excerpt=None,
             raw_json=None,
             person_story=person_story_val,
+            filing_narrative_bullets=filing_narrative_bullets_val,
             outreach_json=None,
         )
 
@@ -685,7 +704,7 @@ def enrich_lead_profile_row(
                 display_name=display_name,
                 title=title,
                 company_name=company_name,
-                s1_bio=s1_bio,
+                s1_bio=_s1_strip,
                 website_bio=bio or "",
                 website_summary=summary or "",
             )
@@ -733,6 +752,7 @@ def enrich_lead_profile_row(
         raw_json=json.dumps(raw_parts, ensure_ascii=False)[:48000],
         error_message=None,
         person_story=person_story_val,
+        filing_narrative_bullets=filing_narrative_bullets_val,
         outreach_json=outreach_val,
         photo_blob=photo_blob_bin,
         photo_mime=photo_mime_val,

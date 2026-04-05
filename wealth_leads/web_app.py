@@ -61,22 +61,18 @@ from wealth_leads.db import (
     get_app_user_by_email,
     get_app_user_by_id,
     get_lead_client_research,
-    get_advisor_lead_outreach,
     get_lead_profile_row,
     insert_app_user,
-    insert_lead_advisor_feedback,
     insert_lead_suppress,
     list_allocation_clients,
     list_lead_advisor_feedback,
     list_lead_suppress,
     list_beneficial_owner_gems_for_filing_ids,
     list_beneficial_owner_outreach_targets_for_cik,
-    list_advisor_lead_outreach_status_by_norm_for_cik,
     list_lead_profiles_for_review,
     list_user_watchlist,
     update_allocation_settings,
     update_user_allocation_profile,
-    upsert_advisor_lead_outreach,
 )
 from wealth_leads.lead_research import row_to_client_research_dict
 from wealth_leads.password_util import hash_password, verify_password
@@ -380,7 +376,10 @@ def _pipeline_row_drawer_enrich(conn: sqlite3.Connection, row: sqlite3.Row) -> d
 
 from wealth_leads.person_quality import is_acceptable_lead_person_name
 from wealth_leads.serve import (
+    _best_issuer_headquarters_for_cik,
     _build_profiles,
+    _dev_state_body,
+    enrich_pipeline_rows_registrant_hq,
     _filings_for_profile,
     _find_profile,
     _latest_filing_snapshot_caveats_for_cik,
@@ -389,6 +388,7 @@ from wealth_leads.serve import (
     _lead_page_db_stats,
     _load_page_data,
     _norm_person_name,
+    _resolve_issuer_headquarters_for_profile,
     _desk_sort_tuple,
     _page_desk,
     _page_desk_company,
@@ -397,19 +397,21 @@ from wealth_leads.serve import (
     _profile_lead_tier,
     _profile_lead_url,
     beneficial_stake_detail_for_profile,
+    beneficial_stake_row_matching_officer_profile,
     filter_profiles_geo_industry_text,
     desk_sales_bundle_company_counts,
     filter_profiles_sales_bundle,
     filter_rows_sales_bundle,
     profile_sales_bundle,
     finder_export_csv_bytes,
-    lead_feedback_form_html,
-    lead_outreach_form_html,
     lead_issuer_recency_bundle,
     normalize_sales_bundle_query,
     sales_bundle_from_lead_tier,
 )
-from wealth_leads.territory import registrant_hq_line_parses_as_united_states
+from wealth_leads.territory import (
+    issuer_hq_city_state_for_ui,
+    registrant_hq_line_parses_as_united_states,
+)
 
 AUTH_COOKIE = "wl_auth"
 SESSION_MAX_AGE = 60 * 60 * 24 * 14
@@ -604,6 +606,23 @@ app = FastAPI(
 )
 
 
+@app.get("/__dev/state")
+async def dev_live_reload_state() -> Response:
+    """
+    Polled by ``_live_reload_snippet()`` on desk/lead/finder pages (see serve.py).
+    Legacy ``python -m wealth_leads serve`` exposed this; FastAPI must too or the
+    browser never sees DB/process changes without a manual full reload.
+    """
+    return Response(
+        content=_dev_state_body(),
+        media_type="application/json; charset=utf-8",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+        },
+    )
+
+
 @app.middleware("http")
 async def _no_cache_html_for_dev(request: Request, call_next):
     """
@@ -620,8 +639,11 @@ async def _no_cache_html_for_dev(request: Request, call_next):
         return response
     ct = (response.headers.get("content-type") or "").lower()
     if "text/html" in ct:
-        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Cache-Control"] = (
+            "private, no-store, no-cache, must-revalidate, max-age=0"
+        )
         response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
     return response
 
 
@@ -944,15 +966,18 @@ async def admin_pipeline(request: Request) -> Response:
     pf = _pipeline_review_params(request)
     months_back = None if pf["months_sel"] <= 0 else pf["months_sel"]
     with connect() as conn:
-        rows = list_lead_profiles_for_review(
+        rows = enrich_pipeline_rows_registrant_hq(
             conn,
-            s1_only=not pf["include_non_s1"],
-            search=pf["q"],
-            limit=800,
-            months_back=months_back,
-            pay_band="all",
-            us_registrant_hq_only=lead_desk_us_registrant_hq_only(),
-            listing_stage="all",
+            list_lead_profiles_for_review(
+                conn,
+                s1_only=not pf["include_non_s1"],
+                search=pf["q"],
+                limit=800,
+                months_back=months_back,
+                pay_band="all",
+                us_registrant_hq_only=lead_desk_us_registrant_hq_only(),
+                listing_stage="all",
+            ),
         )
     from wealth_leads.config import pipeline_blur_comp_columns
 
@@ -994,19 +1019,19 @@ async def admin_pipeline_company(request: Request) -> Response:
     back_href = pp + "?" + urlencode({k: v for k, v in back_qs.items() if v})
 
     with connect() as conn:
-        rows = list_lead_profiles_for_review(
+        rows = enrich_pipeline_rows_registrant_hq(
             conn,
-            s1_only=not pf["include_non_s1"],
-            search=pf["q"],
-            limit=800,
-            months_back=months_back,
-            pay_band="all",
-            us_registrant_hq_only=lead_desk_us_registrant_hq_only(),
-            listing_stage="all",
-            cik=cik,
-        )
-        outreach_by_norm = list_advisor_lead_outreach_status_by_norm_for_cik(
-            conn, int(user["id"]), cik
+            list_lead_profiles_for_review(
+                conn,
+                s1_only=not pf["include_non_s1"],
+                search=pf["q"],
+                limit=800,
+                months_back=months_back,
+                pay_band="all",
+                us_registrant_hq_only=lead_desk_us_registrant_hq_only(),
+                listing_stage="all",
+                cik=cik,
+            ),
         )
     from wealth_leads.config import pipeline_blur_comp_columns
 
@@ -1039,7 +1064,6 @@ async def admin_pipeline_company(request: Request) -> Response:
         company_name=company_name,
         back_href=back_href,
         blur_comp=pipeline_blur_comp_columns(),
-        outreach_by_norm=outreach_by_norm,
         pipeline_path=_pipeline_url_path(),
         search=pf["q"],
         months=pf["months_sel"],
@@ -1080,15 +1104,18 @@ async def admin_pipeline_csv(request: Request) -> Response:
     pf = _pipeline_review_params(request)
     months_back = None if pf["months_sel"] <= 0 else pf["months_sel"]
     with connect() as conn:
-        rows = list_lead_profiles_for_review(
+        rows = enrich_pipeline_rows_registrant_hq(
             conn,
-            s1_only=not pf["include_non_s1"],
-            search=pf["q"],
-            limit=5000,
-            months_back=months_back,
-            pay_band="all",
-            us_registrant_hq_only=lead_desk_us_registrant_hq_only(),
-            listing_stage="all",
+            list_lead_profiles_for_review(
+                conn,
+                s1_only=not pf["include_non_s1"],
+                search=pf["q"],
+                limit=5000,
+                months_back=months_back,
+                pay_band="all",
+                us_registrant_hq_only=lead_desk_us_registrant_hq_only(),
+                listing_stage="all",
+            ),
         )
 
     buf = io.StringIO()
@@ -1600,15 +1627,33 @@ async def lead(
         filings: list[dict] = []
         cr_dict: dict[str, Any] | None = None
         issuer_snap: dict[str, Any] | None = None
-        beneficial_rows: list[dict[str, Any]] = []
         important_llm: list[dict[str, Any]] = []
+        beneficial_individual_shareholders: list[dict[str, Any]] = []
         beneficial_stake_detail: dict[str, Any] | None = None
+        officer_beneficial_stake: dict[str, Any] | None = None
         beneficial_filing_caveats = ""
         lead_recency: dict[str, Any] = {}
-        lead_feedback_html = ""
-        lead_outreach_html = ""
         if prof is not None and not stats.get("missing_db"):
             with connect() as conn:
+                prof = dict(prof)
+                _ck_lead = (cik or "").strip()
+                if _ck_lead:
+                    prof["issuer_headquarters"] = (
+                        _resolve_issuer_headquarters_for_profile(
+                            conn,
+                            _ck_lead,
+                            (prof.get("issuer_headquarters") or "").strip(),
+                        )
+                    )
+                    if not (prof.get("issuer_headquarters") or "").strip():
+                        prof["issuer_headquarters"] = (
+                            _best_issuer_headquarters_for_cik(conn, _ck_lead) or ""
+                        )
+                    _hq_cs = issuer_hq_city_state_for_ui(
+                        (prof.get("issuer_headquarters") or "").strip()
+                    )
+                    if _hq_cs:
+                        prof["issuer_hq_city_state"] = _hq_cs[:120]
                 filings = _filings_for_profile(conn, cik, norm)
                 cr_row = get_lead_client_research(conn, (cik or "").strip(), norm)
                 cr_dict = row_to_client_research_dict(cr_row)
@@ -1637,14 +1682,11 @@ async def lead(
                         important_llm = []
                 else:
                     try:
-                        beneficial_rows = [
-                            dict(r)
-                            for r in list_beneficial_owner_outreach_targets_for_cik(
-                                conn, (cik or "").strip(), limit=10
-                            )
-                        ]
+                        officer_beneficial_stake = beneficial_stake_row_matching_officer_profile(
+                            conn, prof
+                        )
                     except sqlite3.Error:
-                        beneficial_rows = []
+                        officer_beneficial_stake = None
                     try:
                         important_llm = _latest_important_people_from_s1_llm_pack(
                             conn, (cik or "").strip()
@@ -1657,24 +1699,15 @@ async def lead(
                     )
                 except sqlite3.Error:
                     lead_recency = {}
-            pn_fb = (prof.get("norm_name") or "").strip() or norm
-            ck_fb = (cik or "").strip()
-            if pn_fb and ck_fb:
-                lead_feedback_html = lead_feedback_form_html(ck_fb, pn_fb)
-                uid = user.get("id")
-                if uid is not None:
-                    with connect() as conn_o:
-                        row_o = get_advisor_lead_outreach(conn_o, int(uid), ck_fb, pn_fb)
-                    cur_o: dict[str, str] | None = None
-                    if row_o is not None:
-                        cur_o = {
-                            "email": str(row_o["email"] or ""),
-                            "status": str(row_o["status"] or "none"),
-                            "notes": str(row_o["notes"] or ""),
-                        }
-                    lead_outreach_html = lead_outreach_form_html(
-                        ck_fb, pn_fb, current=cur_o
-                    )
+                try:
+                    beneficial_individual_shareholders = [
+                        dict(r)
+                        for r in list_beneficial_owner_outreach_targets_for_cik(
+                            conn, (cik or "").strip(), limit=25
+                        )
+                    ]
+                except sqlite3.Error:
+                    beneficial_individual_shareholders = []
         body = _page_lead(
             prof,
             filings,
@@ -1684,13 +1717,12 @@ async def lead(
             rendered_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             client_research=cr_dict,
             issuer_snapshot=issuer_snap,
-            beneficial_gems=beneficial_rows,
             important_people_llm=important_llm,
+            beneficial_individual_shareholders=beneficial_individual_shareholders,
             beneficial_stake_detail=beneficial_stake_detail,
+            officer_beneficial_stake=officer_beneficial_stake,
             beneficial_filing_caveats=beneficial_filing_caveats,
             lead_recency=lead_recency,
-            lead_feedback_html=lead_feedback_html,
-            lead_outreach_html=lead_outreach_html,
             lead_page_msg=lead_page_msg,
         )
         return HTMLResponse(_inject_chrome(body, user))
@@ -1702,127 +1734,6 @@ async def lead(
             f"<p style='color:#8b96a3;font-size:0.85rem'>{html_module.escape(str(e))}</p>",
             status_code=500,
         )
-
-
-@app.post("/lead/feedback", response_model=None)
-async def lead_feedback_post(
-    request: Request,
-    cik: str = Form(...),
-    person_norm: str = Form(...),
-    category: str = Form("other"),
-    note: str = Form(""),
-    also_suppress: str = Form(""),
-) -> Response:
-    redir = _auth_redirect(request)
-    if redir is not None:
-        return redir
-    user = _session_user(request)
-    assert user is not None
-    ck = (cik or "").strip()
-    pn = (person_norm or "").strip()
-    if not ck or not pn:
-        return HTMLResponse("<h1>Bad request</h1><p>Missing cik or person_norm.</p>", 400)
-    if not user.get("is_admin"):
-        with connect() as conn:
-            ok = conn.execute(
-                """
-                SELECT 1 FROM lead_assignments
-                WHERE user_id = ? AND cik = ? AND person_norm = ? LIMIT 1
-                """,
-                (user["id"], ck, pn),
-            ).fetchone()
-        if not ok:
-            return HTMLResponse(
-                "<h1>Forbidden</h1><p>Feedback only for leads assigned to you.</p>",
-                status_code=403,
-            )
-    email = str(user.get("email") or "").strip()
-    suppress = also_suppress.strip().lower() in ("1", "on", "true", "yes")
-    try:
-        with connect() as conn:
-            insert_lead_advisor_feedback(
-                conn,
-                cik=ck,
-                person_norm=pn,
-                category=category,
-                note=note,
-                user_email=email,
-                also_suppress=suppress,
-            )
-    except sqlite3.Error:
-        return HTMLResponse(
-            "<h1>Database error</h1><p>Could not save feedback.</p>", status_code=500
-        )
-    q = urlencode(
-        {
-            "cik": ck,
-            "name": pn,
-            "msg": "Feedback recorded — thank you.",
-        }
-    )
-    return RedirectResponse(f"/lead?{q}", status_code=302)
-
-
-@app.post("/lead/outreach", response_model=None)
-async def lead_outreach_post(
-    request: Request,
-    cik: str = Form(...),
-    person_norm: str = Form(...),
-    email: str = Form(""),
-    status: str = Form("none"),
-    notes: str = Form(""),
-) -> Response:
-    redir = _auth_redirect(request)
-    if redir is not None:
-        return redir
-    user = _session_user(request)
-    assert user is not None
-    ck = (cik or "").strip()
-    pn = (person_norm or "").strip()
-    if not ck or not pn:
-        return HTMLResponse("<h1>Bad request</h1><p>Missing cik or person_norm.</p>", 400)
-    uid = user.get("id")
-    if uid is None:
-        return HTMLResponse(
-            "<h1>Forbidden</h1><p>Sign in to save outreach.</p>", status_code=403
-        )
-    if not user.get("is_admin"):
-        with connect() as conn:
-            ok = conn.execute(
-                """
-                SELECT 1 FROM lead_assignments
-                WHERE user_id = ? AND cik = ? AND person_norm = ? LIMIT 1
-                """,
-                (int(uid), ck, pn),
-            ).fetchone()
-        if not ok:
-            return HTMLResponse(
-                "<h1>Forbidden</h1><p>Outreach only for leads assigned to you.</p>",
-                status_code=403,
-            )
-    try:
-        with connect() as conn:
-            upsert_advisor_lead_outreach(
-                conn,
-                int(uid),
-                ck,
-                pn,
-                email=email,
-                status=status,
-                notes=notes,
-            )
-    except sqlite3.Error:
-        return HTMLResponse(
-            "<h1>Database error</h1><p>Could not save outreach.</p>", status_code=500
-        )
-    q = urlencode(
-        {
-            "cik": ck,
-            "name": pn,
-            "msg": "Outreach saved.",
-        }
-    )
-    return RedirectResponse(f"/lead?{q}", status_code=302)
 
 
 @app.get("/watchlist", response_model=None)

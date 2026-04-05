@@ -66,6 +66,7 @@ def _prepare_sqlite_connection(conn: sqlite3.Connection) -> None:
     _migrate_issuer_advisor_snapshot(conn)
     _migrate_lead_client_research_advisor_cols(conn)
     _migrate_lead_client_research_photo_blob(conn)
+    _migrate_lead_client_research_filing_narrative_bullets(conn)
     _migrate_beneficial_owner_stake(conn)
 
 SCHEMA = """
@@ -164,12 +165,12 @@ def _migrate_filings_issuer_hq_city_state(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE filings ADD COLUMN issuer_hq_city_state TEXT NOT NULL DEFAULT ''"
         )
-        from wealth_leads.territory import hq_city_state_pipeline_only
+        from wealth_leads.territory import issuer_hq_city_state_for_ui
 
         for row in conn.execute("SELECT id, issuer_headquarters FROM filings"):
             hid = int(row["id"])
             hq = (row["issuer_headquarters"] or "").strip()
-            cs = hq_city_state_pipeline_only(hq) if hq else ""
+            cs = issuer_hq_city_state_for_ui(hq) if hq else ""
             conn.execute(
                 "UPDATE filings SET issuer_hq_city_state = ? WHERE id = ?",
                 (cs, hid),
@@ -353,12 +354,12 @@ def update_filing_issuer_meta(
     ``issuer_hq_city_state`` is always derived from the resolved full HQ line (city + state
     or region, no US ZIP, no street) for pipeline / materialized profiles.
     """
-    from wealth_leads.territory import hq_city_state_pipeline_only
+    from wealth_leads.territory import issuer_hq_city_state_for_ui
 
     tw = (website or "").strip()
     th = (headquarters or "").strip()
     if headquarters_force and th:
-        cs = hq_city_state_pipeline_only(th)
+        cs = issuer_hq_city_state_for_ui(th)
         conn.execute(
             """
             UPDATE filings SET
@@ -371,7 +372,7 @@ def update_filing_issuer_meta(
         )
         return
     if th:
-        cs = hq_city_state_pipeline_only(th)
+        cs = issuer_hq_city_state_for_ui(th)
         conn.execute(
             """
             UPDATE filings SET
@@ -1129,6 +1130,14 @@ def _migrate_lead_client_research_photo_blob(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE lead_client_research ADD COLUMN photo_blob BLOB")
     if "photo_mime" not in cols:
         conn.execute("ALTER TABLE lead_client_research ADD COLUMN photo_mime TEXT")
+
+
+def _migrate_lead_client_research_filing_narrative_bullets(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(lead_client_research)").fetchall()}
+    if "filing_narrative_bullets" not in cols:
+        conn.execute(
+            "ALTER TABLE lead_client_research ADD COLUMN filing_narrative_bullets TEXT"
+        )
 
 
 def _migrate_beneficial_owner_stake(conn: sqlite3.Connection) -> None:

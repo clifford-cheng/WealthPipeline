@@ -461,7 +461,7 @@ def _city_segment_plausible_for_city_state_field(seg: str) -> bool:
     s = (seg or "").strip()
     if not s or len(s) > 80:
         return False
-    if re.match(r"^\d", s):
+    if re.search(r"\d", s):
         return False
     if _STREET_TYPE_WORD.search(s):
         return False
@@ -470,6 +470,12 @@ def _city_segment_plausible_for_city_state_field(seg: str) -> bool:
     if re.search(r"(?i)#\s*\d", s):
         return False
     if _CORP_OR_ENTITY_TAIL.search(s):
+        return False
+    # "Bond St New York" (thoroughfare + city in one segment) — not a city label.
+    if re.search(r"(?i)\b[A-Za-z][A-Za-z'`-]{0,30}\s+st\.?\s+[A-Z]", s):
+        return False
+    # Comma split left "St" + city (e.g. "… Bond St New York, NY" → "St New York") — not a city.
+    if re.match(r"(?i)^st\s+[A-Z]", s) and not s.lower().startswith("st."):
         return False
     return True
 
@@ -498,6 +504,100 @@ def pipeline_hq_city_state_label_ok(cs: str | None) -> bool:
     return True
 
 
+def _issuer_hq_city_state_ui_loose_ok(cs: str | None) -> bool:
+    """
+    Accepts labels for lead/pipeline **Location** when strict :func:`pipeline_hq_city_state_label_ok`
+    rejects them but the string still looks like city + state/region (no ZIP, no obvious issuer tail).
+    """
+    if pipeline_hq_city_state_label_ok(cs):
+        return True
+    t = (cs or "").strip()
+    if not t or hq_city_state_looks_like_filing_noise(t):
+        return False
+    if re.search(r"\b\d{5}(?:-\d{4})?\b", t):
+        return False
+    if len(t) > 100:
+        return False
+    parts = [p.strip() for p in t.split(",") if p.strip()]
+    if len(parts) < 2:
+        return False
+    city_side = ", ".join(parts[:-1]).strip()
+    st_side = parts[-1]
+    if re.search(r"\d", city_side) or len(city_side) > 72:
+        return False
+    if _CORP_OR_ENTITY_TAIL.search(city_side):
+        return False
+    if re.match(r"^\d", st_side):
+        return False
+    if len(st_side) > 40:
+        return False
+    return True
+
+
+def issuer_hq_city_state_materialized_ok(cs: str | None) -> bool:
+    """Whether a stored ``issuer_hq_city_state`` cell is safe to show when live HQ parse is empty."""
+    v = (cs or "").strip()
+    if not v:
+        return False
+    return pipeline_hq_city_state_label_ok(v) or _issuer_hq_city_state_ui_loose_ok(v)
+
+
+def _hq_pipeline_city_state_zip_tail_fallback(hq: str | None) -> str:
+    """
+    When :func:`hq_city_state_display` returns empty, infer **City, ST** from a US tail
+    ``…, City, ST 12345`` or ``… City ST 12345`` (requires ZIP + 2-letter state for confidence).
+    """
+    if not (hq or "").strip():
+        return ""
+    s_strip, _fc = strip_hq_our_facility_clause(hq or "")
+    s0 = normalize_registrant_hq_address_blob(s_strip)
+    raw = _scrub_hq_for_location(s0)
+    if not raw or _NON_US_PRINCIPAL_HINT.search(raw):
+        return ""
+    if headquarters_looks_like_lease_narrative(raw) and not re.search(
+        r"(?i)\b(street|st\.|avenue|road|suite|room|floor|building|hong\s+kong)\b",
+        raw,
+    ):
+        return ""
+    work = raw.strip(" ,")
+    mz = re.search(r"\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)\s*$", work, re.I)
+    if not mz:
+        return ""
+    st = _norm_state_token(mz.group(1).upper())
+    if not st:
+        return ""
+    before = work[: mz.start()].strip(" ,")
+    if not before:
+        return ""
+
+    def _strip_zip_seg(seg: str) -> str:
+        return re.sub(r"\s+\d{5}(?:-\d{4})?\s*$", "", (seg or "").strip(), flags=re.I).strip()
+
+    city = ""
+    parts = [p.strip() for p in before.split(",") if p.strip()]
+    for idx in range(len(parts) - 1, -1, -1):
+        cand = _strip_zip_seg(parts[idx])
+        if cand and _city_segment_plausible_for_city_state_field(cand):
+            city = cand
+            break
+    if not city:
+        w = before.split()
+        for n in range(4, 0, -1):
+            if len(w) >= n:
+                cand = " ".join(w[-n:])
+                if _city_segment_plausible_for_city_state_field(cand):
+                    city = cand
+                    break
+    if not city:
+        return ""
+    line = _finalize_city_state_no_zip(f"{city}, {st}")
+    if not line or hq_city_state_looks_like_filing_noise(line):
+        return ""
+    if re.search(r"\b\d{5}", line):
+        return ""
+    return line
+
+
 def hq_city_state_pipeline_only(hq: str | None) -> str:
     """
     Strict **city + state/region** for pipeline lists and ``issuer_hq_city_state`` materialization.
@@ -506,6 +606,9 @@ def hq_city_state_pipeline_only(hq: str | None) -> str:
     cs = hq_city_state_display(hq or "")
     if cs and pipeline_hq_city_state_label_ok(cs):
         return cs
+    fb = _hq_pipeline_city_state_zip_tail_fallback(hq or "")
+    if fb and pipeline_hq_city_state_label_ok(fb):
+        return fb
     return ""
 
 
@@ -761,6 +864,32 @@ def _segment_is_location_noise(seg: str) -> bool:
     return False
 
 
+def _hq_city_state_street_endswith_same_as_state_tail(clean: list[str]) -> str:
+    """
+    Two-part US lines where the street segment ends with the city name repeated as the state
+    (full state name + ZIP), e.g. ``85 Broad Street New York, New York 10004`` → ``New York, NY``.
+    """
+    if len(clean) < 2:
+        return ""
+
+    def _sz(seg: str) -> str:
+        return re.sub(r"\s+\d{5}(?:-\d{4})?\s*$", "", (seg or "").strip(), flags=re.I).strip()
+
+    last = _sz(clean[-1])
+    st = _us_state_abbr_from_token(last)
+    if not st:
+        return ""
+    if len(last) < 4:
+        return ""
+    prev = _sz(clean[-2])
+    if not prev.lower().endswith(last.lower()):
+        return ""
+    t = _finalize_city_state_no_zip(f"{last}, {st}")
+    if not t or hq_city_state_looks_like_filing_noise(t):
+        return ""
+    return t
+
+
 def _us_state_abbr_from_token(tok: str) -> Optional[str]:
     t = (tok or "").strip()
     m = re.match(r"^([A-Z]{2})(?:\s+\d{5}(?:-\d{4})?)?\s*$", t, re.I)
@@ -854,15 +983,20 @@ def hq_city_state_display(hq: str | None) -> str:
             and len(a2) <= 80
         ):
             return _emit(f"{a2}, {b2}")
-    one = _strip_zip_from_seg(clean[-1])
-    if len(one) <= 48 and not re.match(r"^\d", one):
-        if _segment_is_location_noise(one) or _MONTH_DAY_ONLY.match(one):
-            return ""
-        if _us_state_abbr_from_token(one):
-            return ""
-        if not _city_segment_plausible_for_city_state_field(one):
-            return ""
-        return _emit(one)
+        dup_hit = _hq_city_state_street_endswith_same_as_state_tail(clean)
+        if dup_hit:
+            return _emit(dup_hit)
+    if len(clean) == 1:
+        one = _strip_zip_from_seg(clean[-1])
+        # Single segment only — never treat as city if it looks like a full address fragment.
+        if len(one) <= 48 and not re.match(r"^\d", one) and not re.search(r"\d", one):
+            if _segment_is_location_noise(one) or _MONTH_DAY_ONLY.match(one):
+                return ""
+            if _us_state_abbr_from_token(one):
+                return ""
+            if not _city_segment_plausible_for_city_state_field(one):
+                return ""
+            return _emit(one)
     return ""
 
 
@@ -886,6 +1020,31 @@ def hq_principal_office_display_line(hq: str | None, *, max_len: int = 800) -> s
     ):
         return ""
     return s[:max_len]
+
+
+def issuer_hq_city_state_for_ui(hq_raw: str | None) -> str:
+    """
+    **City + state/region** for lead headers, company card, and pipeline — always derived from the
+    same canonical scrub as :func:`hq_principal_office_display_line` when that line is non-empty,
+    so compact location stays aligned with the full registrant address the user sees.
+    """
+    r = (hq_raw or "").strip()
+    if not r:
+        return ""
+    principal = (hq_principal_office_display_line(r) or "").strip()
+    for src in (principal, r):
+        if not src:
+            continue
+        cs = hq_city_state_pipeline_only(src)
+        if cs:
+            return cs
+        zt = _hq_pipeline_city_state_zip_tail_fallback(src)
+        if zt and _issuer_hq_city_state_ui_loose_ok(zt):
+            return zt
+        disp = hq_city_state_display(src)
+        if disp and _issuer_hq_city_state_ui_loose_ok(disp):
+            return disp
+    return ""
 
 
 def is_plausible_registrant_headquarters(hq: str | None) -> bool:

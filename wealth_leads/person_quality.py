@@ -52,6 +52,16 @@ def looks_like_role_only_line(s: str) -> bool:
         "counsel",
         "nominee",
         "division",
+        # Role blobs mis-ingested as person_name (capitalize like given names, fool _is_name_token).
+        "head of",
+        "operations and",
+        "finance and",
+        "marketing and",
+        "sales and",
+        "product and",
+        "technology and",
+        "managing director",
+        "general manager",
     )
     return any(k in t for k in keys)
 

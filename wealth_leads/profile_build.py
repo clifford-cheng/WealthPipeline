@@ -202,8 +202,13 @@ def _headline_comp_columns(p: dict) -> tuple[object, object, object, object]:
 
 def rebuild_lead_profiles(conn: sqlite3.Connection) -> dict[str, Any]:
     from wealth_leads.crm_ui import format_headquarters_for_ui
-    from wealth_leads.serve import _build_profiles, _lead_desk_filter_profiles
-    from wealth_leads.territory import hq_city_state_pipeline_only, hq_has_registrant_address_detail
+    from wealth_leads.serve import (
+        _best_issuer_headquarters_for_cik,
+        _build_profiles,
+        _lead_desk_filter_profiles,
+        is_plausible_registrant_headquarters,
+    )
+    from wealth_leads.territory import hq_has_registrant_address_detail, issuer_hq_city_state_for_ui
 
     profiles = _lead_desk_filter_profiles(_build_profiles(conn), conn)
     if not profiles:
@@ -221,6 +226,15 @@ def rebuild_lead_profiles(conn: sqlite3.Connection) -> dict[str, Any]:
     fmap = _neo_filing_map(conn, ciks)
     rows: list[tuple] = []
     built_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    hq_by_cik: dict[str, str] = {}
+
+    def _filing_canonical_hq(ck: str) -> str:
+        ck = (ck or "").strip()
+        if not ck:
+            return ""
+        if ck not in hq_by_cik:
+            hq_by_cik[ck] = (_best_issuer_headquarters_for_cik(conn, ck) or "").strip()
+        return hq_by_cik[ck]
 
     for p in profiles:
         cik = str(p.get("cik") or "").strip()
@@ -254,13 +268,20 @@ def rebuild_lead_profiles(conn: sqlite3.Connection) -> dict[str, Any]:
         summ = (p.get("issuer_summary") or "").strip()
         summ_ex = (summ[:600] + "…") if len(summ) > 600 else summ
         why_s = (p.get("why_surfaced") or "")[:500]
+        profile_hq = (p.get("issuer_headquarters") or "").strip()
+        best_hq = _filing_canonical_hq(cik)
+        unified_hq = (
+            best_hq
+            if best_hq and is_plausible_registrant_headquarters(best_hq)
+            else profile_hq
+        )
         search_blob = _materialized_search_text(
             display_name=(p.get("display_name") or "")[:400],
             title=(p.get("title") or "")[:400],
             company_name=(p.get("company_name") or "")[:400],
             person_norm=pn,
             cik=cik,
-            issuer_headquarters=(p.get("issuer_headquarters") or "")[:500],
+            issuer_headquarters=(unified_hq or "")[:500],
             issuer_industry=(p.get("issuer_industry") or "")[:500],
             why_surfaced=why_s,
             issuer_summary_excerpt=summ_ex,
@@ -273,8 +294,8 @@ def rebuild_lead_profiles(conn: sqlite3.Connection) -> dict[str, Any]:
             else None
         )
 
-        hq_line = format_headquarters_for_ui((p.get("issuer_headquarters") or ""))[:500]
-        hq_cs = (hq_city_state_pipeline_only(hq_line)[:120] if hq_line else "") or ""
+        hq_line = format_headquarters_for_ui(unified_hq)[:500]
+        hq_cs = (issuer_hq_city_state_for_ui(unified_hq)[:120] if unified_hq else "") or ""
         hq_detail = 1 if (hq_line and hq_has_registrant_address_detail(hq_line)) else 0
 
         rows.append(
@@ -288,7 +309,7 @@ def rebuild_lead_profiles(conn: sqlite3.Connection) -> dict[str, Any]:
                 acc[:32],
                 (pdoc or "")[:2000],
                 (fform or "")[:32],
-                (p.get("issuer_headquarters") or "")[:500],
+                (unified_hq or "")[:500],
                 (p.get("issuer_industry") or "")[:500],
                 (p.get("issuer_website") or "")[:500],
                 (idx or "")[:2000],
