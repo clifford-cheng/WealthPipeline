@@ -18,7 +18,11 @@ from wealth_leads.config import (
     submissions_8k_per_cik,
     sync_form_types,
 )
-from wealth_leads.compensation import NeoCompRow, extract_neo_compensation_from_s1
+from wealth_leads.compensation import (
+    NEO_COMP_PARSE_REVISION,
+    NeoCompRow,
+    extract_neo_compensation_from_s1,
+)
 from wealth_leads.beneficial_ownership import (
     STAKE_PARSE_REVISION,
     beneficial_owner_rows_for_db,
@@ -107,11 +111,14 @@ def _neo_comp_db_rows(
 
 
 def backfill_compensation(
-    *, force: bool = False, conn=None, session=None
+    *, force: bool = False, conn=None, session=None, cik: str | None = None
 ) -> int:
     """
     Fetch S-1 HTML again and parse NEO tables for filings missing comp rows
     (or all filings if force=True). Returns count of filings processed.
+
+    When ``force`` is false, also re-runs when ``neo_comp_parse_rev`` on the filing is
+    below ``NEO_COMP_PARSE_REVISION`` (summary-comp parser upgrades).
     """
     if session is None:
         session = requests.Session()
@@ -125,11 +132,17 @@ def backfill_compensation(
             FROM filings f
             WHERE f.primary_doc_url IS NOT NULL
             """
+        q_args: tuple = ()
+        ck = (cik or "").strip()
+        if ck:
+            q += " AND TRIM(f.cik) = ?"
+            q_args = (ck,)
         if not force:
-            # Re-fetch when NEO is missing, or when S-1 beneficial stakes were never filled (parser upgrades).
+            # Re-fetch when NEO is missing, parser revision bumped, or S-1 beneficial stakes need refresh.
             q += f"""
             AND (
               (SELECT COUNT(*) FROM neo_compensation WHERE filing_id = f.id) = 0
+              OR COALESCE(f.neo_comp_parse_rev, 0) < {NEO_COMP_PARSE_REVISION}
               OR (
                 UPPER(COALESCE(f.form_type, '')) LIKE 'S-1%'
                 AND NOT EXISTS (
@@ -147,7 +160,7 @@ def backfill_compensation(
             )
             """
         q += " ORDER BY f.filing_date DESC"
-        rows = c.execute(q).fetchall()
+        rows = c.execute(q, q_args).fetchall() if q_args else c.execute(q).fetchall()
         if not rows:
             print("Backfill compensation: nothing to do.", file=sys.stderr)
             return
@@ -657,6 +670,12 @@ def main() -> None:
         help="Re-fetch primary HTML for every filing with a doc URL (slow). Use after NEO or "
         "beneficial-ownership parser upgrades (writes beneficial_owner_stake + neo_compensation).",
     )
+    bf.add_argument(
+        "--cik",
+        type=str,
+        default=None,
+        help="Only filings for this CIK (digits). Combine with --force for a single-issuer refresh.",
+    )
 
     srv = sub.add_parser(
         "serve",
@@ -840,7 +859,10 @@ def main() -> None:
     elif args.cmd == "export-comp":
         export_compensation_csv()
     elif args.cmd == "backfill-comp":
-        n = backfill_compensation(force=bool(getattr(args, "force", False)))
+        n = backfill_compensation(
+            force=bool(getattr(args, "force", False)),
+            cik=getattr(args, "cik", None),
+        )
         print(f"Backfill finished ({n} filings processed).")
     elif args.cmd == "serve":
         from wealth_leads.serve import run_localhost

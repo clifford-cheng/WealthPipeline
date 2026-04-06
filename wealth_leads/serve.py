@@ -207,6 +207,20 @@ def _row_equity_usd(row: dict) -> float:
     return 0.0
 
 
+def _row_cash_pay_signal_usd(row: dict) -> float:
+    """Non-equity SCT bundle on one row (for pay bar when ``total`` is missing)."""
+    s = 0.0
+    for k in ("salary", "bonus", "non_equity_incentive", "pension_change", "other_comp"):
+        v = row.get(k)
+        if v is None:
+            continue
+        try:
+            s += float(v)
+        except (TypeError, ValueError):
+            pass
+    return s
+
+
 _NAME_SUFFIXES = frozenset({"jr", "sr", "ii", "iii", "iv", "v"})
 
 
@@ -563,16 +577,25 @@ def desk_sales_bundle_company_counts(profiles: list[dict]) -> tuple[int, int]:
 
 
 def filter_rows_sales_bundle(rows: list[Any], sales_bundle: str) -> list[Any]:
-    """Pipeline ``lead_profile`` rows: filter by premium vs economy tier."""
+    """
+    Pipeline ``lead_profile`` rows only (not the live desk).
+
+    ``sales_bundle=premium`` means NEO / summary-comp materialized rows (``lead_tier`` premium
+    or standard). ``economy`` is visibility-only and other non-SCT tiers. This matches the
+    pipeline label “Executive · verified” (verified SCT), not the desk pay-bar Exec SKU alone.
+    """
     cur = normalize_sales_bundle_query(sales_bundle)
     out: list[Any] = []
     for r in rows:
         lt = ""
         try:
-            lt = r["lead_tier"]
+            lt = str(r["lead_tier"] or "").strip().lower()
         except (KeyError, TypeError, IndexError):
             pass
-        if sales_bundle_from_lead_tier(lt) == cur:
+        is_neo_bundle = lt in ("premium", "standard")
+        if cur == "premium" and is_neo_bundle:
+            out.append(r)
+        elif cur == "economy" and not is_neo_bundle:
             out.append(r)
     return out
 
@@ -1535,7 +1558,8 @@ def _build_profiles(
                 pass
         # Pay bar, $1M+ filter, and desk sort use headline FY (same row as Latest total column),
         # not max across all fiscal years (older years can have higher equity/total).
-        signal_hwm = max(head_tot, head_eq)
+        head_cash = _row_cash_pay_signal_usd(head)
+        signal_hwm = max(head_tot, head_eq, head_cash)
         has_s1_comp = any(
             _is_s1_form_type(str(r.get("filing_form_type") or "")) for r in items
         )
@@ -2538,6 +2562,662 @@ def _comp_optional_align_details_html(stake: Optional[dict], p: dict) -> str:
     )
 
 
+def _primary_doc_url_for_profile(p: dict) -> str:
+    for row in p.get("year_breakdown") or []:
+        u = (row.get("primary_doc_url") or "").strip()
+        if u:
+            return u
+    return (p.get("primary_doc_url") or "").strip()
+
+
+def _fmt_share_count_cell(v: Any) -> str:
+    if v is None:
+        return "—"
+    try:
+        return f"{float(v):,.0f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _strike_price_cell(v: Any) -> str:
+    if v is None:
+        return "—"
+    try:
+        x = float(v)
+        if abs(x) < 1_000 and abs(x - round(x)) > 1e-6:
+            return f"${x:.2f}"
+        return f"${x:,.0f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _single_rs_implied_fmv_per_share(p: dict, grants: list[dict]) -> Optional[float]:
+    """Headline SCT Stock ($) ÷ single RS grant # from filing, if that pairing is unambiguous."""
+    if not grants or not p.get("has_summary_comp"):
+        return None
+    rs_rows = [
+        g
+        for g in grants
+        if g.get("shares_or_units") is not None
+        and "restrict" in str(g.get("award_type") or "").lower()
+    ]
+    if len(rs_rows) != 1:
+        return None
+    try:
+        sh = float(rs_rows[0]["shares_or_units"])
+        if sh <= 0:
+            return None
+    except (TypeError, ValueError, KeyError):
+        return None
+    fv = p.get("stock_awards")
+    if fv is None:
+        return None
+    try:
+        dollars = float(fv)
+    except (TypeError, ValueError):
+        return None
+    if dollars <= 0:
+        return None
+    return dollars / sh
+
+
+def _heuristic_common_price_anchor(
+    p: dict, grants: list[dict], stake: Optional[dict]
+) -> tuple[Optional[float], str]:
+    v = _single_rs_implied_fmv_per_share(p, grants)
+    if v is not None:
+        return v, "Headline SCT Stock ($) ÷ RS units in grant summary (if that FY line is only this award)"
+    if stake:
+        px, title = _offering_price_per_share_for_alignment(stake)
+        if px is not None and px > 0:
+            return px, title
+    return None, ""
+
+
+def _equity_anchor_kind(
+    p: dict, grants: list[dict], stake: Optional[dict], fmv: float
+) -> str:
+    """How ``fmv`` was chosen: SCT-implied from RS, offering price from stake, or unknown."""
+    if fmv <= 0:
+        return "unknown"
+    v = _single_rs_implied_fmv_per_share(p, grants)
+    if v is not None and abs(v - fmv) <= max(1e-9, fmv * 1e-6):
+        return "sct_rs_implied"
+    if stake:
+        px, _t = _offering_price_per_share_for_alignment(stake)
+        if px is not None and px > 0 and abs(px - fmv) <= max(1e-9, fmv * 1e-6):
+            return "offering"
+    return "unknown"
+
+
+def _build_advisor_equity_footnotes_html(
+    p: dict,
+    grants: list[dict],
+    stake: Optional[dict],
+    opts: list[dict],
+    *,
+    fmv: float,
+    fmv_src: str,
+    total_bo: Optional[float],
+    rs_sum: float,
+    opt_tranche_sum: float,
+    resid_shown: Optional[float],
+    first_opt: Optional[dict],
+    k_ref: Optional[float] = None,
+    k_ref_grant_date: str = "",
+    assume_k_non_option: bool = False,
+) -> str:
+    """
+    Two primary notes (¹ implied P, ² strike & spread) — no <ol> so numbers are not doubled.
+    Optional paragraphs per grant + residual tie-out below.
+    """
+    kind = _equity_anchor_kind(p, grants, stake, fmv)
+    fmv_disp = f"${fmv:,.2f}"
+    fy = p.get("headline_year")
+    fy_e = html.escape(str(fy)) if fy is not None else "headline"
+    sub1 = '<sub class="lead-eq-tn">1</sub>'
+    sub2 = '<sub class="lead-eq-tn">2</sub>'
+
+    # —— Note 1: implied P (assumption) ——
+    n1_core = ""
+    if kind == "sct_rs_implied":
+        rs_one = [
+            g
+            for g in grants
+            if g.get("shares_or_units") is not None
+            and "restrict" in str(g.get("award_type") or "").lower()
+        ]
+        if len(rs_one) == 1:
+            try:
+                sh = float(rs_one[0]["shares_or_units"])
+                sa = float(p.get("stock_awards") or 0)
+            except (TypeError, ValueError, KeyError):
+                sh, sa = 0.0, 0.0
+            if sh > 0 and sa > 0:
+                n1_core = (
+                    f"We use <strong>{html.escape(fmv_disp)}</strong> per share by taking fiscal {fy_e} "
+                    f"<strong>Stock ($)</strong> ({html.escape(_money(sa))}) ÷ "
+                    f"<strong>{sh:,.0f}</strong> RS units from the NEO grant table. "
+                    "<span class=\"dim\">Biased if Stock ($) embeds other equity.</span> "
+                )
+    elif kind == "offering":
+        title_e = html.escape(
+            (_offering_price_per_share_for_alignment(stake or {})[1] or "").strip()
+        )
+        n1_core = (
+            f"We use <strong>{html.escape(fmv_disp)}</strong> from the offering / beneficial-ownership "
+            f"disclosure ({title_e}). "
+        )
+    if not n1_core:
+        src_e = html.escape((fmv_src or "").strip()[:400])
+        n1_core = (
+            f"We use <strong>{html.escape(fmv_disp)}</strong> as the mark. "
+            f"<span class=\"dim\">{src_e or 'Source not classified — verify in filing.'}</span> "
+        )
+
+    note1 = (
+        f'<p class="lead-adv-foot-p" id="lead-adv-eq-note-1">{sub1} <strong>Per-share mark P.</strong> '
+        f"{n1_core}"
+        "<strong>Stock value at assumed price</strong> (shares × this P) is a scenario mark everywhere — "
+        "<strong>not</strong> grant-date fair value from the summary comp table and "
+        "<strong>not</strong> a market quote.</p>"
+    )
+
+    # —— Note 2: strike & spread ——
+    fo = first_opt
+    note2_body = ""
+    if fo is not None:
+        tr = (_try_float(fo.get("exercisable_shares")) or 0) + (
+            _try_float(fo.get("unexercisable_shares")) or 0
+        )
+        k = _try_float(fo.get("exercise_price_usd"))
+        if tr > 0 and k is not None:
+            iv = tr * max(0.0, fmv - k)
+            note2_body = (
+                f"<strong>Option row:</strong> K = {html.escape(_strike_price_cell(k))} from the "
+                "outstanding-award table. "
+                f"<strong>In-the-money value</strong> there (P−K)×Q = {tr:,.0f} × max(0, {fmv:.2f} − {k:.2f}) = "
+                f"<strong>{html.escape(_money(iv))}</strong> (pre-tax intrinsic at P from note 1; "
+                "no time value). "
+            )
+            if assume_k_non_option and k_ref is not None:
+                gd_e = html.escape(k_ref_grant_date or "—")
+                note2_body += (
+                    f"<strong>Elsewhere (subscript 2 only there):</strong> Total / RS / Other repeat the same K "
+                    f"({html.escape(_strike_price_cell(k_ref))}, grant {gd_e}) "
+                    "only so you can compare spreads side-by-side — "
+                    "<strong>not</strong> because the filing discloses those shares as that option. "
+                )
+        else:
+            note2_body = (
+                "<span class=\"dim\">Outstanding-option row parsed but no exercise price in the scrape — "
+                "in-the-money column is —.</span> "
+            )
+    else:
+        note2_body = (
+            "<span class=\"dim\">No outstanding option/SAR row matched this person in the HTML parse — "
+            "no filing strike or intrinsic spread.</span> "
+        )
+
+    note2 = (
+        f'<p class="lead-adv-foot-p" id="lead-adv-eq-note-2">{sub2} <strong>Strike K &amp; spread.</strong> {note2_body}</p>'
+    )
+
+    extras: list[str] = []
+
+    for g in grants:
+        if g.get("shares_or_units") is None:
+            continue
+        if "restrict" not in str(g.get("award_type") or "").lower():
+            continue
+        try:
+            n = float(g["shares_or_units"])
+        except (TypeError, ValueError):
+            continue
+        if n <= 0:
+            continue
+        aw = html.escape(str(g.get("award_type") or "Restricted stock"))
+        extras.append(
+            f'<p class="lead-adv-extra-p"><strong>{aw}</strong> (NEO grant table) — '
+            f"<strong>{n:,.0f}</strong> units. "
+            "<span class=\"dim\">Vested vs unvested and lock-up are in award / plan footnotes, "
+            "not in this HTML extract.</span></p>"
+        )
+
+    for o in opts:
+        gd = html.escape(str(o.get("grant_date") or "—"))
+        exp = html.escape(str(o.get("expiration") or "—").replace("\xa0", " ").strip())
+        exs = _fmt_share_count_cell(o.get("exercisable_shares"))
+        uns = _fmt_share_count_cell(o.get("unexercisable_shares"))
+        ks = html.escape(_strike_price_cell(o.get("exercise_price_usd")))
+        extras.append(
+            f'<p class="lead-adv-extra-p"><strong>Option / SAR</strong> (grant {gd}) — '
+            f"strike {ks}, expiration {exp}; table: exercisable {html.escape(exs)}, "
+            f"unexercisable {html.escape(uns)}. "
+            "<span class=\"dim\">Vesting schedule and cash vs stock settlement: filing footnotes.</span></p>"
+        )
+
+    if (
+        total_bo is not None
+        and total_bo > 0
+        and rs_sum + opt_tranche_sum > 0
+        and resid_shown is not None
+        and resid_shown >= 1.0
+    ):
+        extras.append(
+            f'<p class="lead-adv-extra-p"><strong>Residual (Other)</strong> — share tie-out: '
+            f"{total_bo:,.0f} − {rs_sum:,.0f} − {opt_tranche_sum:,.0f} = "
+            f"<strong>{resid_shown:,.0f}</strong>. "
+            "<span class=\"dim\">Ownership footnote usually explains what fills this bucket.</span></p>"
+        )
+    elif total_bo is not None and total_bo > 0 and rs_sum + opt_tranche_sum > 0:
+        sm = rs_sum + opt_tranche_sum
+        if abs(total_bo - sm) < 1.0:
+            extras.append(
+                f'<p class="lead-adv-extra-p"><strong>Share tie-out</strong> — RS + option units match '
+                f"beneficial total ({total_bo:,.0f}) within rounding.</p>"
+            )
+
+    extras.append(
+        '<p class="lead-adv-extra-p dim" style="margin-bottom:0">'
+        "<strong>Pay table</strong> Stock ($) / Options ($) columns are grant-date accounting — "
+        "different from the marks in this grid.</p>"
+    )
+
+    return (
+        '<div class="lead-adv-two-notes">'
+        f"{note1}{note2}"
+        "</div>"
+        f'<div class="lead-adv-eq-extras">{"".join(extras)}</div>'
+    )
+
+
+def _intrinsic_option_value_usd(
+    units: Optional[float], strike: Optional[float], fmv: float
+) -> Optional[float]:
+    if units is None or strike is None:
+        return None
+    try:
+        u = float(units)
+        k = float(strike)
+    except (TypeError, ValueError):
+        return None
+    if u <= 0:
+        return None
+    return u * max(0.0, fmv - k)
+
+
+def _eq_first_option_strike(opts: list[dict]) -> tuple[Optional[float], str]:
+    """First parsed exercise price from outstanding-option rows (grant date for footnotes)."""
+    for o in opts:
+        kk = _try_float(o.get("exercise_price_usd"))
+        if kk is not None:
+            return kk, str(o.get("grant_date") or "—").strip()
+    return None, ""
+
+
+def _eq_spread_td(q: float, k: Optional[float], fmv: float) -> str:
+    if k is None or q <= 0:
+        return '<td class="num lead-eq-muted">—</td>'
+    v = q * max(0.0, fmv - k)
+    return f'<td class="num">{html.escape(_money(v))}</td>'
+
+
+def _eq_sub_note1_html() -> str:
+    return (
+        '<a href="#lead-adv-eq-note-1" class="lead-eq-fn-anchor" title="Note 1 — per-share mark P">'
+        '<sub class="lead-eq-tn">1</sub></a>'
+    )
+
+
+def _eq_sub_note2_html() -> str:
+    return (
+        '<a href="#lead-adv-eq-note-2" class="lead-eq-fn-anchor" title="Note 2 — strike K and spread">'
+        '<sub class="lead-eq-tn">2</sub></a>'
+    )
+
+
+def _eq_strike_assumed_cell(k_ref: float) -> str:
+    ks = _strike_price_cell(k_ref)
+    return (
+        '<td class="num">'
+        f'<span class="lead-eq-assume-inner">{html.escape(ks)}{_eq_sub_note2_html()}</span>'
+        "</td>"
+    )
+
+
+def _eq_anchor_rs_grant_for_psh(
+    p: dict, grants: list[dict], stake: Optional[dict], fmv: float
+) -> Optional[dict]:
+    """When P = SCT Stock ($) ÷ a single RS line, that grant row; else None."""
+    if _equity_anchor_kind(p, grants, stake, fmv) != "sct_rs_implied":
+        return None
+    rs_one = [
+        g
+        for g in grants
+        if g.get("shares_or_units") is not None
+        and "restrict" in str(g.get("award_type") or "").lower()
+    ]
+    if len(rs_one) != 1:
+        return None
+    return rs_one[0]
+
+
+class _EqPshSourceRow:
+    """Exactly one row shows plain $/sh (filing source for P). All other rows get subscript 1 → note 1."""
+
+    def __init__(
+        self,
+        p: dict,
+        grants: list[dict],
+        stake: Optional[dict],
+        fmv: float,
+        total_bo: Optional[float],
+    ) -> None:
+        self.anchor_kind = _equity_anchor_kind(p, grants, stake, fmv)
+        self.anchor_rs = _eq_anchor_rs_grant_for_psh(p, grants, stake, fmv)
+        self._has_total = total_bo is not None and total_bo > 0
+        self._unknown_claimed = False
+
+    def total_is_p_source(self) -> bool:
+        if not self._has_total:
+            return False
+        return self.anchor_kind in ("offering", "unknown")
+
+    def rs_is_p_source(self, g: dict) -> bool:
+        if self.anchor_rs is not None and g is self.anchor_rs:
+            self._unknown_claimed = True
+            return True
+        if self.anchor_kind == "unknown" and not self._has_total and not self._unknown_claimed:
+            self._unknown_claimed = True
+            return True
+        return False
+
+    def opt_is_p_source(self) -> bool:
+        if self.anchor_kind != "unknown" or self._has_total or self._unknown_claimed:
+            return False
+        self._unknown_claimed = True
+        return True
+
+    def other_is_p_source(self) -> bool:
+        if self.anchor_kind != "unknown" or self._has_total or self._unknown_claimed:
+            return False
+        self._unknown_claimed = True
+        return True
+
+
+def _eq_psh_cell_html(fmv: float, *, annotate_repeat_p: bool) -> str:
+    """Filing row for P: plain $/sh. Every other row repeats that P → subscript 1 → note 1."""
+    dollars = html.escape(f"${fmv:,.2f}")
+    tail = _eq_sub_note1_html() if annotate_repeat_p else ""
+    return f'<td class="num mono">{dollars}{tail}</td>'
+
+
+def _advisor_equity_snapshot_table_html(
+    p: dict,
+    stake: Optional[dict],
+    grants: list[dict],
+    opts: list[dict],
+    *,
+    fmv: float,
+    fmv_source: str,
+) -> str:
+    """
+    Subscript 1 only where $/sh repeats P from note 1 (not on the one filing row that sources P).
+    Subscript 2 only where strike repeats option K for spread comparison (not on the option table row).
+    """
+    rows_html: list[str] = []
+    src_plain = (fmv_source or "").strip()
+    k_ref, k_ref_grant_d = _eq_first_option_strike(opts)
+    assume_k = k_ref is not None
+    first_opt: Optional[dict] = None
+    resid_shown: Optional[float] = None
+
+    total_bo: Optional[float] = None
+    if stake:
+        total_bo = _try_float(stake.get("shares_before_offering"))
+    psh_src = _EqPshSourceRow(p, grants, stake, fmv, total_bo)
+    if total_bo is not None and total_bo > 0:
+        tot_usd = total_bo * fmv
+        st_tot = _eq_strike_assumed_cell(k_ref) if assume_k else '<td class="num lead-eq-muted">—</td>'
+        sp_tot = (
+            _eq_spread_td(total_bo, k_ref, fmv) if assume_k else '<td class="num lead-eq-muted">—</td>'
+        )
+        rows_html.append(
+            '<tr class="lead-advisor-equity-total">'
+            '<td class="lead-eq-line"><strong>Total beneficial ownership</strong> '
+            '<span class="lead-eq-line-meta">(pre-offering)</span></td>'
+            f'<td class="num">{html.escape(f"{total_bo:,.0f}")}</td>'
+            f'{_eq_psh_cell_html(fmv, annotate_repeat_p=not psh_src.total_is_p_source())}'
+            f"{st_tot}"
+            f'<td class="num">{html.escape(_money(tot_usd))}</td>'
+            f"{sp_tot}"
+            "</tr>"
+        )
+
+    rs_sum = 0.0
+    for g in grants:
+        if g.get("shares_or_units") is None:
+            continue
+        if "restrict" not in str(g.get("award_type") or "").lower():
+            continue
+        try:
+            n = float(g["shares_or_units"])
+        except (TypeError, ValueError):
+            continue
+        if n <= 0:
+            continue
+        rs_sum += n
+        aw = html.escape(str(g.get("award_type") or "Restricted stock"))
+        usd = n * fmv
+        st_rs = _eq_strike_assumed_cell(k_ref) if assume_k else '<td class="num lead-eq-muted">—</td>'
+        sp_rs = _eq_spread_td(n, k_ref, fmv) if assume_k else '<td class="num lead-eq-muted">—</td>'
+        rows_html.append(
+            f'<tr><td class="lead-eq-line">{aw} <span class="lead-eq-line-meta">(NEO grant table)</span></td>'
+            f'<td class="num">{html.escape(f"{n:,.0f}")}</td>'
+            f'{_eq_psh_cell_html(fmv, annotate_repeat_p=not psh_src.rs_is_p_source(g))}'
+            f"{st_rs}"
+            f'<td class="num">{html.escape(_money(usd))}</td>'
+            f"{sp_rs}"
+            "</tr>"
+        )
+
+    opt_tranche_sum = 0.0
+    for o in opts:
+        ex = _try_float(o.get("exercisable_shares"))
+        un = _try_float(o.get("unexercisable_shares"))
+        k = _try_float(o.get("exercise_price_usd"))
+        ex = ex or 0.0
+        un = un or 0.0
+        tr = ex + un
+        if tr <= 0:
+            continue
+        opt_tranche_sum += tr
+        if first_opt is None:
+            first_opt = o
+        gd_raw = str(o.get("grant_date") or "—")
+        exp_raw = str(o.get("expiration") or "—").replace("\xa0", " ").strip()
+        exp_short = (exp_raw[:42] + "…") if len(exp_raw) > 45 else exp_raw
+        k_disp = _strike_price_cell(k) if k is not None else "—"
+        gross = tr * fmv
+        iv = 0.0
+        if ex > 0:
+            iv += _intrinsic_option_value_usd(ex, k, fmv) or 0.0
+        if un > 0:
+            iv += _intrinsic_option_value_usd(un, k, fmv) or 0.0
+        iv_cell = _money(iv) if iv > 0 else "—"
+        lab = (
+            "Option / SAR <span class=\"lead-eq-line-meta\">(grant "
+            f"{html.escape(gd_raw)}"
+        )
+        if exp_short and exp_short != "—":
+            lab += f"; exp. {html.escape(exp_short)}"
+        lab += ")</span>"
+        strike_td = f'<td class="num">{html.escape(k_disp)}</td>'
+        rows_html.append(
+            f'<tr><td class="lead-eq-line">{lab}</td>'
+            f'<td class="num">{html.escape(f"{tr:,.0f}")}</td>'
+            f'{_eq_psh_cell_html(fmv, annotate_repeat_p=not psh_src.opt_is_p_source())}'
+            f"{strike_td}"
+            f'<td class="num">{html.escape(_money(gross))}</td>'
+            f'<td class="num">{html.escape(iv_cell)}</td></tr>'
+        )
+
+    parsed_sum = rs_sum + opt_tranche_sum
+    if total_bo is not None and total_bo > 0 and parsed_sum > 0:
+        resid = total_bo - parsed_sum
+        if resid >= 1.0:
+            resid_shown = resid
+            st_ot = _eq_strike_assumed_cell(k_ref) if assume_k else '<td class="num lead-eq-muted">—</td>'
+            sp_ot = _eq_spread_td(resid, k_ref, fmv) if assume_k else '<td class="num lead-eq-muted">—</td>'
+            rows_html.append(
+                '<tr><td class="lead-eq-line">Other <span class="lead-eq-line-meta">(residual to total)</span></td>'
+                f'<td class="num">{html.escape(f"{resid:,.0f}")}</td>'
+                f'{_eq_psh_cell_html(fmv, annotate_repeat_p=not psh_src.other_is_p_source())}'
+                f"{st_ot}"
+                f'<td class="num">{html.escape(_money(resid * fmv))}</td>'
+                f"{sp_ot}"
+                "</tr>"
+            )
+        elif resid <= -1.0:
+            rows_html.append(
+                "<tr><td colspan=\"6\" class=\"dim\" style=\"font-size:0.72rem;line-height:1.45\">"
+                "<strong>Check:</strong> Parsed RS + option units exceed the beneficial total — "
+                "tables overlap in the filing footnotes. Do not sum breakout lines as if they were "
+                "mutually exclusive.</td></tr>"
+            )
+
+    if not rows_html:
+        return ""
+
+    caption = (
+        '<caption class="lead-adv-eq-cap dim" style="text-align:center;padding:0 0 0.4rem 0;'
+        'font-size:0.68rem;line-height:1.45;caption-side:top">'
+        "Not tax or legal advice.</caption>"
+    )
+    thead = (
+        "<thead><tr>"
+        '<th scope="col" class="lead-eq-line">Line</th>'
+        '<th scope="col" class="num">Shares</th>'
+        '<th scope="col" class="num">$/sh</th>'
+        '<th scope="col" class="num">Strike</th>'
+        '<th scope="col" class="num">Stock value at assumed price<br>'
+        '<span class="dim" style="font-weight:400;font-size:0.62em">shares × $/sh</span></th>'
+        '<th scope="col" class="num">Option spread at assumed price<br>'
+        '<span class="dim" style="font-weight:400;font-size:0.62em">(price − strike) × shares if in the money · pre-tax</span></th>'
+        "</tr></thead>"
+    )
+    foot_block = _build_advisor_equity_footnotes_html(
+        p,
+        grants,
+        stake,
+        opts,
+        fmv=fmv,
+        fmv_src=src_plain,
+        total_bo=total_bo,
+        rs_sum=rs_sum,
+        opt_tranche_sum=opt_tranche_sum,
+        resid_shown=resid_shown,
+        first_opt=first_opt,
+        k_ref=k_ref,
+        k_ref_grant_date=k_ref_grant_d,
+        assume_k_non_option=assume_k,
+    )
+    legend = (
+        '<p class="lead-adv-eq-legend dim" style="margin:0 0 0.4rem;font-size:0.68rem;line-height:1.5;'
+        'max-width:56rem;text-align:center">'
+        "<strong>Legend:</strong> "
+        "One body color for amounts. "
+        "<sub class=\"lead-eq-tn\">1</sub> on <strong>$/sh</strong> only where that row <em>repeats</em> P — the one row that <em>sources</em> P from the filing has no subscript (see note 1). "
+        "<sub class=\"lead-eq-tn\">2</sub> on <strong>strike</strong> only where K is <em>carried</em> from the option row — the option line’s strike from the award table has no subscript (see note 2).</p>"
+    )
+    foot_html = (
+        '<div class="lead-advisor-equity-footnotes" '
+        'style="font-size:0.7rem;line-height:1.55;max-width:56rem;margin-top:0.55rem">'
+        f"{legend}"
+        '<p class="lead-adv-eq-notes-hdr dim" style="margin:0.35rem 0 0.25rem 0;text-align:center">'
+        "<strong>Assumptions &amp; filing detail</strong></p>"
+        f"{foot_block}"
+        "</div>"
+    )
+    return (
+        '<div class="table-wrap lead-advisor-equity-wrap" style="margin-top:0.35rem">'
+        f'<table class="inner-comp lead-advisor-equity-snap">{caption}{thead}<tbody>'
+        + "".join(rows_html)
+        + "</tbody></table></div>"
+        + foot_html
+    )
+
+
+def _profile_outstanding_equity_from_filing_html(
+    p: dict, stake: Optional[dict] = None
+) -> str:
+    """
+    Pull outstanding option / RSU style tables from the same primary document as the SCT.
+    Best-effort: layouts vary; values are as in the filing (not fair-value $ from the SCT).
+    """
+    from wealth_leads.beneficial_ownership import beneficial_owner_row_matching_display_name
+    from wealth_leads.compensation import (
+        extract_outstanding_option_awards_from_s1,
+        extract_rsu_or_stock_award_grants_from_s1,
+        is_sec_archives_document_url,
+        load_edgar_primary_doc_html,
+    )
+
+    url = _primary_doc_url_for_profile(p)
+    nm = (p.get("display_name") or "").strip()
+    if not url or not nm or not is_sec_archives_document_url(url):
+        return ""
+    try:
+        doc_html = load_edgar_primary_doc_html(url)
+    except Exception:
+        return ""
+    opts = extract_outstanding_option_awards_from_s1(doc_html, nm)
+    grants = extract_rsu_or_stock_award_grants_from_s1(doc_html, nm)
+    if not opts and not grants:
+        return ""
+
+    stake_snap: dict[str, Any] = dict(stake) if stake else {}
+    sh_db = _try_float(stake_snap.get("shares_before_offering"))
+    if sh_db is None or sh_db <= 0:
+        bom = beneficial_owner_row_matching_display_name(doc_html, nm)
+        if bom:
+            merge_keys = (
+                "shares_before_offering",
+                "offering_price_used",
+                "offering_price_gross_usd",
+                "offering_underwriting_deduction_usd",
+            )
+            for key in merge_keys:
+                v = bom.get(key)
+                cur = stake_snap.get(key)
+                if cur in (None, 0, "") and v not in (None, "", 0):
+                    stake_snap[key] = v
+            if not (stake_snap.get("holder_name") or "").strip():
+                stake_snap["holder_name"] = bom.get("holder_name")
+
+    stake_for_anchor = stake_snap if stake_snap else None
+    fmv_a, fmv_src = _heuristic_common_price_anchor(p, grants, stake_for_anchor)
+    snap = ""
+    if fmv_a is not None and fmv_a > 0:
+        tb = _try_float(stake_snap.get("shares_before_offering"))
+        st_table = stake_snap if tb is not None and tb > 0 else None
+        snap = _advisor_equity_snapshot_table_html(
+            p, st_table, grants, opts, fmv=float(fmv_a), fmv_source=fmv_src
+        )
+    if not snap:
+        return ""
+    return (
+        '<div class="card lead-filing-equity-awards lead-filing-equity-hero" style="margin-top:0.5rem">'
+        '<h2 class="lead-section-h" style="font-size:1.08rem;margin:0 0 0.4rem">'
+        "Equity tie-out</h2>"
+        '<p class="meta dim" style="font-size:0.72rem;margin:0 0 0.35rem;line-height:1.45;max-width:56rem">'
+        "<sub class=\"lead-eq-tn\">1</sub> marks a <strong>$/sh</strong> that repeats P explained in note 1 — not the single filing row that defines P. "
+        "<sub class=\"lead-eq-tn\">2</sub> marks a <strong>strike</strong> carried from the option row (note 2) — not the option line’s own table strike.</p>"
+        f"{snap}</div>"
+    )
+
+
 def _profile_lead_compensation_card_html(
     p: dict,
     beneficial_stake: Optional[dict] = None,
@@ -2569,6 +3249,17 @@ def _profile_lead_compensation_card_html(
             f"{comp_html}</div></div></div>"
         )
 
+    def _s1_summary_comp_solo_card(comp_html: str) -> str:
+        return (
+            '<div class="card lead-s1-pay-bundle lead-s1-pay-bundle-solo" style="margin-top:0.65rem">'
+            '<h2 class="lead-section-h" style="font-size:1.02rem;margin:0 0 0.35rem">'
+            "Summary compensation</h2>"
+            '<p class="meta dim" style="font-size:0.72rem;margin:0 0 0.45rem;line-height:1.4">'
+            "Stock / Options are grant-date accounting dollars. Pre-offering share economics and "
+            "spreads are in the equity tie-out above.</p>"
+            f'<div class="lead-s1-pay-comp">{comp_html}</div></div>'
+        )
+
     if beneficial_only:
         return _profile_beneficial_equity_as_comp_html(
             p, beneficial_stake, filing_caveats=filing_caveats
@@ -2584,6 +3275,11 @@ def _profile_lead_compensation_card_html(
         obs if not beneficial_only else None, p
     )
     yb = p.get("year_breakdown") or []
+    equity_filing_html = (
+        _profile_outstanding_equity_from_filing_html(p, obs)
+        if has_sc and not beneficial_only
+        else ""
+    )
 
     if obs is not None and not beneficial_only:
         pos = _beneficial_stake_ownership_table_only_html(obs)
@@ -2597,6 +3293,10 @@ def _profile_lead_compensation_card_html(
                 ),
                 for_s1_bundle=True,
             )
+            if equity_filing_html:
+                return equity_filing_html + _s1_summary_comp_solo_card(
+                    f"{comp_frag}{align_html}"
+                )
             return _s1_bundle_shell(pos, f"{comp_frag}{align_html}")
         top = yb[0]
         doc_u = (top.get("primary_doc_url") or "").strip()
@@ -2621,6 +3321,8 @@ def _profile_lead_compensation_card_html(
             '<div class="table-wrap lead-comp-table-wrap lead-comp-history-wrap">'
             f"{tbl}</div>{foot}{align_html}"
         )
+        if equity_filing_html:
+            return equity_filing_html + _s1_summary_comp_solo_card(comp)
         return _s1_bundle_shell(pos, comp)
 
     if not yb:
@@ -2637,6 +3339,8 @@ def _profile_lead_compensation_card_html(
             lix = body.rfind("</div>")
             if lix != -1:
                 body = body[:lix] + align_html + body[lix:]
+        if equity_filing_html:
+            return equity_filing_html + body
         return body
 
     top = yb[0]
@@ -2655,7 +3359,7 @@ def _profile_lead_compensation_card_html(
         + "</p>"
     )
     tbl = _profile_breakdown_table(p)
-    return (
+    breakout = (
         '<div class="lead-comp-breakout-wrap card">'
         '<h2 class="lead-section-h">Summary compensation (year by year)</h2>'
         '<p class="meta dim" style="font-size:0.7rem;margin:0 0 0.4rem;line-height:1.35">'
@@ -2663,6 +3367,9 @@ def _profile_lead_compensation_card_html(
         '<div class="table-wrap lead-comp-table-wrap lead-comp-history-wrap">'
         f"{tbl}</div>{foot}{align_html}</div>"
     )
+    if equity_filing_html:
+        return equity_filing_html + breakout
+    return breakout
 
 
 def _profile_lead_url(p: dict) -> str:
@@ -2742,10 +3449,13 @@ def beneficial_stake_row_matching_officer_profile(
     """
     if _is_beneficial_only_lead(p):
         return None
+    from wealth_leads.compensation import _person_cell_matches_name
+
     ck = str(p.get("cik") or "").strip()
     want = (p.get("norm_name") or "").strip() or _norm_person_name(
         p.get("display_name") or ""
     )
+    disp = (p.get("display_name") or "").strip()
     if not ck or not want:
         return None
     best: Optional[dict] = None
@@ -2755,7 +3465,9 @@ def beneficial_stake_row_matching_officer_profile(
         hn = (d.get("holder_name") or "").strip()
         tier = _officer_name_match_tier(want, _norm_person_name(hn))
         if tier < 0:
-            continue
+            if not disp or not _person_cell_matches_name(hn, disp):
+                continue
+            tier = 2
         g1 = int(d.get("gem_score") or 0)
         try:
             n1 = float(d.get("notional_usd_est") or 0)
@@ -4089,6 +4801,90 @@ def _shared_css() -> str:
     table.inner-comp th { background: #0c1016; color: #8b96a3; font-weight: 600; padding: 0.35rem 0.45rem; border-bottom: 1px solid #2a3340; }
     table.inner-comp td { padding: 0.35rem 0.45rem; border-bottom: 1px solid #1a2228; }
     table.inner-comp tbody tr:hover td { background: #0f141a; }
+    table.lead-advisor-equity-snap tr.lead-advisor-equity-total td {
+      background: #141c26;
+      border-bottom: 1px solid #2f4a62;
+      font-weight: 500;
+    }
+    table.lead-advisor-equity-snap sub.lead-eq-tn {
+      font-size: 0.58em;
+      line-height: 1;
+      font-weight: 600;
+      color: #7ec8f5;
+      vertical-align: sub;
+    }
+    .lead-filing-equity-hero sub.lead-eq-tn,
+    .lead-advisor-equity-footnotes sub.lead-eq-tn {
+      font-size: 0.62em;
+      line-height: 1;
+      font-weight: 600;
+      color: #7ec8f5;
+      vertical-align: sub;
+    }
+    table.lead-advisor-equity-snap a.lead-eq-fn-anchor,
+    .lead-advisor-equity-footnotes a.lead-eq-fn-anchor {
+      color: inherit;
+      text-decoration: none;
+    }
+    table.lead-advisor-equity-snap a.lead-eq-fn-anchor:hover sub.lead-eq-tn,
+    .lead-advisor-equity-footnotes a.lead-eq-fn-anchor:hover sub.lead-eq-tn {
+      text-decoration: underline;
+    }
+    p.lead-adv-foot-p[id^="lead-adv-eq-note-"] { scroll-margin-top: 0.75rem; }
+    table.lead-advisor-equity-snap td.mono { font-variant-numeric: tabular-nums; }
+    .lead-advisor-equity-wrap {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      width: 100%;
+    }
+    table.lead-advisor-equity-snap {
+      width: auto;
+      max-width: 100%;
+      min-width: min(100%, 52rem);
+      margin-left: auto;
+      margin-right: auto;
+    }
+    table.lead-advisor-equity-snap th,
+    table.lead-advisor-equity-snap td {
+      vertical-align: middle;
+    }
+    table.lead-advisor-equity-snap th.num,
+    table.lead-advisor-equity-snap td.num {
+      text-align: center;
+    }
+    table.lead-advisor-equity-snap th.lead-eq-line,
+    table.lead-advisor-equity-snap td.lead-eq-line {
+      text-align: left;
+      padding-left: 0.55rem;
+    }
+    table.lead-advisor-equity-snap td.num { color: #e8ecf0; }
+    .lead-eq-filing { color: #9fd4a8; font-weight: 500; }
+    .lead-eq-implied { color: #7ec8f5; font-weight: 500; }
+    table.lead-advisor-equity-snap td.lead-eq-line .lead-eq-line-meta {
+      color: #e8ecf0;
+      font-weight: 400;
+    }
+    .lead-eq-assume-inner { white-space: nowrap; }
+    table.lead-advisor-equity-snap .lead-eq-assume-inner .lead-eq-fn-anchor sub.lead-eq-tn {
+      margin-left: 0.1em;
+    }
+    .lead-eq-muted { color: #5c6775 !important; font-weight: 400; }
+    .lead-advisor-equity-footnotes { color: #b8c0c8; }
+    .lead-adv-two-notes { max-width: 52rem; margin: 0 auto; }
+    .lead-adv-foot-p { margin: 0 0 0.5rem 0; line-height: 1.55; text-align: left; }
+    .lead-adv-eq-extras {
+      margin-top: 0.65rem; padding-top: 0.55rem; border-top: 1px solid #2a3340;
+      max-width: 52rem; margin-left: auto; margin-right: auto;
+    }
+    .lead-adv-extra-p { margin: 0 0 0.42rem 0; line-height: 1.5; font-size: 0.68rem; text-align: left; }
+    .lead-advisor-equity-footnotes .lead-eq-filing { color: #9fd4a8; }
+    .lead-advisor-equity-footnotes .lead-eq-implied { color: #7ec8f5; }
+    .lead-filing-equity-hero {
+      border-left: 3px solid #238636;
+      background: linear-gradient(180deg, #0f1712 0%, #101820 55%);
+    }
+    .lead-s1-pay-bundle-solo .lead-s1-pay-comp { max-width: 100%; }
     .hero { display: grid; gap: 0.75rem; margin-bottom: 1rem; }
     @media (min-width: 640px) { .hero { grid-template-columns: 1fr 1fr; } }
     @media (min-width: 900px) { .hero { grid-template-columns: repeat(4, 1fr); } }

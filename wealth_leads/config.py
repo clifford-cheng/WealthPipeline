@@ -294,7 +294,7 @@ def require_app_auth() -> bool:
 
 def user_may_view_pipeline_exec_bundle(user: dict) -> bool:
     """
-    Who may open ``/pipeline/company?...&sales_bundle=premium`` (exec / pay-bar roster).
+    Who may open ``/pipeline/company?...&sales_bundle=premium`` (NEO / verified SCT roster).
 
     Admins always qualify. Otherwise set ``WEALTH_LEADS_EXEC_BUNDLE_EMAIL_ALLOWLIST`` to a
     comma-separated list of advisor emails, or ``WEALTH_LEADS_PIPELINE_EXEC_BUNDLE_ALL_ADVISORS=1``

@@ -44,6 +44,7 @@ def _prepare_sqlite_connection(conn: sqlite3.Connection) -> None:
     _migrate_filings_issuer_industry(conn)
     _migrate_filings_s1_llm_lead_pack(conn)
     _migrate_filings_issuer_scale_text(conn)
+    _migrate_filings_neo_comp_parse_rev(conn)
     _migrate_app_auth(conn)
     _migrate_allocation_system(conn)
     _migrate_lead_profile(conn)
@@ -207,6 +208,14 @@ def _migrate_filings_issuer_scale_text(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE filings ADD COLUMN issuer_revenue_text TEXT")
     if "issuer_employees_text" not in cols:
         conn.execute("ALTER TABLE filings ADD COLUMN issuer_employees_text TEXT")
+
+
+def _migrate_filings_neo_comp_parse_rev(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(filings)").fetchall()}
+    if "neo_comp_parse_rev" not in cols:
+        conn.execute(
+            "ALTER TABLE filings ADD COLUMN neo_comp_parse_rev INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def _migrate_app_auth(conn: sqlite3.Connection) -> None:
@@ -553,8 +562,11 @@ def replace_neo_compensation(
             """,
             rows,
         )
+    from wealth_leads.compensation import NEO_COMP_PARSE_REVISION
+
     conn.execute(
-        "UPDATE filings SET compensation_extracted = 1 WHERE id = ?", (filing_id,)
+        "UPDATE filings SET compensation_extracted = 1, neo_comp_parse_rev = ? WHERE id = ?",
+        (NEO_COMP_PARSE_REVISION, filing_id),
     )
 
 

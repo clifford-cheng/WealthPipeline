@@ -717,6 +717,38 @@ def extract_beneficial_owner_rows(html: str) -> list[dict[str, Any]]:
     return sorted(by_key.values(), key=lambda r: (-int(r["gem_score"]), -(r["notional_usd_est"] or 0)))
 
 
+def beneficial_owner_row_matching_display_name(
+    html: str, display_name: str
+) -> Optional[dict[str, Any]]:
+    """
+    Best *person* row from beneficial-ownership tables whose holder name matches
+    ``display_name`` using the same loose match as NEO grant / option HTML parsers.
+    Used when the DB officer↔stake link is missing but the primary document is loaded.
+    """
+    from wealth_leads.compensation import _person_cell_matches_name
+
+    dn = (display_name or "").strip()
+    if not dn:
+        return None
+    rows = extract_beneficial_owner_rows(html)
+    best: Optional[dict[str, Any]] = None
+    best_sh = -1.0
+    for r in rows:
+        if (r.get("holder_kind") or "") != "person":
+            continue
+        hn = (r.get("holder_name") or "").strip()
+        if not hn or not _person_cell_matches_name(hn, dn):
+            continue
+        try:
+            fv = float(r.get("shares_before_offering") or 0)
+        except (TypeError, ValueError):
+            fv = 0.0
+        if fv > best_sh:
+            best_sh = fv
+            best = r
+    return best
+
+
 def beneficial_owner_rows_for_db(html: str) -> list[dict[str, Any]]:
     """Alias for sync — only individual gems are surfaced in UI; entities stored with low scores."""
     return extract_beneficial_owner_rows(html)

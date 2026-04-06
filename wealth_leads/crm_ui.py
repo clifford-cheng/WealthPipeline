@@ -626,20 +626,23 @@ def _pl_bundle_numeric_data_attr(v: Any) -> str:
         return ""
 
 
-def _lead_profile_row_sales_bundle_bucket(r: Any) -> str:
-    """Match ``serve.sales_bundle_from_lead_tier`` for materialized pipeline rows."""
+def _pipeline_row_exec_verified_bundle(r: Any) -> str:
+    """
+    Pipeline index grouping: ``premium`` URL = NEO / summary-comp rows (``lead_tier`` premium
+    or standard). ``economy`` = visibility-only (no SCT row). See ``serve.filter_rows_sales_bundle``.
+    """
     lt = ""
     try:
-        lt = r["lead_tier"]
+        lt = str(r["lead_tier"] or "").strip().lower()
     except (KeyError, TypeError, IndexError):
         pass
-    return "premium" if str(lt or "").strip().lower() == "premium" else "economy"
+    return "premium" if lt in ("premium", "standard") else "economy"
 
 
 def _filter_members_for_sales_bundle(members: list[Any], sales_bundle: str) -> list[Any]:
     sb = str(sales_bundle or "").strip().lower().replace("-", "_")
     want = "economy" if sb == "economy" else "premium"
-    return [r for r in members if _lead_profile_row_sales_bundle_bucket(r) == want]
+    return [r for r in members if _pipeline_row_exec_verified_bundle(r) == want]
 
 
 def pipeline_cash_excl_equity_from_row(r: Any) -> float | None:
@@ -658,7 +661,11 @@ def pipeline_cash_excl_equity_from_row(r: Any) -> float | None:
         if v is not None:
             s += v
             n += 1
-    return s if n > 0 else None
+    if n > 0:
+        return s
+    if stk is not None:
+        return 0.0
+    return None
 
 
 def _pipeline_bundle_summary_block_html(
@@ -945,8 +952,8 @@ def _expand_pipeline_bundles_to_exec_other_skus(
     bundles: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """
-    Turn one row per CIK into up to two sellable bundles: Exec (premium) and Other (economy).
-    Preserves company order from ``bundles``; within each company, Exec then Other.
+    Turn one row per CIK into up to two pipeline bundles: NEO/SCT (``sales_bundle=premium``)
+    and visibility-only (``economy``). Preserves company order; within each company, premium then economy.
     """
     out: list[dict[str, Any]] = []
     for parent in bundles:
@@ -1739,13 +1746,13 @@ def render_pipeline_review_page(
     )
     if tt == "exec":
         active_hint = (
-            "Showing executive-tier bundles only. Open Standard for the other product."
+            "Showing NEO / summary-comp (verified SCT) bundles only. Open Standard for visibility-only officers."
         )
         active_bundles = sku_premium
         empty_msg = "No executive bundles in this window."
     else:
         active_hint = (
-            "Showing standard-tier bundles only. Open Executive · verified for the other product."
+            "Showing visibility-only bundles (no SCT row). Open Executive · verified for summary comp."
         )
         active_bundles = sku_economy
         empty_msg = "No standard bundles in this window."
@@ -1812,7 +1819,7 @@ def render_pipeline_review_page(
   <dl>
     <dt>People / Filed</dt><dd>Counts and latest filing date from materialized <code>lead_profile</code> rows.</dd>
     <dt>Σ Cash / Σ Stock</dt><dd>Sums per bundle row for the active tab’s materialized tier — a practical proxy for scale alongside listing and people count.</dd>
-    <dt>Tabs</dt><dd><strong>Executive · verified</strong> and <strong>Standard</strong> are separate views (<code>tier=exec</code> or <code>tier=standard</code>). Only one tier’s companies load per page. Company drill-in still uses <code>sales_bundle</code>; omitting it defaults to standard roster. Executive roster access may be restricted by configuration.</dd>
+    <dt>Tabs</dt><dd><strong>Executive · verified</strong> lists issuers with at least one NEO / summary-comp row (<code>lead_tier</code> premium or standard). <strong>Standard</strong> lists visibility-only officers (no SCT in DB). Company drill-in uses <code>sales_bundle=premium|economy</code> with the same split. Executive roster access may be restricted by configuration.</dd>
     <dt>signal_hwm</dt><dd>In CSV: headline comp signal used for desk pay-bar; see <code>WEALTH_LEADS_LEAD_DESK_MIN_SIGNAL_USD</code>.</dd>
     <dt>Search</dt><dd>Full-text on <code>search_text</code> when available; otherwise LIKE. Rebuild profiles after sync to refresh the index.</dd>
   </dl>
@@ -1992,9 +1999,9 @@ def render_pipeline_company_page(
         sb = "economy"
     if sb == "premium":
         page_h2 = "Executive roster"
-        page_sub = "Executive-tier profiles for this issuer (your exec product)."
+        page_sub = "NEO / summary-comp profiles (verified SCT) for this issuer."
         title_suffix = "Executive roster"
-        empty_msg = "No executive-tier profiles in this company for the current window."
+        empty_msg = "No NEO / summary-comp profiles in this company for the current window."
     else:
         page_h2 = "Roster"
         page_sub = "People for this issuer in your current filing window."
