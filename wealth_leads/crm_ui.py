@@ -7,6 +7,7 @@ import re
 from typing import Any
 from urllib.parse import quote, urlencode
 
+from wealth_leads.config import advisor_ui_product_name
 from wealth_leads.serve import (
     _norm_person_name,
     normalize_listing_stage_query,
@@ -314,12 +315,12 @@ code{{font-size:0.78rem;background:#0a0e12;padding:0.1rem 0.35rem;border-radius:
 pre.log{{white-space:pre-wrap;word-break:break-word;font-size:0.72rem;background:#0a0e12;padding:0.5rem;border-radius:4px;max-height:12rem;overflow:auto;border:1px solid #2a3340}}
 </style></head><body{body_attr}>
 <h1>Admin — territories & allocation</h1>
-<p class="meta"><a href="/my-leads">My assigned leads</a> · <a href="/admin/pipeline"><strong>Pipeline review</strong></a> · <a href="/admin/desk">Full lead desk</a> · <a href="/admin/finder">Finder</a></p>
+<p class="meta"><a href="/my-leads">My leads</a> · <a href="/admin/desk">Desk</a> · <a href="/admin/pipeline">Pipeline</a> · <a href="/admin/finder">Finder</a></p>
 {msg}
 {sync_note}
 <div class="card">
 <h2 style="margin-top:0;font-size:1rem">SEC data — sync from here</h2>
-<p class="meta">Sync loads SEC filings and rebuilds <code>lead_profile</code>. <a href="/admin/pipeline">Pipeline</a> · desk · finder.</p>
+<p class="meta">Sync loads SEC filings and rebuilds <code>lead_profile</code>. Browse from <a href="/admin/desk">desk</a> or <a href="/admin/pipeline">pipeline</a> after.</p>
 <p class="meta"><strong>Filings in DB:</strong> {_esc(filing_count) if filing_count is not None else "unknown"}</p>
 <form method="post" action="/admin/sync" style="display:flex;flex-wrap:wrap;gap:0.75rem;align-items:center;margin-top:0.5rem">
 <button type="submit" style="padding:0.45rem 0.9rem;border-radius:4px;border:none;background:#238636;color:#fff;cursor:pointer;font-weight:600" {"disabled" if sync_running else ""}>Run SEC sync now</button>
@@ -1221,10 +1222,9 @@ body {
   color: var(--amber);
 }
 .pl-logo {
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  font-size: 0.72rem;
-  text-transform: uppercase;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  font-size: 0.78rem;
   color: var(--amber);
 }
 .pl-title { font-size: 1.15rem; font-weight: 600; letter-spacing: -0.02em; }
@@ -1798,13 +1798,13 @@ def render_pipeline_review_page(
     csv_href = f"{_esc(pipeline_path)}.csv?{urlencode({k: v for k, v in csv_qs.items() if v})}"
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Company pipeline — {_esc(tab_title)} · WealthPipeline</title>
+<title>Company pipeline — {_esc(tab_title)} · {_esc(advisor_ui_product_name())}</title>
 <style>
 {PIPELINE_PAGE_CSS}</style></head><body>
 <div class="pl-shell">
 <header class="pl-head">
   <div class="pl-brand">
-    <span class="pl-logo">WealthPipeline</span>
+    <span class="pl-logo">{_esc(advisor_ui_product_name())}</span>
     <span class="pl-title">Company pipeline</span>
     <span class="pl-sub dim">{summary_line}</span>
   </div>
@@ -2069,7 +2069,7 @@ def render_pipeline_company_page(
     sub_esc = _esc(page_sub)
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>{_esc(company_name)} — {_esc(title_suffix)} · WealthPipeline</title>
+<title>{_esc(company_name)} — {_esc(title_suffix)} · {_esc(advisor_ui_product_name())}</title>
 <style>
 {PIPELINE_PAGE_CSS}
 </style></head><body>

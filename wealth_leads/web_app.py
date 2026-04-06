@@ -33,6 +33,7 @@ from fastapi.responses import (
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 from wealth_leads.config import (
+    advisor_ui_product_name,
     app_allow_public_signup,
     app_secret_key,
     database_path,
@@ -40,7 +41,6 @@ from wealth_leads.config import (
     require_app_auth,
     user_may_view_pipeline_exec_bundle,
 )
-from wealth_leads.advisor_pack import get_issuer_snapshot_dict
 from wealth_leads.allocation import assign_for_cycle, assignments_to_display_rows
 from wealth_leads.crm_ui import (
     format_headquarters_for_ui,
@@ -68,7 +68,6 @@ from wealth_leads.db import (
     list_lead_advisor_feedback,
     list_lead_suppress,
     list_beneficial_owner_gems_for_filing_ids,
-    list_beneficial_owner_outreach_targets_for_cik,
     list_lead_profiles_for_review,
     list_user_watchlist,
     update_allocation_settings,
@@ -380,10 +379,8 @@ from wealth_leads.serve import (
     _build_profiles,
     _dev_state_body,
     enrich_pipeline_rows_registrant_hq,
-    _filings_for_profile,
     _find_profile,
     _latest_filing_snapshot_caveats_for_cik,
-    _latest_important_people_from_s1_llm_pack,
     _lead_desk_filter_profiles,
     _lead_page_db_stats,
     _load_page_data,
@@ -396,6 +393,7 @@ from wealth_leads.serve import (
     _page_lead,
     _profile_lead_tier,
     _profile_lead_url,
+    lead_company_roster_back_href,
     beneficial_stake_detail_for_profile,
     beneficial_stake_row_matching_officer_profile,
     filter_profiles_geo_industry_text,
@@ -431,9 +429,10 @@ _SYNTHETIC_REVIEW_USER: dict = {
 }
 
 def _compliance_footer_html() -> str:
+    pn = html_module.escape(advisor_ui_product_name())
     return f"""
 <footer style="margin:2rem 1rem;font-size:0.72rem;color:#6b7785;max-width:52rem;line-height:1.5;border-top:1px solid #2a3340;padding-top:1rem">
-<strong>Important.</strong> WealthPipeline surfaces public SEC filing text and extracted fields for research workflows.
+<strong>Important.</strong> {pn} surfaces public SEC filing text and extracted fields for research workflows.
 It is <strong>not</strong> investment advice, a recommendation, or a solicitation. Filings may be amended; numbers and narratives
 are only as accurate as the underlying parser and your sync time. You are responsible for your own compliance (e.g. RIA marketing
 and recordkeeping). Verify material facts in the official EDGAR filing.
@@ -444,9 +443,10 @@ Restart the app after editing Python files (or set <code>WEALTH_LEADS_UVICORN_RE
 
 _TOP_NAV_CSS = """
 <style>
-.wl-top { background:#121820;border-bottom:1px solid #2a3340;padding:0.5rem 1rem;font-size:0.8125rem;display:flex;flex-wrap:wrap;gap:0.75rem;align-items:center;justify-content:space-between }
+.wl-top { background:#0d1117;border-bottom:1px solid #2e3847;padding:0.55rem 1.1rem;font-size:0.8125rem;display:flex;flex-wrap:wrap;gap:0.75rem;align-items:center;justify-content:space-between }
 .wl-top a { color:#5eb3e0; text-decoration:none }
 .wl-top a:hover { text-decoration:underline }
+.wl-top .wl-brand { letter-spacing:0.04em; font-weight:650; color:#f0f4f8 }
 .wl-top .wl-actions form { display:inline }
 .wl-top button { background:#1a2634;border:1px solid #2a3340;color:#d8dee4;border-radius:4px;padding:0.2rem 0.5rem;cursor:pointer;font:inherit;font-size:0.75rem }
 .wl-top button:hover { background:#243044 }
@@ -455,7 +455,7 @@ _TOP_NAV_CSS = """
 
 
 def _serializer(secret: str) -> URLSafeTimedSerializer:
-    return URLSafeTimedSerializer(secret, salt="wealthpipeline-auth")
+    return URLSafeTimedSerializer(secret, salt="equitysignal-auth")
 
 
 def _safe_next(path: str) -> str:
@@ -514,26 +514,32 @@ def _pipeline_url_path() -> str:
     return "/admin/pipeline" if require_app_auth() else "/pipeline"
 
 
+def _lead_page_back_nav(user: dict) -> tuple[str, str]:
+    """Full desk index from a lead profile (vs company roster when ref=co)."""
+    if not user.get("is_admin"):
+        return "/my-leads", "My leads"
+    return "/admin/desk", "All leads"
+
+
 def _inject_chrome(page_html: str, user: dict) -> str:
     email = html_module.escape(str(user.get("email") or ""))
+    brand = (
+        f'<span class="wl-brand">{html_module.escape(advisor_ui_product_name())}</span>'
+    )
     if user.get("_synthetic"):
-        pp = _pipeline_url_path()
-        center = (
-            f'<a href="{pp}"><strong>Pipeline</strong></a> · '
-            '<a href="/admin/desk">Desk</a> · <a href="/admin/finder">Finder</a> · '
-            f'<a href="{pp}.csv">Pipeline CSV</a> · '
-            '<a href="/admin">Sync &amp; settings</a>'
-        )
+        # No dense nav: desk/finder/pipeline/CSV/sync remain at their URLs and in-page links.
+        center = brand
         right = (
             f'<span style="color:#8b96a3">{email}</span> · '
-            '<a href="/login">Sign in</a> <span style="color:#6b7785">(set WEALTH_LEADS_REQUIRE_AUTH=1)</span>'
+            '<a href="/login" title="Enable WEALTH_LEADS_REQUIRE_AUTH=1 on the server to require sign-in">'
+            "Sign in</a>"
         )
     elif user.get("is_admin"):
         center = (
-            '<a href="/my-leads">My leads</a> · <a href="/admin">Admin</a> · '
-            '<a href="/admin/pipeline">Pipeline</a> · '
-            '<a href="/admin/desk">Desk</a> · <a href="/admin/finder">Finder</a> · '
-            '<a href="/watchlist">Watchlist</a> · <a href="/export/my-leads.csv">My CSV</a>'
+            f"{brand} · "
+            '<a href="/my-leads">My leads</a> · '
+            '<a href="/admin" title="Sync, pipeline, desk, finder, settings">Admin</a> · '
+            '<a href="/watchlist">Watchlist</a>'
         )
         right = (
             f'<span style="color:#8b96a3">{email}</span> · '
@@ -541,6 +547,7 @@ def _inject_chrome(page_html: str, user: dict) -> str:
         )
     else:
         center = (
+            f"{brand} · "
             '<a href="/my-leads">My leads</a> · '
             '<a href="/export/my-leads.csv">Export CSV</a>'
         )
@@ -599,7 +606,7 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="WealthPipeline",
+    title=advisor_ui_product_name(),
     docs_url=None,
     redoc_url=None,
     lifespan=_lifespan,
@@ -630,7 +637,7 @@ async def _no_cache_html_for_dev(request: Request, call_next):
     Set WEALTH_LEADS_ALLOW_BROWSER_CACHE=1 to allow caching (not typical for this app).
     """
     response = await call_next(request)
-    response.headers["X-WealthPipeline-Server"] = "advisor"
+    response.headers["X-EquitySignal-Server"] = "advisor"
     if os.environ.get("WEALTH_LEADS_ALLOW_BROWSER_CACHE", "").strip().lower() in (
         "1",
         "true",
@@ -671,13 +678,13 @@ async def login_get(request: Request, next: str = "/my-leads") -> HTMLResponse:
             "To require sign-in later, set <code>WEALTH_LEADS_REQUIRE_AUTH=1</code> and restart.</p>"
         )
     return HTMLResponse(
-        f"""<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Sign in — WealthPipeline</title>
+        f"""<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Sign in — {html_module.escape(advisor_ui_product_name())}</title>
 <style>body{{font-family:system-ui;background:#0d1117;color:#e8ecf0;max-width:24rem;margin:3rem auto;padding:1rem}}
 label{{display:block;margin:0.5rem 0 0.2rem;color:#8b96a3;font-size:0.8rem}}
 input{{width:100%;padding:0.45rem;border-radius:4px;border:1px solid #2a3340;background:#0a0e12;color:#e8ecf0}}
 button{{margin-top:1rem;padding:0.5rem 1rem;border-radius:4px;border:none;background:#238636;color:#fff;cursor:pointer;width:100%}}
 a{{color:#58a6ff}}</style></head><body>
-<h1>WealthPipeline</h1>
+<h1>{html_module.escape(advisor_ui_product_name())}</h1>
 {data_mode}
 <p>Sign in with your advisor account.</p>
 {msg}
@@ -741,7 +748,7 @@ async def register_get(request: Request) -> HTMLResponse:
             status_code=403,
         )
     return HTMLResponse(
-        f"""<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Register — WealthPipeline</title>
+        f"""<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Register — {html_module.escape(advisor_ui_product_name())}</title>
 <style>body{{font-family:system-ui;background:#0d1117;color:#e8ecf0;max-width:24rem;margin:3rem auto;padding:1rem}}
 label{{display:block;margin:0.5rem 0 0.2rem;color:#8b96a3;font-size:0.8rem}}
 input{{width:100%;padding:0.45rem;border-radius:4px;border:1px solid #2a3340;background:#0a0e12;color:#e8ecf0}}
@@ -1266,7 +1273,7 @@ async def pipeline_geocode_json(request: Request, q: str) -> Response:
             "https://nominatim.openstreetmap.org/search",
             params={"q": q, "format": "json", "limit": 1},
             headers={
-                "User-Agent": "WealthPipeline/1.0 (local SEC lead desk; contact in app README)",
+                "User-Agent": "EquitySignal/1.0 (local SEC lead desk; contact in app README)",
                 "Accept-Language": "en",
             },
             timeout=15,
@@ -1480,8 +1487,11 @@ async def admin_desk_company(request: Request) -> Response:
             "<h1>Bad request</h1><p>Missing <code>cik</code>. Open the desk and click a company.</p>",
             status_code=400,
         )
-    profiles, _pa, leads, comp, stats = _load_page_data(omit_audit_tables=True)
-    at_cik = [p for p in profiles if str(p.get("cik") or "").strip() == cik_w]
+    profiles, _pa, leads, comp, stats = _load_page_data(
+        omit_audit_tables=True,
+        company_cik=cik_w,
+    )
+    at_cik = list(profiles)
     filtered_cik = list(at_cik)
     filtered_cik.sort(key=_desk_sort_tuple, reverse=True)
     sb = normalize_sales_bundle_query(request.query_params.get("sales_bundle"))
@@ -1624,11 +1634,24 @@ async def lead(
                 else:
                     profiles_all = []
         prof = _find_profile(profiles_all, cik, norm) if not stats.get("missing_db") else None
-        filings: list[dict] = []
+        back_href, back_lbl = _lead_page_back_nav(user)
+        ref_q = (request.query_params.get("ref") or "").strip()
+        sb_q = (
+            request.query_params.get("sb")
+            or request.query_params.get("sales_bundle")
+            or ""
+        )
+        prof_cik = str(prof.get("cik") or "").strip() if prof else ""
+        co_back_href = None
+        if user.get("is_admin"):
+            co_back_href = lead_company_roster_back_href(
+                ref=ref_q,
+                sales_bundle_q=str(sb_q),
+                query_cik=(cik or "").strip(),
+                profile_cik=prof_cik or (cik or "").strip(),
+                roster_path="/admin/desk/company",
+            )
         cr_dict: dict[str, Any] | None = None
-        issuer_snap: dict[str, Any] | None = None
-        important_llm: list[dict[str, Any]] = []
-        beneficial_individual_shareholders: list[dict[str, Any]] = []
         beneficial_stake_detail: dict[str, Any] | None = None
         officer_beneficial_stake: dict[str, Any] | None = None
         beneficial_filing_caveats = ""
@@ -1654,10 +1677,8 @@ async def lead(
                     )
                     if _hq_cs:
                         prof["issuer_hq_city_state"] = _hq_cs[:120]
-                filings = _filings_for_profile(conn, cik, norm)
                 cr_row = get_lead_client_research(conn, (cik or "").strip(), norm)
                 cr_dict = row_to_client_research_dict(cr_row)
-                issuer_snap = get_issuer_snapshot_dict(conn, (cik or "").strip())
                 bo_only = bool(prof.get("has_s1_beneficial_owner")) and not bool(
                     prof.get("has_s1_officer")
                 )
@@ -1674,12 +1695,6 @@ async def lead(
                         )
                     except sqlite3.Error:
                         beneficial_filing_caveats = ""
-                    try:
-                        important_llm = _latest_important_people_from_s1_llm_pack(
-                            conn, (cik or "").strip()
-                        )
-                    except sqlite3.Error:
-                        important_llm = []
                 else:
                     try:
                         officer_beneficial_stake = beneficial_stake_row_matching_officer_profile(
@@ -1687,43 +1702,27 @@ async def lead(
                         )
                     except sqlite3.Error:
                         officer_beneficial_stake = None
-                    try:
-                        important_llm = _latest_important_people_from_s1_llm_pack(
-                            conn, (cik or "").strip()
-                        )
-                    except sqlite3.Error:
-                        important_llm = []
                 try:
                     lead_recency = lead_issuer_recency_bundle(
                         conn, (cik or "").strip()
                     )
                 except sqlite3.Error:
                     lead_recency = {}
-                try:
-                    beneficial_individual_shareholders = [
-                        dict(r)
-                        for r in list_beneficial_owner_outreach_targets_for_cik(
-                            conn, (cik or "").strip(), limit=25
-                        )
-                    ]
-                except sqlite3.Error:
-                    beneficial_individual_shareholders = []
         body = _page_lead(
             prof,
-            filings,
             query_cik=cik,
             query_name=name,
             stats=stats,
             rendered_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             client_research=cr_dict,
-            issuer_snapshot=issuer_snap,
-            important_people_llm=important_llm,
-            beneficial_individual_shareholders=beneficial_individual_shareholders,
             beneficial_stake_detail=beneficial_stake_detail,
             officer_beneficial_stake=officer_beneficial_stake,
             beneficial_filing_caveats=beneficial_filing_caveats,
             lead_recency=lead_recency,
             lead_page_msg=lead_page_msg,
+            lead_back_href=back_href,
+            lead_back_label=back_lbl,
+            lead_back_company_href=co_back_href,
         )
         return HTMLResponse(_inject_chrome(body, user))
     except Exception as e:
@@ -1870,7 +1869,7 @@ async def export_finder_csv(
         gen(),
         media_type="text/csv; charset=utf-8",
         headers={
-            "Content-Disposition": 'attachment; filename="wealthpipeline-finder.csv"',
+            "Content-Disposition": 'attachment; filename="equity-signal-finder.csv"',
             "Cache-Control": "no-store",
         },
     )
@@ -1937,7 +1936,7 @@ async def export_desk_csv(
         gen(),
         media_type="text/csv; charset=utf-8",
         headers={
-            "Content-Disposition": 'attachment; filename="wealthpipeline-desk.csv"',
+            "Content-Disposition": 'attachment; filename="equity-signal-desk.csv"',
             "Cache-Control": "no-store",
         },
     )

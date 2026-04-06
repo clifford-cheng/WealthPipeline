@@ -12,13 +12,13 @@ scriptsDir = fso.GetParentFolderName(winDir)
 root = fso.GetParentFolderName(scriptsDir)
 
 If Not fso.FolderExists(root & "\wealth_leads") Then
-    MsgBox "Could not find wealth_leads at: " & root, vbCritical, "WealthPipeline"
+    MsgBox "Could not find wealth_leads at: " & root, vbCritical, "Equity Signal"
     WScript.Quit 1
 End If
 
 scriptPy = Chr(34) & root & "\serve_advisor.py" & Chr(34)
 cmd = "cmd.exe /k cd /d """ & root & """ && " & _
-  "set WEALTH_LEADS_APP_SECRET=wealthpipeline-local-dev-only-change-me && " & _
+  "set WEALTH_LEADS_APP_SECRET=equity-signal-local-dev-only-change-me && " & _
   "set WEALTH_LEADS_ALLOW_SIGNUP=1 && " & _
   "(py -3 " & scriptPy & " || python " & scriptPy & ")"
 

@@ -26,9 +26,9 @@ echo ===== %date% %time% sync start ===== >> "%LOG%"
 echo SEC sync starting... (log: logs\sec-sync.log)
 
 REM Set SEC_USER_AGENT once for your PC (recommended). Examples:
-REM   setx SEC_USER_AGENT "WealthPipeline/1.0 (contact: you@email.com)"
+REM   setx SEC_USER_AGENT "EquitySignal/1.0 (contact: you@email.com)"
 REM Or uncomment and edit the next line:
-REM set "SEC_USER_AGENT=WealthPipeline/1.0 (contact: you@email.com)"
+REM set "SEC_USER_AGENT=EquitySignal/1.0 (contact: you@email.com)"
 
 %_PY% -m wealth_leads sync >> "%LOG%" 2>&1
 set "RC=%ERRORLEVEL%"
@@ -49,5 +49,5 @@ REM 4. Arguments: /c ""C:\path\to\Wealth App\scripts\windows\Run SEC sync only.b
 REM    (use your real path; keep the quotes)
 REM 5. Start in:  C:\path\to\Wealth App
 REM 6. Optional: check "Run whether user is logged on or not" and store your Windows password.
-REM 7. Ensure SEC_USER_AGENT is set for your account: setx SEC_USER_AGENT "WealthPipeline/1.0 (contact: email)"
+REM 7. Ensure SEC_USER_AGENT is set for your account: setx SEC_USER_AGENT "EquitySignal/1.0 (contact: email)"
 REM    Then log off/on once so Task Scheduler picks it up.

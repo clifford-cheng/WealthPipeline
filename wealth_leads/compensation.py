@@ -520,7 +520,7 @@ def is_sec_archives_document_url(url: str) -> bool:
 
 
 _EDGAR_UA = (
-    "Mozilla/5.0 (compatible; WealthLeads/1.0; institutional filing research; "
+    "Mozilla/5.0 (compatible; EquitySignal/1.0; institutional filing research; "
     "+https://www.sec.gov/os/webmaster-faq#code-support)"
 )
 

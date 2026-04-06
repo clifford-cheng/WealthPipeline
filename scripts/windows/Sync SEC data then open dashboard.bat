@@ -1,6 +1,6 @@
 @echo off
 setlocal EnableExtensions
-title WealthPipeline — Sync + Advisor app
+title Equity Signal — Sync + Advisor app
 
 set "WL_ROOT=%~dp0..\.."
 cd /d "%WL_ROOT%"
@@ -23,7 +23,7 @@ if not defined _PY (
 if not defined SEC_USER_AGENT (
     echo.
     echo Tip: For reliable SEC access, set SEC_USER_AGENT in this window, e.g.:
-    echo   set SEC_USER_AGENT=WealthPipeline/1.0 (contact: you@gmail.com)
+    echo   set SEC_USER_AGENT=EquitySignal/1.0 (contact: you@gmail.com)
     echo.
 )
 
@@ -36,7 +36,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if not defined WEALTH_LEADS_APP_SECRET set "WEALTH_LEADS_APP_SECRET=wealthpipeline-local-dev-only-change-me"
+if not defined WEALTH_LEADS_APP_SECRET set "WEALTH_LEADS_APP_SECRET=equity-signal-local-dev-only-change-me"
 if not defined WEALTH_LEADS_ALLOW_SIGNUP set "WEALTH_LEADS_ALLOW_SIGNUP=1"
 
 set "WEALTH_LEADS_APP_PORT=8765"

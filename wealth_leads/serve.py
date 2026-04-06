@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin
 from wsgiref.simple_server import make_server
 
 from wealth_leads.config import (
+    advisor_ui_product_name,
     database_path,
     email_hypothesis_top_n,
     email_smtp_mail_from,
@@ -38,7 +39,6 @@ from wealth_leads.config import (
 )
 from wealth_leads.advisor_pack import (
     apply_smtp_probes_to_candidates,
-    get_issuer_snapshot_dict,
     outreach_pattern_pack_from_website,
 )
 from wealth_leads.db import (
@@ -46,7 +46,6 @@ from wealth_leads.db import (
     get_lead_client_research,
     issuer_listing_stage_map,
     lead_suppress_pair_set,
-    list_beneficial_owner_outreach_targets_for_cik,
     list_beneficial_owner_stakes_for_cik,
     max_filing_date_for_cik,
 )
@@ -2385,26 +2384,21 @@ def _profile_headline_comp_breakout_html(
         '<th scope="col" title="Fiscal year">FY</th>'
         '<th scope="col" title="Salary">Salary</th>'
         '<th scope="col" title="Bonus">Bonus</th>'
-        '<th scope="col" title="Grant-date stock awards, US dollars (not shares)">Stock ($)</th>'
-        '<th scope="col" title="Option awards, grant-date fair value in US dollars">Opt. ($)</th>'
+        '<th scope="col" title="Disclosed equity (grant-date fair value), SCT">Equity ($)</th>'
         '<th scope="col" title="Non-equity incentive plan comp">Non-eq.</th>'
-        '<th scope="col" title="Change in pension value">Pens.</th>'
         '<th scope="col" title="All other compensation">Other</th>'
         '<th scope="col" title="Total">Total</th>'
         "</tr></thead><tbody><tr>"
         f"<td class=\"num strong\">{html.escape(fy_s)}</td>"
         f"<td class=\"num\">{_money(row.get('salary'))}</td>"
         f"<td class=\"num\">{_money(row.get('bonus'))}</td>"
-        f"<td class=\"num\">{_money(row.get('stock_awards'))}</td>"
-        f"<td class=\"num\">{_money(row.get('option_awards'))}</td>"
+        f"<td class=\"num\">{_money(row.get('equity_comp_disclosed'))}</td>"
         f"<td class=\"num\">{_money(row.get('non_equity_incentive'))}</td>"
-        f"<td class=\"num\">{_money(row.get('pension_change'))}</td>"
         f"<td class=\"num\">{_reported_other_cell(row)}</td>"
         f"<td class=\"num strong\">{_money(row.get('total'))}</td>"
         "</tr></tbody></table></div>"
-        f"<p class=\"meta dim lead-comp-foot\">Grant-date SCT dollars — not liquid wealth. "
-        f"<strong>Total</strong> for this FY includes Stock and Opt. columns. "
-        f"Filing date <b>{html.escape(row.get('filing_date') or '—')}</b> · {doc_l}</p>"
+        f"<p class=\"meta dim lead-comp-foot\">Grant-date SCT — not liquid. "
+        f"<strong>Total</strong> includes Equity ($). Source: {doc_l}</p>"
     )
     if for_s1_bundle:
         return f"{sub}{tbl}"
@@ -2427,18 +2421,15 @@ def _profile_breakdown_table(p: dict) -> str:
     if not yb:
         return "<p class='bd-note'>No fiscal-year rows.</p>"
     parts: list[str] = [
-        "<table class='inner-comp'><thead><tr>",
+        "<table class='inner-comp lead-comp-breakout'><thead><tr>",
         "<th title='Fiscal year'>FY</th>",
         "<th title='Cash salary'>Salary</th>",
         "<th title='Cash bonus'>Bonus</th>",
-        "<th title='Grant-date stock awards, US dollars (not share count)'>Stock ($)</th>",
-        "<th title='Grant-date option awards (fair value), US dollars'>Options ($)</th>",
+        "<th title='Disclosed equity (grant-date fair value), SCT'>Equity ($)</th>",
         "<th title='Non-equity incentive plan compensation'>Non-equity</th>",
-        "<th title='Change in pension value'>Pension Δ</th>",
         "<th title='All other compensation'>Other</th>",
-        "<th title='Stock + option columns for this FY (both in dollars)'>Equity ($)</th>",
-        "<th title='All compensation for this FY; includes Stock and Options dollars'>Total</th>",
-        "<th>Filing</th><th>Doc</th>",
+        "<th title='All compensation for this FY'>Total</th>",
+        "<th>Doc</th>",
         "</tr></thead><tbody>",
     ]
     for y in yb:
@@ -2450,14 +2441,10 @@ def _profile_breakdown_table(p: dict) -> str:
             f"<td class='num'>{html.escape(str(fy) if fy is not None else '—')}</td>"
             f"<td class='num'>{_money(y.get('salary'))}</td>"
             f"<td class='num'>{_money(y.get('bonus'))}</td>"
-            f"<td class='num'>{_money(y.get('stock_awards'))}</td>"
-            f"<td class='num'>{_money(y.get('option_awards'))}</td>"
-            f"<td class='num'>{_money(y.get('non_equity_incentive'))}</td>"
-            f"<td class='num'>{_money(y.get('pension_change'))}</td>"
-            f"<td class='num'>{_reported_other_cell(y)}</td>"
             f"<td class='num'>{_money(y.get('equity_comp_disclosed'))}</td>"
+            f"<td class='num'>{_money(y.get('non_equity_incentive'))}</td>"
+            f"<td class='num'>{_reported_other_cell(y)}</td>"
             f"<td class='num strong'>{_money(y.get('total'))}</td>"
-            f"<td>{html.escape(y.get('filing_date') or '')}</td>"
             f"<td>{doc_l}</td>"
             "</tr>"
         )
@@ -2557,7 +2544,7 @@ def _comp_optional_align_details_html(stake: Optional[dict], p: dict) -> str:
         return ""
     return (
         '<details class="lead-more" style="margin-top:0.65rem">'
-        '<summary>Optional: same-ruler share scale (headline FY)</summary>'
+        '<summary>Optional: SCT $ ÷ offering $/sh (headline FY)</summary>'
         f"{block}</details>"
     )
 
@@ -2666,11 +2653,9 @@ def _build_advisor_equity_footnotes_html(
     k_ref: Optional[float] = None,
     k_ref_grant_date: str = "",
     assume_k_non_option: bool = False,
+    show_strike_footnote: bool = True,
 ) -> str:
-    """
-    Two primary notes (¹ implied P, ² strike & spread) — no <ol> so numbers are not doubled.
-    Optional paragraphs per grant + residual tie-out below.
-    """
+    """Implied $/sh note; optional strike/spread note only when options carry K into the grid."""
     kind = _equity_anchor_kind(p, grants, stake, fmv)
     fmv_disp = f"${fmv:,.2f}"
     fy = p.get("headline_year")
@@ -2695,108 +2680,61 @@ def _build_advisor_equity_footnotes_html(
                 sh, sa = 0.0, 0.0
             if sh > 0 and sa > 0:
                 n1_core = (
-                    f"We use <strong>{html.escape(fmv_disp)}</strong> per share by taking fiscal {fy_e} "
-                    f"<strong>Stock ($)</strong> ({html.escape(_money(sa))}) ÷ "
-                    f"<strong>{sh:,.0f}</strong> RS units from the NEO grant table. "
-                    "<span class=\"dim\">Biased if Stock ($) embeds other equity.</span> "
+                    f"<strong>{html.escape(fmv_disp)}</strong> = fiscal {fy_e} SCT stock $ "
+                    f"{html.escape(_money(sa))} ÷ <strong>{sh:,.0f}</strong> RS units. "
                 )
     elif kind == "offering":
         title_e = html.escape(
             (_offering_price_per_share_for_alignment(stake or {})[1] or "").strip()
         )
         n1_core = (
-            f"We use <strong>{html.escape(fmv_disp)}</strong> from the offering / beneficial-ownership "
-            f"disclosure ({title_e}). "
+            f"<strong>{html.escape(fmv_disp)}</strong> from offering / beneficial ownership"
+            f"{(' — ' + title_e) if title_e else ''}. "
         )
     if not n1_core:
-        src_e = html.escape((fmv_src or "").strip()[:400])
+        src_e = html.escape((fmv_src or "").strip()[:200])
         n1_core = (
-            f"We use <strong>{html.escape(fmv_disp)}</strong> as the mark. "
-            f"<span class=\"dim\">{src_e or 'Source not classified — verify in filing.'}</span> "
+            f"<strong>{html.escape(fmv_disp)}</strong> working mark"
+            f"{(' — ' + src_e) if src_e else ''}. "
         )
 
+    note1_close = (
+        '<span class="dim">Stock value = shares × this $/sh (illustrative).</span>'
+    )
     note1 = (
-        f'<p class="lead-adv-foot-p" id="lead-adv-eq-note-1">{sub1} <strong>Per-share mark P.</strong> '
-        f"{n1_core}"
-        "<strong>Stock value at assumed price</strong> (shares × this P) is a scenario mark everywhere — "
-        "<strong>not</strong> grant-date fair value from the summary comp table and "
-        "<strong>not</strong> a market quote.</p>"
+        f'<p class="lead-adv-foot-p" id="lead-adv-eq-note-1">{sub1} <strong>Implied $/sh.</strong> {n1_core}'
+        f"{note1_close}</p>"
     )
 
-    # —— Note 2: strike & spread ——
-    fo = first_opt
-    note2_body = ""
-    if fo is not None:
-        tr = (_try_float(fo.get("exercisable_shares")) or 0) + (
-            _try_float(fo.get("unexercisable_shares")) or 0
-        )
-        k = _try_float(fo.get("exercise_price_usd"))
-        if tr > 0 and k is not None:
-            iv = tr * max(0.0, fmv - k)
-            note2_body = (
-                f"<strong>Option row:</strong> K = {html.escape(_strike_price_cell(k))} from the "
-                "outstanding-award table. "
-                f"<strong>In-the-money value</strong> there (P−K)×Q = {tr:,.0f} × max(0, {fmv:.2f} − {k:.2f}) = "
-                f"<strong>{html.escape(_money(iv))}</strong> (pre-tax intrinsic at P from note 1; "
-                "no time value). "
+    # —— Note 2: only when strike is carried into the grid (options with K) ——
+    note2 = ""
+    if show_strike_footnote:
+        fo = first_opt
+        note2_body = ""
+        if fo is not None:
+            tr = (_try_float(fo.get("exercisable_shares")) or 0) + (
+                _try_float(fo.get("unexercisable_shares")) or 0
             )
-            if assume_k_non_option and k_ref is not None:
-                gd_e = html.escape(k_ref_grant_date or "—")
-                note2_body += (
-                    f"<strong>Elsewhere (subscript 2 only there):</strong> Total / RS / Other repeat the same K "
-                    f"({html.escape(_strike_price_cell(k_ref))}, grant {gd_e}) "
-                    "only so you can compare spreads side-by-side — "
-                    "<strong>not</strong> because the filing discloses those shares as that option. "
+            k = _try_float(fo.get("exercise_price_usd"))
+            if tr > 0 and k is not None:
+                iv = tr * max(0.0, fmv - k)
+                note2_body = (
+                    f"Strike {html.escape(_strike_price_cell(k))}; spread ≈ "
+                    f"<strong>{html.escape(_money(iv))}</strong> at implied $/sh (pre-tax, rough). "
                 )
+                if assume_k_non_option and k_ref is not None:
+                    note2_body += '<span class="dim">Same strike fills empty strike cells.</span> '
+            else:
+                note2_body = '<span class="dim">No strike on this option row.</span> '
         else:
-            note2_body = (
-                "<span class=\"dim\">Outstanding-option row parsed but no exercise price in the scrape — "
-                "in-the-money column is —.</span> "
-            )
-    else:
-        note2_body = (
-            "<span class=\"dim\">No outstanding option/SAR row matched this person in the HTML parse — "
-            "no filing strike or intrinsic spread.</span> "
+            note2_body = '<span class="dim">See option rows in the filing.</span> '
+
+        note2 = (
+            f'<p class="lead-adv-foot-p" id="lead-adv-eq-note-2">{sub2} <strong>Options.</strong> '
+            f"{note2_body}</p>"
         )
 
-    note2 = (
-        f'<p class="lead-adv-foot-p" id="lead-adv-eq-note-2">{sub2} <strong>Strike K &amp; spread.</strong> {note2_body}</p>'
-    )
-
-    extras: list[str] = []
-
-    for g in grants:
-        if g.get("shares_or_units") is None:
-            continue
-        if "restrict" not in str(g.get("award_type") or "").lower():
-            continue
-        try:
-            n = float(g["shares_or_units"])
-        except (TypeError, ValueError):
-            continue
-        if n <= 0:
-            continue
-        aw = html.escape(str(g.get("award_type") or "Restricted stock"))
-        extras.append(
-            f'<p class="lead-adv-extra-p"><strong>{aw}</strong> (NEO grant table) — '
-            f"<strong>{n:,.0f}</strong> units. "
-            "<span class=\"dim\">Vested vs unvested and lock-up are in award / plan footnotes, "
-            "not in this HTML extract.</span></p>"
-        )
-
-    for o in opts:
-        gd = html.escape(str(o.get("grant_date") or "—"))
-        exp = html.escape(str(o.get("expiration") or "—").replace("\xa0", " ").strip())
-        exs = _fmt_share_count_cell(o.get("exercisable_shares"))
-        uns = _fmt_share_count_cell(o.get("unexercisable_shares"))
-        ks = html.escape(_strike_price_cell(o.get("exercise_price_usd")))
-        extras.append(
-            f'<p class="lead-adv-extra-p"><strong>Option / SAR</strong> (grant {gd}) — '
-            f"strike {ks}, expiration {exp}; table: exercisable {html.escape(exs)}, "
-            f"unexercisable {html.escape(uns)}. "
-            "<span class=\"dim\">Vesting schedule and cash vs stock settlement: filing footnotes.</span></p>"
-        )
-
+    tail: list[str] = []
     if (
         total_bo is not None
         and total_bo > 0
@@ -2804,31 +2742,29 @@ def _build_advisor_equity_footnotes_html(
         and resid_shown is not None
         and resid_shown >= 1.0
     ):
-        extras.append(
-            f'<p class="lead-adv-extra-p"><strong>Residual (Other)</strong> — share tie-out: '
-            f"{total_bo:,.0f} − {rs_sum:,.0f} − {opt_tranche_sum:,.0f} = "
-            f"<strong>{resid_shown:,.0f}</strong>. "
-            "<span class=\"dim\">Ownership footnote usually explains what fills this bucket.</span></p>"
+        tail.append(
+            f"<strong>Other</strong> shares = beneficial total − RS − options = "
+            f"{total_bo:,.0f} − {rs_sum:,.0f} − {opt_tranche_sum:,.0f} = {resid_shown:,.0f}."
         )
-    elif total_bo is not None and total_bo > 0 and rs_sum + opt_tranche_sum > 0:
-        sm = rs_sum + opt_tranche_sum
-        if abs(total_bo - sm) < 1.0:
-            extras.append(
-                f'<p class="lead-adv-extra-p"><strong>Share tie-out</strong> — RS + option units match '
-                f"beneficial total ({total_bo:,.0f}) within rounding.</p>"
-            )
+    extras_html = ""
+    if tail:
+        extras_html = (
+            f'<div class="lead-adv-eq-extras"><p class="lead-adv-extra-p dim" style="margin:0">'
+            f'{" ".join(tail)}</p></div>'
+        )
 
-    extras.append(
-        '<p class="lead-adv-extra-p dim" style="margin-bottom:0">'
-        "<strong>Pay table</strong> Stock ($) / Options ($) columns are grant-date accounting — "
-        "different from the marks in this grid.</p>"
-    )
+    context_line = ""
+    if kind == "unknown":
+        context_line = (
+            '<p class="lead-adv-foot-p dim" style="margin:0.35rem 0 0 0;font-size:0.68rem;line-height:1.45">'
+            "Verify $/sh against the prospectus if you use it in a model.</p>"
+        )
 
     return (
         '<div class="lead-adv-two-notes">'
-        f"{note1}{note2}"
+        f"{note1}{note2}{context_line}"
         "</div>"
-        f'<div class="lead-adv-eq-extras">{"".join(extras)}</div>'
+        f"{extras_html}"
     )
 
 
@@ -2865,14 +2801,14 @@ def _eq_spread_td(q: float, k: Optional[float], fmv: float) -> str:
 
 def _eq_sub_note1_html() -> str:
     return (
-        '<a href="#lead-adv-eq-note-1" class="lead-eq-fn-anchor" title="Note 1 — per-share mark P">'
+        '<a href="#lead-adv-eq-note-1" class="lead-eq-fn-anchor" title="Implied $/sh">'
         '<sub class="lead-eq-tn">1</sub></a>'
     )
 
 
 def _eq_sub_note2_html() -> str:
     return (
-        '<a href="#lead-adv-eq-note-2" class="lead-eq-fn-anchor" title="Note 2 — strike K and spread">'
+        '<a href="#lead-adv-eq-note-2" class="lead-eq-fn-anchor" title="Options — strike and spread">'
         '<sub class="lead-eq-tn">2</sub></a>'
     )
 
@@ -2985,7 +2921,7 @@ def _advisor_equity_snapshot_table_html(
         )
         rows_html.append(
             '<tr class="lead-advisor-equity-total">'
-            '<td class="lead-eq-line"><strong>Total beneficial ownership</strong> '
+            '<td class="lead-eq-line"><strong>Beneficial ownership</strong> '
             '<span class="lead-eq-line-meta">(pre-offering)</span></td>'
             f'<td class="num">{html.escape(f"{total_bo:,.0f}")}</td>'
             f'{_eq_psh_cell_html(fmv, annotate_repeat_p=not psh_src.total_is_p_source())}'
@@ -3013,7 +2949,7 @@ def _advisor_equity_snapshot_table_html(
         st_rs = _eq_strike_assumed_cell(k_ref) if assume_k else '<td class="num lead-eq-muted">—</td>'
         sp_rs = _eq_spread_td(n, k_ref, fmv) if assume_k else '<td class="num lead-eq-muted">—</td>'
         rows_html.append(
-            f'<tr><td class="lead-eq-line">{aw} <span class="lead-eq-line-meta">(NEO grant table)</span></td>'
+            f'<tr><td class="lead-eq-line">{aw} <span class="lead-eq-line-meta">(grant table)</span></td>'
             f'<td class="num">{html.escape(f"{n:,.0f}")}</td>'
             f'{_eq_psh_cell_html(fmv, annotate_repeat_p=not psh_src.rs_is_p_source(g))}'
             f"{st_rs}"
@@ -3090,21 +3026,15 @@ def _advisor_equity_snapshot_table_html(
     if not rows_html:
         return ""
 
-    caption = (
-        '<caption class="lead-adv-eq-cap dim" style="text-align:center;padding:0 0 0.4rem 0;'
-        'font-size:0.68rem;line-height:1.45;caption-side:top">'
-        "Not tax or legal advice.</caption>"
-    )
     thead = (
         "<thead><tr>"
         '<th scope="col" class="lead-eq-line">Line</th>'
         '<th scope="col" class="num">Shares</th>'
         '<th scope="col" class="num">$/sh</th>'
         '<th scope="col" class="num">Strike</th>'
-        '<th scope="col" class="num">Stock value at assumed price<br>'
-        '<span class="dim" style="font-weight:400;font-size:0.62em">shares × $/sh</span></th>'
-        '<th scope="col" class="num">Option spread at assumed price<br>'
-        '<span class="dim" style="font-weight:400;font-size:0.62em">(price − strike) × shares if in the money · pre-tax</span></th>'
+        '<th scope="col" class="num">Value @ $/sh</th>'
+        '<th scope="col" class="num">Option spread<br>'
+        '<span class="dim" style="font-weight:400;font-size:0.62em">ITM · pre-tax</span></th>'
         "</tr></thead>"
     )
     foot_block = _build_advisor_equity_footnotes_html(
@@ -3122,27 +3052,18 @@ def _advisor_equity_snapshot_table_html(
         k_ref=k_ref,
         k_ref_grant_date=k_ref_grant_d,
         assume_k_non_option=assume_k,
-    )
-    legend = (
-        '<p class="lead-adv-eq-legend dim" style="margin:0 0 0.4rem;font-size:0.68rem;line-height:1.5;'
-        'max-width:56rem;text-align:center">'
-        "<strong>Legend:</strong> "
-        "One body color for amounts. "
-        "<sub class=\"lead-eq-tn\">1</sub> on <strong>$/sh</strong> only where that row <em>repeats</em> P — the one row that <em>sources</em> P from the filing has no subscript (see note 1). "
-        "<sub class=\"lead-eq-tn\">2</sub> on <strong>strike</strong> only where K is <em>carried</em> from the option row — the option line’s strike from the award table has no subscript (see note 2).</p>"
+        show_strike_footnote=assume_k,
     )
     foot_html = (
-        '<div class="lead-advisor-equity-footnotes" '
-        'style="font-size:0.7rem;line-height:1.55;max-width:56rem;margin-top:0.55rem">'
-        f"{legend}"
-        '<p class="lead-adv-eq-notes-hdr dim" style="margin:0.35rem 0 0.25rem 0;text-align:center">'
-        "<strong>Assumptions &amp; filing detail</strong></p>"
+        '<div class="lead-advisor-equity-footnotes lead-advisor-equity-footnotes-below">'
         f"{foot_block}"
+        '<p class="lead-adv-eq-disclaimer dim" style="margin:0.55rem 0 0;font-size:0.66rem;line-height:1.4">'
+        "Illustrative only — not tax or legal advice.</p>"
         "</div>"
     )
     return (
-        '<div class="table-wrap lead-advisor-equity-wrap" style="margin-top:0.35rem">'
-        f'<table class="inner-comp lead-advisor-equity-snap">{caption}{thead}<tbody>'
+        '<div class="table-wrap lead-advisor-equity-wrap">'
+        f'<table class="inner-comp lead-advisor-equity-snap">{thead}<tbody>'
         + "".join(rows_html)
         + "</tbody></table></div>"
         + foot_html
@@ -3208,13 +3129,35 @@ def _profile_outstanding_equity_from_filing_html(
     if not snap:
         return ""
     return (
-        '<div class="card lead-filing-equity-awards lead-filing-equity-hero" style="margin-top:0.5rem">'
-        '<h2 class="lead-section-h" style="font-size:1.08rem;margin:0 0 0.4rem">'
-        "Equity tie-out</h2>"
-        '<p class="meta dim" style="font-size:0.72rem;margin:0 0 0.35rem;line-height:1.45;max-width:56rem">'
-        "<sub class=\"lead-eq-tn\">1</sub> marks a <strong>$/sh</strong> that repeats P explained in note 1 — not the single filing row that defines P. "
-        "<sub class=\"lead-eq-tn\">2</sub> marks a <strong>strike</strong> carried from the option row (note 2) — not the option line’s own table strike.</p>"
+        '<div class="card lead-filing-equity-awards lead-filing-equity-hero">'
+        '<h2 class="lead-section-h lead-equity-snapshot-h">Equity snapshot</h2>'
+        '<p class="meta dim lead-equity-snapshot-lede">'
+        "Filing <strong>share counts</strong> and one working <strong>$/sh</strong> for the grid "
+        "(how we set it: footnote 1). Pick your own price for advice.</p>"
         f"{snap}</div>"
+    )
+
+
+def _lead_equity_comp_split_shell(left_html: str, right_html: str) -> str:
+    """Equity snapshot first, then summary comp below (full width each)."""
+    return (
+        '<div class="lead-equity-comp-split" role="region" '
+        'aria-label="Equity snapshot and summary compensation">'
+        '<div class="lead-equity-comp-col lead-equity-comp-primary">'
+        f"{left_html}</div>"
+        '<div class="lead-equity-comp-col lead-equity-comp-secondary">'
+        f"{right_html}</div>"
+        "</div>"
+    )
+
+
+def _s1_summary_comp_sidebar_card(inner_html: str) -> str:
+    return (
+        '<div class="card lead-s1-comp-sidebar">'
+        '<h2 class="lead-section-h lead-s1-comp-sidebar-h">Summary compensation</h2>'
+        '<p class="meta dim lead-s1-comp-sidebar-lede">'
+        "Grant-date SCT dollars. Share-level view is in the equity snapshot above.</p>"
+        f'<div class="lead-s1-pay-comp">{inner_html}</div></div>'
     )
 
 
@@ -3238,8 +3181,7 @@ def _profile_lead_compensation_card_html(
             '<h2 class="lead-section-h" style="font-size:1.02rem;margin:0 0 0.35rem">'
             "Ownership &amp; summary compensation</h2>"
             '<p class="meta dim" style="font-size:0.72rem;margin:0 0 0.45rem;line-height:1.4">'
-            "Beneficial ownership (left) and summary comp (right). Stock / Options columns are "
-            "grant-date dollars, not share counts. Newest fiscal year first.</p>"
+            "Ownership (left) and SCT (right). Grant-date dollars; newest fiscal year first.</p>"
             '<div class="lead-s1-pay-bundle-grid">'
             '<div class="lead-s1-pay-pos"><h3 class="lead-section-h" style="font-size:0.82rem;margin:0 0 0.35rem">'
             "Held position</h3>"
@@ -3247,17 +3189,6 @@ def _profile_lead_compensation_card_html(
             '<div class="lead-s1-pay-comp"><h3 class="lead-section-h" style="font-size:0.82rem;margin:0 0 0.35rem">'
             "Pay by fiscal year</h3>"
             f"{comp_html}</div></div></div>"
-        )
-
-    def _s1_summary_comp_solo_card(comp_html: str) -> str:
-        return (
-            '<div class="card lead-s1-pay-bundle lead-s1-pay-bundle-solo" style="margin-top:0.65rem">'
-            '<h2 class="lead-section-h" style="font-size:1.02rem;margin:0 0 0.35rem">'
-            "Summary compensation</h2>"
-            '<p class="meta dim" style="font-size:0.72rem;margin:0 0 0.45rem;line-height:1.4">'
-            "Stock / Options are grant-date accounting dollars. Pre-offering share economics and "
-            "spreads are in the equity tie-out above.</p>"
-            f'<div class="lead-s1-pay-comp">{comp_html}</div></div>'
         )
 
     if beneficial_only:
@@ -3294,8 +3225,9 @@ def _profile_lead_compensation_card_html(
                 for_s1_bundle=True,
             )
             if equity_filing_html:
-                return equity_filing_html + _s1_summary_comp_solo_card(
-                    f"{comp_frag}{align_html}"
+                return _lead_equity_comp_split_shell(
+                    equity_filing_html,
+                    _s1_summary_comp_sidebar_card(f"{comp_frag}{align_html}"),
                 )
             return _s1_bundle_shell(pos, f"{comp_frag}{align_html}")
         top = yb[0]
@@ -3306,23 +3238,24 @@ def _profile_lead_compensation_card_html(
             if doc_u
             else ""
         )
-        fd = html.escape(top.get("filing_date") or "—")
         foot = (
-            "<p class=\"meta dim lead-comp-foot\" style=\"margin:0.45rem 0 0;font-size:0.72rem;line-height:1.4\">"
-            f"Grant-date dollars per row · newest FY first · filing <b>{fd}</b>"
+            "<p class=\"meta dim lead-comp-foot\" style=\"margin:0.45rem 0 0;font-size:0.7rem;line-height:1.4\">"
+            "Grant-date dollars · newest FY first"
             + (f" · {doc_l}" if doc_l else "")
             + "</p>"
         )
         tbl = _profile_breakdown_table(p)
         comp = (
-            '<p class="meta dim" style="font-size:0.7rem;margin:0 0 0.35rem;line-height:1.35">'
-            "Each row is one FY; <strong>Total</strong> already includes that year’s Stock/Options $. "
-            "Don’t add down the column for lifetime pay.</p>"
+            '<p class="meta dim lead-comp-inline-hint">'
+            "One row per fiscal year; <strong>Total</strong> is that year only.</p>"
             '<div class="table-wrap lead-comp-table-wrap lead-comp-history-wrap">'
             f"{tbl}</div>{foot}{align_html}"
         )
         if equity_filing_html:
-            return equity_filing_html + _s1_summary_comp_solo_card(comp)
+            return _lead_equity_comp_split_shell(
+                equity_filing_html,
+                _s1_summary_comp_sidebar_card(comp),
+            )
         return _s1_bundle_shell(pos, comp)
 
     if not yb:
@@ -3340,7 +3273,16 @@ def _profile_lead_compensation_card_html(
             if lix != -1:
                 body = body[:lix] + align_html + body[lix:]
         if equity_filing_html:
-            return equity_filing_html + body
+            comp_inner = _profile_headline_comp_breakout_html(
+                p,
+                section_title="",
+                subtitle_html=sub,
+                for_s1_bundle=True,
+            )
+            return _lead_equity_comp_split_shell(
+                equity_filing_html,
+                _s1_summary_comp_sidebar_card(f"{comp_inner}{align_html}"),
+            )
         return body
 
     top = yb[0]
@@ -3351,10 +3293,9 @@ def _profile_lead_compensation_card_html(
         if doc_u
         else ""
     )
-    fd = html.escape(top.get("filing_date") or "—")
     foot = (
-        "<p class=\"meta dim lead-comp-foot\" style=\"margin:0.45rem 0 0;font-size:0.72rem;line-height:1.4\">"
-        f"Grant-date dollars per row · newest FY first · filing <b>{fd}</b>"
+        "<p class=\"meta dim lead-comp-foot\" style=\"margin:0.45rem 0 0;font-size:0.7rem;line-height:1.4\">"
+        "Grant-date dollars · newest FY first"
         + (f" · {doc_l}" if doc_l else "")
         + "</p>"
     )
@@ -3362,22 +3303,89 @@ def _profile_lead_compensation_card_html(
     breakout = (
         '<div class="lead-comp-breakout-wrap card">'
         '<h2 class="lead-section-h">Summary compensation (year by year)</h2>'
-        '<p class="meta dim" style="font-size:0.7rem;margin:0 0 0.4rem;line-height:1.35">'
-        "Each row is one FY; Stock/Options are dollars. <strong>Total</strong> includes equity for that year.</p>"
+        '<p class="meta dim lead-comp-inline-hint" style="margin:0 0 0.4rem">'
+        "One row per fiscal year; <strong>Total</strong> includes equity for that year.</p>"
         '<div class="table-wrap lead-comp-table-wrap lead-comp-history-wrap">'
         f"{tbl}</div>{foot}{align_html}</div>"
     )
     if equity_filing_html:
-        return equity_filing_html + breakout
+        right_inner = (
+            '<div class="table-wrap lead-comp-table-wrap lead-comp-history-wrap">'
+            f"{tbl}</div>{foot}{align_html}"
+        )
+        return _lead_equity_comp_split_shell(
+            equity_filing_html,
+            _s1_summary_comp_sidebar_card(right_inner),
+        )
     return breakout
 
 
-def _profile_lead_url(p: dict) -> str:
+def _profile_lead_url(
+    p: dict,
+    *,
+    from_company_roster: bool = False,
+    sales_bundle: str = "premium",
+) -> str:
     """Use normalized name in the query string so /lead matches DB person_norm reliably."""
     nm = (p.get("norm_name") or "").strip() or _norm_person_name(
         p.get("display_name") or ""
     )
-    return "/lead?" + urlencode({"cik": str(p.get("cik") or ""), "name": nm})
+    q: dict[str, str] = {"cik": str(p.get("cik") or ""), "name": nm}
+    if from_company_roster:
+        q["ref"] = "co"
+        q["sb"] = normalize_sales_bundle_query(sales_bundle)
+    return "/lead?" + urlencode(q)
+
+
+def _lead_profile_back_nav_html(
+    desk_href: str,
+    desk_label: str,
+    *,
+    company_href: Optional[str] = None,
+    company_label: str = "Company roster",
+) -> str:
+    """One or two back links above the lead header (company drill-in vs full desk)."""
+    dh = html.escape(desk_href, quote=True)
+    dl = html.escape(desk_label)
+    if company_href:
+        ch = html.escape(company_href, quote=True)
+        cl = html.escape(company_label)
+        return (
+            f'<nav class="lead-back-nav" aria-label="Back navigation">'
+            f'<a href="{ch}">← {cl}</a>'
+            f'<span class="lead-back-sep dim"> · </span>'
+            f'<a href="{dh}">← {dl}</a>'
+            "</nav>"
+        )
+    return (
+        f'<nav class="lead-back-nav" aria-label="Back navigation">'
+        f'<a href="{dh}">← {dl}</a></nav>'
+    )
+
+
+def lead_company_roster_back_href(
+    *,
+    ref: str,
+    sales_bundle_q: str,
+    query_cik: str,
+    profile_cik: Optional[str],
+    roster_path: str,
+) -> Optional[str]:
+    """
+    Safe return URL to the issuer people table when the profile was opened from that view
+    (ref=co + matching CIK). roster_path is e.g. /admin/desk/company or /desk/company.
+    """
+    if (ref or "").strip().lower() != "co":
+        return None
+    qc = str(query_cik or "").strip()
+    pc = str(profile_cik or "").strip()
+    if not qc or not pc or qc != pc:
+        return None
+    base = (roster_path or "").split("?")[0].strip()
+    if not base.startswith("/") or base.startswith("//"):
+        return None
+    sb = normalize_sales_bundle_query(sales_bundle_q or "premium")
+    return f"{base}?{urlencode({'cik': qc, 'sales_bundle': sb})}"
 
 
 def _find_profile(profiles: list[dict], cik: str, norm_name: str) -> Optional[dict]:
@@ -3558,15 +3566,12 @@ def _sct_equity_implied_shares_alignment_html(stake: dict, p: dict) -> str:
         '<div class="lead-bo-sct-align" style="margin-top:0.75rem;padding-top:0.65rem;'
         'border-top:1px solid #2a3340">'
         '<h4 class="lead-section-h" style="font-size:0.88rem;margin:0 0 0.35rem">'
-        "Same-ruler share scale (optional)</h4>"
+        "Rough share units from SCT $</h4>"
         f'<p class="meta dim" style="margin:0 0 0.45rem;font-size:0.72rem;line-height:1.45">'
-        f"Compare mentally to the <strong>ownership share count</strong> in section 1 — "
-        f"<strong>do not add</strong> these rows to it. For <strong>FY {html.escape(fy_s)}</strong> "
-        "only: SCT stock and option columns are <strong>dollars</strong>. Dividing by <strong>"
-        f"{px_e}</strong> ({title_e}) yields <em>rough</em> share-scale units on the same per-share "
-        "ruler as the illustrative ownership value above.</p>"
-        f'<p class="meta dim" style="margin:0 0 0.35rem;font-size:0.7rem;line-height:1.4">'
-        "<strong>Options:</strong> fair value ÷ price is <em>not</em> the number of option contracts.</p>"
+        f"<strong>FY {html.escape(fy_s)}</strong> SCT stock/option columns are <strong>dollars</strong>. "
+        f"Dividing by <strong>{px_e}</strong> ({title_e}) gives rough share-scale units — "
+        "<strong>not additive</strong> with beneficial ownership shares above. "
+        "Options: fair value ÷ price is not the option contract count.</p>"
         '<div class="table-wrap" style="margin-top:0.25rem"><table class="inner-comp" style="font-size:0.82rem">'
         "<thead><tr><th scope=\"col\">Line</th>"
         '<th scope="col" class="num" title="SCT values are dollars for the fiscal year shown">'
@@ -3961,42 +3966,6 @@ def _desk_company_bundles_table(
   </div>"""
 
 
-def _filings_for_profile(conn: sqlite3.Connection, cik: str, _norm_name: str) -> list[dict]:
-    """
-    Issuer filing timeline for cross-reference: S-1, 10-K, and 8-K family rows we have for
-    this CIK, newest first — not only filings where this person has a comp row.
-    """
-    cik_s = str(cik or "").strip()
-    cur = conn.execute(
-        """
-        SELECT f.id, f.accession, f.form_type, f.filing_date, f.index_url, f.primary_doc_url
-        FROM filings f
-        WHERE f.cik = ?
-          AND (
-            form_type LIKE '%S-1%'
-            OR form_type LIKE '%10-K%'
-            OR form_type LIKE '8-K%'
-          )
-        ORDER BY COALESCE(f.filing_date, '') DESC, f.id DESC
-        LIMIT 60
-        """,
-        (cik_s,),
-    )
-    out: list[dict] = []
-    for r in cur.fetchall():
-        out.append(
-            {
-                "id": int(r["id"]),
-                "accession": r["accession"] or "",
-                "form_type": r["form_type"] or "",
-                "filing_date": r["filing_date"] or "",
-                "index_url": r["index_url"] or "",
-                "primary_doc_url": r["primary_doc_url"] or "",
-            }
-        )
-    return out
-
-
 def _desk_profile_row_tr(p: dict, *, hide_company: bool = False) -> str:
     """One desk person row; ``hide_company`` when the page is scoped to a single issuer."""
     company = html.escape(p["company_name"] or "")
@@ -4109,11 +4078,20 @@ def _desk_person_location_cell(p: dict) -> str:
     return ""
 
 
-def _desk_profile_row_tr_company_minimal(p: dict, *, blur_preview: bool = False) -> str:
+def _desk_profile_row_tr_company_minimal(
+    p: dict,
+    *,
+    blur_preview: bool = False,
+    sales_bundle: str = "premium",
+) -> str:
     """One person row for issuer drill-in; optional preview blur (location stays clear)."""
     loc = html.escape(_desk_person_location_cell(p) or "—")
     title = html.escape(p["title"] or "—")
-    href = html.escape(_profile_lead_url(p))
+    href = html.escape(
+        _profile_lead_url(
+            p, from_company_roster=True, sales_bundle=sales_bundle
+        )
+    )
     nm = html.escape(p["display_name"] or "")
     idx = html.escape(p["index_url"] or "")
     doc = html.escape(p["primary_doc_url"] or "")
@@ -4198,6 +4176,7 @@ def _desk_company_people_table(
     *,
     company_name: str,
     blur_preview: bool = False,
+    sales_bundle: str = "premium",
 ) -> str:
     """Person rows for one issuer — Location column first; optional preview blur."""
     co_plain = (company_name or "").strip() or "This issuer"
@@ -4205,7 +4184,9 @@ def _desk_company_people_table(
     if not profiles:
         return f"""<p class="meta dim">No people in this roster for {co_e}. Try the other tab.</p>"""
     rows = [
-        _desk_profile_row_tr_company_minimal(p, blur_preview=blur_preview)
+        _desk_profile_row_tr_company_minimal(
+            p, blur_preview=blur_preview, sales_bundle=sales_bundle
+        )
         for p in profiles
     ]
     inner = "".join(rows)
@@ -4402,7 +4383,7 @@ def _page_finder(
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>WealthPipeline — lead finder</title>
+  <title>{html.escape(advisor_ui_product_name())} — lead finder</title>
   <style>{css}{extra_css}</style>
 </head>
 <body class="wide">
@@ -4624,8 +4605,11 @@ def _shared_css() -> str:
     }
     body { margin: 0; padding: 1rem 1.1rem; max-width: 900px; margin-inline: auto; }
     body.wide { max-width: 1480px; }
-    nav.top { margin-bottom: 1rem; font-size: 0.84rem; }
-    nav.top a { color: #5eb3e0; }
+    nav.lead-back-nav { margin: 0 0 0.35rem 0; font-size: 0.84rem; line-height: 1.45; }
+    nav.lead-back-nav a { color: #6eb8e8; text-decoration: none; font-weight: 500; }
+    nav.lead-back-nav a:hover { text-decoration: underline; color: #8ecfff; }
+    .lead-profile-page nav.lead-back-nav { margin-bottom: 0.45rem; }
+    .lead-back-sep { margin: 0 0.35rem; user-select: none; }
     h1 { font-size: 1.2rem; font-weight: 600; margin-top: 0; letter-spacing: -0.02em; }
     h1 span.tag { font-weight: 400; color: #6b7785; font-size: 0.88rem; }
     h2 { font-size: 0.95rem; margin-top: 1.5rem; margin-bottom: 0.45rem; color: #a8b0ba; font-weight: 600; }
@@ -4835,23 +4819,25 @@ def _shared_css() -> str:
     .lead-advisor-equity-wrap {
       display: flex;
       flex-direction: column;
-      align-items: center;
+      align-items: stretch;
       width: 100%;
+      margin-top: 0.35rem;
     }
     table.lead-advisor-equity-snap {
-      width: auto;
+      width: 100%;
       max-width: 100%;
-      min-width: min(100%, 52rem);
-      margin-left: auto;
-      margin-right: auto;
+      min-width: 0;
+      margin: 0;
     }
     table.lead-advisor-equity-snap th,
     table.lead-advisor-equity-snap td {
       vertical-align: middle;
+      font-size: 0.82rem;
+      padding: 0.48rem 0.55rem;
     }
     table.lead-advisor-equity-snap th.num,
     table.lead-advisor-equity-snap td.num {
-      text-align: center;
+      text-align: right;
     }
     table.lead-advisor-equity-snap th.lead-eq-line,
     table.lead-advisor-equity-snap td.lead-eq-line {
@@ -4871,18 +4857,57 @@ def _shared_css() -> str:
     }
     .lead-eq-muted { color: #5c6775 !important; font-weight: 400; }
     .lead-advisor-equity-footnotes { color: #b8c0c8; }
-    .lead-adv-two-notes { max-width: 52rem; margin: 0 auto; }
+    .lead-adv-two-notes { max-width: 100%; margin: 0; }
     .lead-adv-foot-p { margin: 0 0 0.5rem 0; line-height: 1.55; text-align: left; }
     .lead-adv-eq-extras {
       margin-top: 0.65rem; padding-top: 0.55rem; border-top: 1px solid #2a3340;
-      max-width: 52rem; margin-left: auto; margin-right: auto;
+      max-width: 100%;
     }
     .lead-adv-extra-p { margin: 0 0 0.42rem 0; line-height: 1.5; font-size: 0.68rem; text-align: left; }
     .lead-advisor-equity-footnotes .lead-eq-filing { color: #9fd4a8; }
     .lead-advisor-equity-footnotes .lead-eq-implied { color: #7ec8f5; }
     .lead-filing-equity-hero {
-      border-left: 3px solid #238636;
+      border-left: 4px solid #238636;
       background: linear-gradient(180deg, #0f1712 0%, #101820 55%);
+      padding: 1.05rem 1.2rem 1.2rem;
+      margin-top: 0.5rem;
+      margin-bottom: 0.15rem;
+    }
+    .lead-equity-snapshot-h {
+      font-size: 1.28rem;
+      font-weight: 650;
+      letter-spacing: -0.02em;
+      margin: 0 0 0.45rem 0;
+      line-height: 1.2;
+      color: #f0f4f8;
+    }
+    .lead-equity-snapshot-lede {
+      font-size: 0.8rem;
+      margin: 0 0 0.6rem 0;
+      line-height: 1.5;
+      max-width: 44rem;
+      color: #9aa5b1;
+    }
+    .lead-advisor-equity-footnotes-below {
+      font-size: 0.72rem;
+      line-height: 1.55;
+      margin-top: 0.65rem;
+      max-width: 100%;
+    }
+    .lead-s1-comp-sidebar-h {
+      font-size: 1.05rem;
+      margin: 0 0 0.35rem 0;
+    }
+    .lead-s1-comp-sidebar-lede {
+      font-size: 0.72rem;
+      margin: 0 0 0.4rem 0;
+      line-height: 1.45;
+      max-width: 44rem;
+    }
+    .lead-comp-inline-hint {
+      font-size: 0.72rem;
+      margin: 0 0 0.35rem 0;
+      line-height: 1.4;
     }
     .lead-s1-pay-bundle-solo .lead-s1-pay-comp { max-width: 100%; }
     .hero { display: grid; gap: 0.75rem; margin-bottom: 1rem; }
@@ -4929,26 +4954,35 @@ def _shared_css() -> str:
       margin-bottom: 0.75rem;
     }
     details.audit summary:hover { color: #c5ccd4; }
-    body.lead-profile-page { max-width: 1180px; }
-    .lead-hero-context { max-width: 46rem; }
-    .lead-person-framing {
-      font-size: 0.82rem; line-height: 1.52; color: #a8b3be; margin: 0 0 0.85rem;
+    body.detail-page.lead-profile-page {
+      max-width: 1180px;
+      padding: 1.25rem clamp(1rem, 3.5vw, 1.75rem) 1.75rem;
+      -webkit-font-smoothing: antialiased;
     }
-    .lead-person-framing strong { color: #dbe2e8; font-weight: 600; }
-    .lead-filing-narrative {
-      border-left: 3px solid #238636;
-      background: linear-gradient(180deg, #0f1711 0%, #101820 40%);
+    .lead-page-header {
+      margin-bottom: 1.2rem;
+      padding-bottom: 1.05rem;
+      border-bottom: 1px solid #2e3847;
     }
-    .lead-filing-narrative .lead-filing-narrative-body p.meta {
-      line-height: 1.55; font-size: 0.86rem; color: #d0d7de;
+    .lead-profile-page .lead-page-header h1 {
+      font-size: clamp(1.5rem, 4vw, 1.95rem);
+      font-weight: 650;
+      letter-spacing: -0.035em;
+      line-height: 1.12;
+      margin: 0.4rem 0 0.45rem 0;
+      color: #f6f8fa;
     }
-    ul.lead-filing-bullets {
-      margin: 0.35rem 0 0.25rem 0.15rem; padding: 0 0 0 1.1rem;
-      line-height: 1.52; font-size: 0.84rem; color: #d8dee4;
+    .lead-profile-page .lead-hero-line {
+      font-size: 0.9375rem;
+      color: #b1bac4;
+      line-height: 1.5;
+      margin: 0 0 0.75rem 0;
     }
-    ul.lead-filing-bullets li { margin: 0.38rem 0; padding-left: 0.15rem; }
-    .lead-filing-bullets-wrap { margin: 0 0 0.85rem; }
-    .lead-page-header { margin-bottom: 1rem; padding-bottom: 0.85rem; border-bottom: 1px solid #2a3340; }
+    .lead-profile-page .card {
+      border-radius: 8px;
+      border-color: #2e3847;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+    }
     .lead-beneficial-verify {
       margin: 0 0 0.55rem 0;
       padding: 0.5rem 0.65rem;
@@ -4994,16 +5028,6 @@ def _shared_css() -> str:
       font-size: 0.74rem;
       line-height: 1.45;
       color: #c5d4e8;
-    }
-    p.lead-important-people-beneficial-note {
-      margin: 0 0 0.5rem 0;
-      padding: 0.45rem 0.55rem;
-      border-radius: 4px;
-      border-left: 3px solid #316d9a;
-      background: #121a22;
-      font-size: 0.74rem;
-      line-height: 1.45;
-      color: #b8c5d4;
     }
     .lead-beneficial-offering-wrap {
       margin: 0 0 0.45rem 0;
@@ -5095,9 +5119,10 @@ def _shared_css() -> str:
     .lead-hero-line { font-size: 0.92rem; line-height: 1.5; color: #c5ccd4; margin: 0.25rem 0 0.65rem; }
     .lead-hero-sep { color: #5c6570; margin: 0 0.35rem; }
     .lead-hero-kv {
-      display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.5rem 1rem;
-      margin: 0.35rem 0 0.25rem; padding: 0.65rem 0.75rem;
-      background: #101820; border: 1px solid #2a3340; border-radius: 6px;
+      display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.55rem 1.1rem;
+      margin: 0.35rem 0 0.35rem; padding: 0.75rem 0.9rem;
+      background: linear-gradient(180deg, #111820 0%, #0e141c 100%);
+      border: 1px solid #2e3847; border-radius: 8px;
     }
     @media (min-width: 640px) { .lead-hero-kv { grid-template-columns: repeat(4, 1fr); } }
     .lead-held-kv { margin-top: 0; }
@@ -5187,6 +5212,53 @@ def _shared_css() -> str:
     }
     .lead-kv-v { font-size: 0.88rem; color: #e8ecf0; line-height: 1.35; word-break: break-word; }
     .lead-hero-links { margin: 0.45rem 0 0; font-size: 0.84rem; }
+    .lead-equity-comp-split {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 1.15rem;
+      align-items: start;
+      width: 100%;
+      margin: 0 0 1.1rem 0;
+    }
+    .lead-equity-comp-split .lead-equity-comp-col { min-width: 0; width: 100%; }
+    .lead-equity-comp-split .lead-equity-comp-secondary .lead-comp-table-wrap {
+      overflow-x: visible;
+      max-width: 100%;
+    }
+    .lead-equity-comp-split .lead-equity-comp-secondary div.table-wrap.lead-comp-table-wrap {
+      overflow-x: visible;
+    }
+    .lead-equity-comp-split .lead-equity-comp-secondary table.lead-comp-breakout {
+      width: 100%;
+      min-width: 0;
+      table-layout: auto;
+    }
+    .lead-equity-comp-split .lead-equity-comp-secondary table.lead-comp-breakout th,
+    .lead-equity-comp-split .lead-equity-comp-secondary table.lead-comp-breakout td {
+      font-size: 0.78rem;
+      padding: 0.45rem 0.5rem;
+      white-space: normal;
+      word-break: normal;
+      overflow-wrap: anywhere;
+      vertical-align: top;
+    }
+    .lead-equity-comp-split .lead-equity-comp-secondary table.lead-comp-breakout .num {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .lead-equity-comp-split .lead-equity-comp-secondary table.lead-comp-breakout th:first-child,
+    .lead-equity-comp-split .lead-equity-comp-secondary table.lead-comp-breakout td:first-child {
+      width: 2.75rem;
+    }
+    @media (max-width: 480px) {
+      .lead-equity-comp-split .lead-equity-comp-secondary table.lead-comp-breakout th,
+      .lead-equity-comp-split .lead-equity-comp-secondary table.lead-comp-breakout td {
+        font-size: 0.68rem;
+        padding: 0.35rem 0.28rem;
+      }
+    }
+    .lead-s1-comp-sidebar .lead-s1-pay-comp { margin-top: 0.15rem; }
     .lead-comp-fullwidth {
       width: 100%;
       margin: 0 0 1.1rem 0;
@@ -5407,7 +5479,7 @@ def _page_desk(
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>WealthPipeline — lead desk</title>
+  <title>{html.escape(advisor_ui_product_name())} — lead desk</title>
   <style>{css}</style>
 </head>
 <body class="wide">
@@ -5554,6 +5626,7 @@ def _page_desk_company(
         stats,
         company_name=co_plain,
         blur_preview=blur_preview,
+        sales_bundle=sb_cur,
     )
     row_sel = "#desk-co-body tr.desk-row[data-href]"
     return f"""<!DOCTYPE html>
@@ -5622,75 +5695,6 @@ def _canonical_external_url(raw: str, *, base: str = "") -> str:
     if "." in host and " " not in host and not host.startswith("."):
         return "https://" + s.lstrip("/")
     return ""
-
-
-def _filings_table_html(filings: list[dict]) -> str:
-    if not filings:
-        return "<p class='meta'>No linked filings in DB for this person.</p>"
-    rows = []
-    for f in filings:
-        idx = html.escape(f.get("index_url") or "")
-        doc = html.escape(f.get("primary_doc_url") or "")
-        idx_l = f'<a href="{idx}" target="_blank" rel="noopener">EDGAR</a>' if idx else "—"
-        doc_l = f'<a href="{doc}" target="_blank" rel="noopener">Doc</a>' if doc else "—"
-        rows.append(
-            "<tr>"
-            f"<td>{html.escape(f.get('filing_date') or '')}</td>"
-            f"<td>{html.escape(f.get('form_type') or '')}</td>"
-            f"<td class='cik'>{html.escape(f.get('accession') or '')}</td>"
-            f"<td>{idx_l} · {doc_l}</td>"
-            "</tr>"
-        )
-    return (
-        "<div class='table-wrap'><table><thead><tr>"
-        "<th>Filing date</th><th>Form</th><th>Accession</th><th>Links</th>"
-        "</tr></thead><tbody>"
-        + "".join(rows)
-        + "</tbody></table></div>"
-    )
-
-
-def _json_leaf_display_str(v: object) -> str:
-    """Issuer snapshot values come from json.loads — may be int/float/bool, not only strings."""
-    if v is None:
-        return ""
-    if isinstance(v, (dict, list)):
-        return ""
-    s = str(v).strip()
-    return s
-
-
-def _issuer_snapshot_card_html(snap: dict) -> str:
-    if not snap:
-        return (
-            '<div class="card advisor-company-snapshot">'
-            '<h3 class="advisor-subh" style="margin-top:0">At a glance (enriched)</h3>'
-            '<p class="meta" style="margin-bottom:0">'
-            "<span class='dim'>Not generated yet.</span> Run "
-            "<code>enrich-client-research</code> after issuer summary exists."
-            "</p></div>"
-        )
-    parts: list[str] = []
-    for key, title in [
-        ("headline", "At a glance"),
-        ("business_plain", "What they do"),
-        ("pool_angle", "Why scale matters for outreach"),
-    ]:
-        v = _json_leaf_display_str(snap.get(key))
-        if v:
-            parts.append(
-                f'<h3 class="advisor-subh">{html.escape(title)}</h3>'
-                f'<p class="meta" style="margin-top:0.2rem">{html.escape(v)}</p>'
-            )
-    cave = _json_leaf_display_str(snap.get("caveat"))
-    if cave:
-        parts.append(f'<p class="meta dim" style="margin-top:0.65rem">{html.escape(cave)}</p>')
-    body = "".join(parts) if parts else "<p class='meta dim'>Snapshot empty — re-run enrichment.</p>"
-    return (
-        '<div class="card advisor-company-snapshot">'
-        f"{body}"
-        "</div>"
-    )
 
 
 def _lead_company_public_card_html(p: dict) -> str:
@@ -6117,95 +6121,6 @@ def _client_research_card_html(
     )
 
 
-def _beneficial_outreach_shareholders_card_html(rows: Optional[list[dict]]) -> str:
-    """Company column: same table pattern as summary comp — illustrative stake, %, address, filing."""
-    if not rows:
-        return ""
-    econ_hdr = _beneficial_offering_snapshot_html(rows[0], include_holder_shares=False)
-    body: list[str] = [
-        "<thead><tr>",
-        '<th scope="col">Name</th>',
-        '<th scope="col" title="Pre-offering shares from beneficial ownership table">Shares</th>',
-        '<th scope="col" title="Shares × net $/share from filing when underwriting is parsed (illustrative)">'
-        "Illustrative value</th>",
-        '<th scope="col" title="Percent beneficial per table">%</th>',
-        '<th scope="col">Mailing / footnote address</th>',
-        '<th scope="col">Filing date</th>',
-        "</tr></thead><tbody>",
-    ]
-    for g in rows:
-        nm_raw = str(g.get("holder_name") or "").strip()
-        nm = html.escape(nm_raw)
-        notes = (g.get("outreach_notes") or "").strip()
-        title_attr = (
-            f' title="{html.escape(notes[:420] + ("…" if len(notes) > 420 else ""), quote=True)}"'
-            if notes
-            else ""
-        )
-        sh_raw = g.get("shares_before_offering")
-        if sh_raw is not None:
-            try:
-                sh_cell = f'<td class="num">{float(sh_raw):,.0f}</td>'
-            except (TypeError, ValueError):
-                sh_cell = '<td class="num dim">—</td>'
-        else:
-            sh_cell = '<td class="num dim">—</td>'
-        val_cell = f"<td class=\"num strong\">{_money(g.get('notional_usd_est'))}</td>"
-        pct_cell = f"<td class=\"num\">{_beneficial_pct_cell(g.get('pct_beneficial'))}</td>"
-        addr = (g.get("mailing_address") or "").strip()
-        doc_u = (g.get("stake_primary_doc_url") or "").strip()
-        ma = (g.get("mailing_footnote_doc_anchor") or "").strip()
-        if addr:
-            ae = html.escape(addr.replace("\r\n", "\n"))
-            mu = filing_doc_url_with_fragment(doc_u, ma) if doc_u and ma else ""
-            if mu:
-                addr_cell = (
-                    f"<td class=\"num\" style=\"max-width:14rem;font-size:0.82rem;"
-                    f'white-space:pre-line;line-height:1.35;word-break:break-word">'
-                    f'<a href="{html.escape(mu)}" target="_blank" rel="noopener" '
-                    f'title="Filing footnote">{ae}</a></td>'
-                )
-            else:
-                addr_cell = (
-                    f"<td class=\"num\" style=\"max-width:14rem;font-size:0.82rem;"
-                    f'white-space:pre-line;line-height:1.35;word-break:break-word">{ae}</td>'
-                )
-        else:
-            addr_cell = "<td class=\"dim\">—</td>"
-        fd = html.escape(str(g.get("stake_filing_date") or "—"))
-        fil_cell = f'<td class="num">{fd}</td>'
-        body.append(
-            "<tr>"
-            f"<td><strong{title_attr}>{nm}</strong></td>"
-            f"{sh_cell}{val_cell}{pct_cell}{addr_cell}{fil_cell}</tr>"
-        )
-    body.append("</tbody>")
-    tbl = (
-        '<div class="table-wrap lead-comp-table-wrap">'
-        '<table class="inner-comp lead-comp-breakout">'
-        + "".join(body)
-        + "</table></div>"
-    )
-    foot = (
-        '<p class="meta dim lead-comp-foot" style="font-size:0.78rem;line-height:1.45;margin:0.4rem 0 0">'
-        '<span title="Filing-only illustration; not a solicitation.">'
-        "Illustrative S-1 positions. Natural-person holders with address or material stake; excludes funds and "
-        "entities.</span></p>"
-    )
-    return (
-        '<div class="lead-comp-breakout-wrap card lead-beneficial-gems">'
-        '<h2 class="lead-section-h">Key individual shareholders</h2>'
-        '<p class="meta dim" style="margin:0 0 0.45rem;font-size:0.75rem;line-height:1.45">'
-        "Natural-person rows from the S-1 beneficial-ownership parse (mailing and/or material stake). "
-        "Sanity-check these names against officers for this issuer."
-        '<span class="dim" style="display:block;margin-top:0.28rem;font-size:0.7rem">'
-        "Under <strong>Compensation</strong>, <em>Beneficial ownership (same person)</em> is the automatic "
-        "name match for the profile you opened — compare its <strong>Name in table</strong> to rows here. "
-        "Per-share snapshot below applies to every row.</span></p>"
-        f"{econ_hdr}{tbl}{foot}</div>"
-    )
-
-
 def _latest_filing_snapshot_caveats_for_cik(conn: sqlite3.Connection, cik: str) -> str:
     """LLM ``filing_snapshot_caveats`` from newest stored ``s1_llm_lead_pack`` for this issuer."""
     ck = (cik or "").strip()
@@ -6267,147 +6182,6 @@ def _beneficial_ownership_verify_banner_html(llm_caveats: object) -> str:
     )
 
 
-def _latest_important_people_from_s1_llm_pack(
-    conn: sqlite3.Connection, cik: str
-) -> list[dict]:
-    """``important_people`` from latest ``filings.s1_llm_lead_pack`` (enrich-s1-ai)."""
-    ck = (cik or "").strip()
-    if not ck:
-        return []
-    try:
-        r = conn.execute(
-            """
-            SELECT s1_llm_lead_pack FROM filings
-            WHERE cik = ? AND s1_llm_lead_pack IS NOT NULL
-              AND TRIM(s1_llm_lead_pack) != ''
-            ORDER BY COALESCE(filing_date, '') DESC, id DESC
-            LIMIT 1
-            """,
-            (ck,),
-        ).fetchone()
-    except sqlite3.Error:
-        return []
-    if not r:
-        return []
-    raw = (r["s1_llm_lead_pack"] or "").strip()
-    if not raw:
-        return []
-    try:
-        pack = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(pack, dict):
-        return []
-    ip = pack.get("important_people")
-    if not isinstance(ip, list):
-        return []
-    out: list[dict] = []
-    for x in ip:
-        if not isinstance(x, dict) or not (str(x.get("name") or "").strip()):
-            continue
-        try:
-            out.append(dict(x))
-        except (TypeError, ValueError):
-            continue
-    return out[:40]
-
-
-def _important_people_beneficial_lead_note_html(beneficial_only: bool) -> str:
-    """Callout when the lead is beneficial-only: AI card is supplementary to the comp snapshot."""
-    if not beneficial_only:
-        return ""
-    return (
-        '<p class="lead-important-people-beneficial-note">'
-        "<strong>Major-shareholder lead:</strong> This is <em>supplementary</em> S-1 excerpt context from "
-        "<code>enrich-s1-ai</code> — not a second source of truth. Use the <strong>Compensation</strong> "
-        "card for stake math; use this for relationships, footnotes, and planning hooks. The LLM only saw "
-        "a window of the filing; reverse splits, distress, and post-filing events may be missing — see the "
-        "yellow verify box above the snapshot.</p>"
-    )
-
-
-def _important_people_s1_ai_card_html(
-    people: Optional[list[dict]], *, beneficial_only: bool = False
-) -> str:
-    """LLM-curated individuals (spouses, beneficial owners, etc.) from ``enrich-s1-ai``."""
-    if not isinstance(people, list):
-        people = []
-    note = _important_people_beneficial_lead_note_html(beneficial_only)
-    if not people:
-        return (
-            '<div class="card lead-important-people-ai">'
-            '<h2 class="lead-section-h">Important people (S-1 AI)</h2>'
-            f"{note}"
-            '<p class="meta dim" style="margin:0">'
-            "No AI extract yet. Run <code>python -m wealth_leads enrich-s1-ai</code> on this issuer’s S-1 "
-            "so the model can list beneficial owners, spouses, and footnotes — not only named executives."
-            "</p></div>"
-        )
-    items: list[str] = []
-    for pe in people[:20]:
-        nm = html.escape(str(pe.get("name") or ""))
-        cat = html.escape(str(pe.get("category") or "").replace("_", " "))
-        rel = (pe.get("relationship_to_company_or_insider") or "").strip()
-        sh = (pe.get("shares_disclosed") or "").strip()
-        own = (pe.get("ownership_or_interest_text") or "").strip()
-        implied = (pe.get("implied_value_at_offering_text") or "").strip()
-        addr = (pe.get("disclosed_address") or "").strip()
-        hook = (pe.get("wealth_or_planning_hook") or "").strip()
-        src = (pe.get("source_hint") or "").strip()
-        bits: list[str] = []
-        if rel:
-            bits.append(html.escape(rel[:500] + ("…" if len(rel) > 500 else "")))
-        if sh:
-            bits.append(
-                "<span class='dim'>Shares (filing):</span> "
-                + html.escape(sh[:180] + ("…" if len(sh) > 180 else ""))
-            )
-        if own:
-            bits.append(
-                "<span class='dim'>Interest:</span> "
-                + html.escape(own[:400] + ("…" if len(own) > 400 else ""))
-            )
-        if implied:
-            bits.append(
-                "<span class='dim'>Illustrative at offering price (from excerpt):</span> "
-                "<strong>"
-                + html.escape(implied[:500] + ("…" if len(implied) > 500 else ""))
-                + "</strong>"
-            )
-        if addr:
-            bits.append(
-                "<span class='dim'>Address (filing):</span> "
-                + html.escape(addr[:300] + ("…" if len(addr) > 300 else ""))
-            )
-        if hook:
-            bits.append(
-                "<span class='dim'>Hook:</span> "
-                + html.escape(hook[:400] + ("…" if len(hook) > 400 else ""))
-            )
-        if src:
-            bits.append(f"<span class='dim'>{html.escape(src[:200])}</span>")
-        body = "<br/>".join(bits) if bits else ""
-        items.append(
-            f"<li style='margin:0.6rem 0'><strong>{nm}</strong>"
-            f"{' · <span class=\"dim\">' + cat + '</span>' if cat else ''}"
-            f"{('<div class=\"meta\" style=\"margin-top:0.3rem;line-height:1.45\">' + body + '</div>') if body else ''}"
-            f"</li>"
-        )
-    return (
-        '<div class="card lead-important-people-ai">'
-        '<h2 class="lead-section-h">Important people (S-1 AI)</h2>'
-        f"{note}"
-        '<p class="meta dim" style="margin-top:0;font-size:0.78rem">'
-        "From <code>enrich-s1-ai</code> — same disclosure neighborhood as <strong>security ownership of "
-        "certain beneficial owners and management</strong>: individuals and footnotes. When the excerpt includes "
-        "both a person’s stake and an assumed offering price per share, we ask the model for an illustrative "
-        "shares × price line (not a market valuation)."
-        "</p><ul style='list-style:none;padding-left:0;margin:0.35rem 0 0'>"
-        + "".join(items)
-        + "</ul></div>"
-    )
-
-
 def _lead_safe_text(v: object) -> str:
     """Coerce DB / profile values for HTML and string ops (avoid TypeError on strip/escape)."""
     if v is None:
@@ -6420,91 +6194,33 @@ def _lead_safe_text(v: object) -> str:
     return str(v).strip()
 
 
-def _heuristic_filing_narrative_sentence_bullets(text: str, *, max_items: int = 5) -> list[str]:
-    """Cheap fallback when stored LLM bullets are missing — split filing prose into chunks."""
-    raw = (text or "").strip()
-    if not raw:
-        return []
-    paras = [p.strip() for p in re.split(r"\n\s*\n", raw) if p.strip()]
-    chunks: list[str] = []
-    if len(paras) >= 2:
-        for p in paras:
-            one = " ".join(p.split())
-            if len(one) < 40:
-                continue
-            chunks.append(one[:350] + ("…" if len(one) > 350 else ""))
-            if len(chunks) >= max_items:
-                return chunks
-    merged = " ".join(raw.split())
-    for part in re.split(r"(?<=[.!?])\s+", merged):
-        part = part.strip()
-        if len(part) < 40:
-            continue
-        if len(part) > 350:
-            part = part[:347].rsplit(" ", 1)[0] + "…"
-        chunks.append(part)
-        if len(chunks) >= max_items:
-            break
-    return chunks
-
-
-def _filing_narrative_bullets_to_ul(stored_raw: str, *, heuristic_source: str) -> str:
-    items: list[str] = []
-    for line in (stored_raw or "").splitlines():
-        s = line.strip()
-        if s.startswith("- "):
-            s = s[2:].strip()
-        elif s.startswith("* "):
-            s = s[2:].strip()
-        elif re.match(r"^\d+\.", s):
-            s = re.sub(r"^\d+\.\s*", "", s).strip()
-        else:
-            continue
-        if s:
-            items.append(s)
-    if not items and (stored_raw or "").strip():
-        for line in (stored_raw or "").splitlines():
-            t = line.strip()
-            if len(t) >= 35:
-                items.append(t[:350] + ("…" if len(t) > 350 else ""))
-            if len(items) >= 5:
-                break
-    if not items:
-        items = _heuristic_filing_narrative_sentence_bullets(heuristic_source)
-    if not items:
-        return ""
-    lis = "".join(f"<li>{html.escape(_lead_safe_text(x))}</li>" for x in items)
-    return f'<ul class="lead-filing-bullets">{lis}</ul>'
-
-
-def _lead_filing_narrative_bullets_html(
-    mb_text: str, client_research: Optional[dict]
-) -> str:
-    stored = ""
-    if isinstance(client_research, dict):
-        stored = _lead_safe_text(client_research.get("filing_narrative_bullets"))
-    return _filing_narrative_bullets_to_ul(stored, heuristic_source=_lead_safe_text(mb_text))
-
-
 def _page_lead(
     profile: Optional[dict],
-    filings: list[dict],
     *,
     query_cik: str,
     query_name: str,
     stats: dict,
     rendered_at: str,
     client_research: Optional[dict] = None,
-    issuer_snapshot: Optional[dict] = None,
-    important_people_llm: Optional[list[dict]] = None,
-    beneficial_individual_shareholders: Optional[list[dict]] = None,
     beneficial_stake_detail: Optional[dict] = None,
     officer_beneficial_stake: Optional[dict] = None,
     beneficial_filing_caveats: str = "",
     lead_recency: Optional[dict[str, Any]] = None,
     lead_page_msg: str = "",
+    lead_back_href: str = "/",
+    lead_back_label: str = "Lead desk",
+    lead_back_company_href: Optional[str] = None,
+    lead_back_company_label: str = "Company roster",
 ) -> str:
     css = _shared_css()
+    back_h_e = html.escape(lead_back_href, quote=True)
+    back_l_e = html.escape(lead_back_label)
+    back_nav_html = _lead_profile_back_nav_html(
+        lead_back_href,
+        lead_back_label,
+        company_href=lead_back_company_href,
+        company_label=lead_back_company_label,
+    )
     if profile is None:
         q = html.escape(urlencode({"cik": query_cik, "name": query_name}))
         return f"""<!DOCTYPE html>
@@ -6512,15 +6228,15 @@ def _page_lead(
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Lead not found — WealthPipeline</title>
+  <title>Lead not found — {html.escape(advisor_ui_product_name())}</title>
   <style>{css}</style>
 </head>
 <body>
-  <nav class="top"><a href="/">← Lead desk</a> · <a href="/finder">Lead finder</a></nav>
+  {back_nav_html}
   <h1>Profile not found</h1>
   <p class="meta">No matching executive + CIK in your snapshot. Check <code>cik</code> and <code>name</code> query params, run <code>sync</code>, or return to the desk.</p>
   <p class="meta">Requested: CIK <code>{html.escape(query_cik)}</code>, name <code>{html.escape(query_name)}</code></p>
-  <p class="meta"><a href="/?">Back to lead desk</a> · <a href="/lead?{q}">Retry this URL</a></p>
+  <p class="meta"><a href="{back_h_e}">← {back_l_e}</a> · <a href="/lead?{q}">Retry this URL</a></p>
 </body>
 </html>"""
 
@@ -6550,79 +6266,6 @@ def _page_lead(
             '<span class="badge badge-tier-visibility" title="Officer/director table; no summary comp row '
             "in this database.\">Visibility</span>"
         )
-
-    dts_body = (p.get("director_term_summary") or "").strip()
-    director_card = f"""
-    <div class="card">
-      <h2 class="lead-section-h">Director &amp; board terms</h2>
-      <p class="meta" style="margin-bottom:0">{html.escape(dts_body) if dts_body else "<span class='dim'>—</span> <span class='dim' style='font-size:0.78rem'>(<code>backfill-comp --force</code>)</span>"}</p>
-    </div>"""
-
-    mb = _lead_safe_text(p.get("mgmt_bio_text"))
-    mb_role = _lead_safe_text(p.get("mgmt_bio_role"))
-    mb_name = _lead_safe_text(p.get("mgmt_bio_display_name"))
-    disp = _lead_safe_text(p.get("display_name"))
-    mb_bullets_block = ""
-    if mb:
-        mb_ul = _lead_filing_narrative_bullets_html(mb, client_research)
-        if mb_ul:
-            fnb = (
-                client_research.get("filing_narrative_bullets")
-                if isinstance(client_research, dict)
-                else None
-            )
-            has_llm_bullets = bool(_lead_safe_text(fnb))
-            snap_note = (
-                "Compressed from the filing when you run <code>enrich-client-research</code> with LLM."
-                if has_llm_bullets
-                else "Auto-split from the filing — run enrich with LLM for smarter bullets (skips title noise)."
-            )
-            mb_bullets_block = (
-                '<div class="lead-filing-bullets-wrap">'
-                '<p class="meta" style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.06em;'
-                'color:#6b7785;margin:0 0 0.35rem">From the filing (extra context)</p>'
-                f"{mb_ul}"
-                '<p class="meta dim" style="font-size:0.66rem;margin:0.35rem 0 0;line-height:1.35">'
-                f"{snap_note} Verify on EDGAR.</p></div>"
-            )
-    if mb:
-        paras = [html.escape(x.strip()) for x in mb.split("\n\n") if x.strip()]
-        paras_html = "".join(
-            f"<p class='meta' style='margin-top:0.35rem; margin-bottom:0'>{x}</p>"
-            for x in paras
-        )
-        full_narrative_fold = (
-            '<details class="lead-more lead-filing-fulltext" style="margin-top:0.35rem">'
-            '<summary class="meta dim" style="font-size:0.78rem;cursor:pointer">'
-            "Full narrative as filed <span class='dim'>(verbatim)</span></summary>"
-            f'<div class="lead-filing-narrative-body" style="margin-top:0.45rem">{paras_html}</div>'
-            "</details>"
-        )
-        bullets_section = (
-            mb_bullets_block
-            if mb_bullets_block
-            else '<p class="meta dim" style="margin:0 0 0.35rem;font-size:0.78rem;line-height:1.4">'
-            "No bullet summary yet — <code>enrich-client-research</code> with LLM, or open the full narrative below.</p>"
-        )
-        mgmt_narrative_card = f"""
-    <div class="card lead-filing-narrative">
-      <h2 class="lead-section-h">Filing narrative (SEC)</h2>
-      <p class="meta dim" style="font-size:0.72rem;margin:0 0 0.45rem;line-height:1.4">
-        Bullet notes from the registration statement — not your page header (name / title / company).</p>
-      {bullets_section}
-      {full_narrative_fold}
-    </div>"""
-    else:
-        mgmt_narrative_card = f"""
-    <div class="card bio-placeholder lead-filing-narrative">
-      <h2 class="lead-section-h">Filing narrative (SEC)</h2>
-      <p class="meta dim" style="font-size:0.76rem;margin:0 0 0.6rem;line-height:1.45">
-        When captured, this section carries experience, education, and other roles as stated in the filing.</p>
-      <p class="meta" style="margin-bottom:0">
-        <span class='dim'>No management narrative matched this person yet.</span>{(' ' + doc_link) if doc_link else ''}
-        <span class='dim' style='font-size:0.78rem'> · <code>backfill-comp --force</code></span>
-      </p>
-    </div>"""
 
     oa = p.get("officer_age")
     stated = p.get("age_stated_in_filing")
@@ -6667,23 +6310,10 @@ def _page_lead(
             hq_loc = mat
     hq_loc_esc = html.escape(hq_loc) if hq_loc else ""
     web_raw = (p.get("issuer_website") or "").strip()
-    summ_body = (p.get("issuer_summary") or "").strip()
-    summ_html = (
-        html.escape(summ_body)
-        if summ_body
-        else "<span class='dim'>Not extracted — run <code>sync</code> or <code>backfill-comp --force</code>.</span>"
-    )
 
     age_title_attr = html.escape(age_hero_title, quote=True) if age_hero_title else ""
 
-    snap_dict = issuer_snapshot or {}
     company_intro_card = _lead_company_public_card_html(p)
-    snapshot_card = _issuer_snapshot_card_html(snap_dict)
-    snapshot_folded = (
-        '<details class="lead-more lead-snapshot-fold">'
-        "<summary>Company snapshot <span class='dim'>(if enriched)</span></summary>"
-        f'<div class="lead-snapshot-inner">{snapshot_card}</div></details>'
-    )
 
     cik_s = str(p.get("cik") or "").strip()
     sec_co = _sec_edgar_company_filings_url(cik_s)
@@ -6765,12 +6395,6 @@ def _page_lead(
         <span class="lead-kv-v">{tier_badge}</span></div>
     </div>"""
 
-    why_card = f"""
-    <div class="card lead-why-card">
-      <h2 class="lead-section-h">Why on the desk</h2>
-      <p class="meta" style="margin-bottom:0">{html.escape(p.get('why_surfaced') or '—')}</p>
-    </div>"""
-
     _mail_ft = ""
     _bo_doc = (p.get("primary_doc_url") or "").strip()
     _bo_mail_anchor = ""
@@ -6788,41 +6412,10 @@ def _page_lead(
         filing_mailing_anchor=_bo_mail_anchor if beneficial_only else "",
     )
 
-    _browse_all = _sec_edgar_company_filings_url(p.get("cik"))
-    _browse_all_html = (
-        f' <a href="{html.escape(_browse_all)}" target="_blank" rel="noopener">'
-        "See every filing on sec.gov</a> (10-K, 8-K, etc. — not limited to this S-1 index)."
-        if _browse_all
-        else ""
-    )
-    filings_block = f"""
-    <h3 class="lead-section-h" style="margin-top:0.75rem">Issuer filings</h3>
-    <p class="meta dim" style="font-size:0.78rem">Synced DB, newest first.{_browse_all_html}</p>
-    {_filings_table_html(filings)}
-    """
-
-    source_details = f"""
-    <details class="lead-more">
-      <summary>More filing detail</summary>
-      <p class="meta" style="margin-top:0.65rem; margin-bottom:0"><strong>Issuer summary (extracted)</strong></p>
-      <p class="meta" style="margin-top:0.35rem">{summ_html}</p>
-      {director_card}
-      {filings_block}
-    </details>"""
-
-    _indiv_rows = beneficial_individual_shareholders or []
-    shareholders_card = _beneficial_outreach_shareholders_card_html(_indiv_rows)
-    ip_card = _important_people_s1_ai_card_html(
-        important_people_llm, beneficial_only=beneficial_only
-    )
     col_company = f"""
     <aside class="lead-col lead-col-company" aria-labelledby="lead-col-company">
       <div class="lead-col-title" id="lead-col-company">Company</div>
-      {shareholders_card}
-      {ip_card}
       {company_intro_card}
-      {snapshot_folded}
-      {source_details}
     </aside>"""
 
     comp_fullwidth = f"""
@@ -6832,20 +6425,9 @@ def _page_lead(
       </div>
     </section>"""
 
-    _person_note = (
-        '<p class="lead-person-framing"><strong>Filing-sourced context.</strong> Ownership tables and footnote '
-        "addresses come from beneficial-ownership disclosures — not a company directory or email product.</p>"
-        if beneficial_only
-        else '<p class="lead-person-framing"><strong>SEC-grounded profile.</strong> The center column is ownership '
-        "and pay as disclosed. This column leads with the <em>filing narrative</em> (regulatory). "
-        "Website scrape and email patterns below are optional conveniences — verify before you rely on them.</p>"
-    )
-    col_person = f"""
-    <main class="lead-col lead-col-person" aria-labelledby="lead-col-person">
-      <div class="lead-col-title" id="lead-col-person">Person</div>
-      {_person_note}
-      {why_card}
-      {mgmt_narrative_card}
+    col_contact = f"""
+    <main class="lead-col lead-col-person" aria-labelledby="lead-col-contact">
+      <div class="lead-col-title" id="lead-col-contact">Contact</div>
       {research_card}
     </main>"""
 
@@ -6855,12 +6437,12 @@ def _page_lead(
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"/>
-  <title>{html.escape(p.get('display_name') or 'Lead')} — WealthPipeline</title>
+  <title>{html.escape(p.get('display_name') or 'Lead')} — {html.escape(advisor_ui_product_name())}</title>
   <style>{css}</style>
 </head>
 <body class="detail-page lead-profile-page">
   <header class="lead-page-header">
-    <nav class="top"><a href="/">← Lead desk</a> · <a href="/finder">Lead finder</a></nav>
+    {back_nav_html}
     <h1>{html.escape(p.get('display_name') or '—')}</h1>
     <p class="lead-hero-line">
       <strong title="{html.escape((p.get('title') or '—').strip() or '—', quote=True)}">{html.escape(advisor_title_badge((p.get('title') or '').strip() or '—'))}</strong>
@@ -6873,16 +6455,13 @@ def _page_lead(
     {msg_html}
     {stale_banner}
     {hero_kv}
-    <p class="lead-hero-context meta dim" style="margin:0.55rem 0 0;font-size:0.78rem;line-height:1.5">
-      Built around <strong>who they are in the filing</strong>, <strong>disclosed economics</strong>, and
-      <strong>issuer context</strong> — not only name, title, and guessed contact paths.</p>
     <p class="meta dim" style="font-size:0.68rem;margin:0.4rem 0 0;line-height:1.35">Page snapshot: {html.escape(rendered_at)} · Use a full refresh (Ctrl+F5) if this time does not change.</p>
     <p class="lead-hero-links meta">{quick_links if quick_links else "<span class='dim'>No EDGAR links on file</span>"}</p>
   </header>
   {comp_fullwidth}
   <div class="lead-split" role="presentation">
     {col_company}
-    {col_person}
+    {col_contact}
   </div>
   {_live_reload_snippet()}
 </body>
@@ -6928,23 +6507,44 @@ def _lead_page_db_stats(conn: sqlite3.Connection, *, db_mtime: str) -> dict:
 _LOAD_PAGE_DATA_CACHE: dict[str, Any] = {"key": None, "blob": None}
 
 
+def _desk_page_cache_signature() -> tuple[Any, ...]:
+    """Invalidate cached desk rows when inclusion rules change without a DB file touch."""
+    return (
+        bool(lead_desk_s1_only()),
+        bool(lead_desk_us_registrant_hq_only()),
+        bool(lead_desk_include_beneficial_only_leads()),
+        bool(lead_desk_include_visibility_tier()),
+        bool(lead_desk_exclude_issuer_risk_high()),
+    )
+
+
 def _load_page_data(
-    *, omit_audit_tables: bool = False
+    *,
+    omit_audit_tables: bool = False,
+    company_cik: Optional[str] = None,
 ) -> tuple[list[dict], list[dict], list[sqlite3.Row], list[sqlite3.Row], dict]:
     dbp = database_path()
     if not Path(dbp).is_file():
         empty = {"missing_db": True, "profile_count": 0, "profile_count_all": 0}
         return [], [], [], [], empty
 
+    ckw = (company_cik or "").strip()
+    if ckw and not omit_audit_tables:
+        ckw = ""
+
     st = Path(dbp).stat()
-    cache_key = (str(dbp), st.st_mtime, st.st_size)
+    cache_key = (str(dbp), st.st_mtime, st.st_size, _desk_page_cache_signature())
     global _LOAD_PAGE_DATA_CACHE
     if _LOAD_PAGE_DATA_CACHE.get("key") == cache_key:
         blob = _LOAD_PAGE_DATA_CACHE.get("blob")
         if blob is not None:
-            profiles_all, leads, comp, nf, no, nc, latest, mtime_s = blob
-            with connect() as conn:
-                profiles = _lead_desk_filter_profiles(profiles_all, conn)
+            # v2 blob stores desk-filtered profiles to avoid re-scanning all rows on every page (e.g. /desk/company).
+            if len(blob) == 9:
+                profiles_all, profiles, leads, comp, nf, no, nc, latest, mtime_s = blob
+            else:
+                profiles_all, leads, comp, nf, no, nc, latest, mtime_s = blob
+                with connect() as conn:
+                    profiles = _lead_desk_filter_profiles(profiles_all, conn)
             stats = {
                 "missing_db": False,
                 "filings": nf,
@@ -6958,11 +6558,25 @@ def _load_page_data(
                 "latest_filing_date": latest,
                 "db_file_modified": mtime_s,
             }
+            if ckw:
+                profiles = [
+                    p for p in profiles if str(p.get("cik") or "").strip() == ckw
+                ]
+                profiles_all = [
+                    p for p in profiles_all if str(p.get("cik") or "").strip() == ckw
+                ]
             if omit_audit_tables:
                 return profiles, profiles_all, [], [], stats
             return profiles, profiles_all, leads, comp, stats
 
     mtime = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+
+    if ckw:
+        with connect() as conn:
+            profiles_all = _build_profiles(conn, cik_filter=ckw)
+            profiles = _lead_desk_filter_profiles(profiles_all, conn)
+            stats = _lead_page_db_stats(conn, db_mtime=mtime)
+        return profiles, profiles_all, [], [], stats
 
     with connect() as conn:
         profiles_all = _build_profiles(conn)
@@ -7050,7 +6664,17 @@ def _load_page_data(
         "db_file_modified": mtime,
     }
     _LOAD_PAGE_DATA_CACHE["key"] = cache_key
-    _LOAD_PAGE_DATA_CACHE["blob"] = (profiles_all, leads, comp, nf, no, nc, latest, mtime)
+    _LOAD_PAGE_DATA_CACHE["blob"] = (
+        profiles_all,
+        profiles,
+        leads,
+        comp,
+        nf,
+        no,
+        nc,
+        latest,
+        mtime,
+    )
     return profiles, profiles_all, leads, comp, stats
 
 
@@ -7064,7 +6688,7 @@ def _is_advisor_only_path(pi: str) -> bool:
 
 
 def _advisor_redirect_help_html() -> str:
-    return """<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Wrong server — WealthPipeline</title>
+    return """<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Wrong server — Equity Signal</title>
 <style>body{font-family:system-ui;background:#0d1117;color:#e8ecf0;max-width:36rem;margin:2rem auto;padding:1rem;line-height:1.5}
 a{color:#5eb3e0}code{background:#1a2634;padding:0.1rem 0.35rem;border-radius:4px}</style></head><body>
 <h1>This is the legacy lead desk server</h1>
@@ -7072,7 +6696,7 @@ a{color:#5eb3e0}code{background:#1a2634;padding:0.1rem 0.35rem;border-radius:4px
 <code>python -m wealth_leads serve</code> on the same port as the advisor app.</p>
 <p><strong>Fix:</strong> Close this server window, then start the advisor app:</p>
 <ul>
-<li>Double-click <code>Start WealthPipeline Dashboard.bat</code> in the project folder, or</li>
+<li>Double-click <code>Start Equity Signal Dashboard.bat</code> in the project folder, or</li>
 <li>Run <code>py -3 serve_advisor.py</code> from the project root.</li>
 </ul>
 <p>Then open <a href="http://127.0.0.1:8765/login">http://127.0.0.1:8765/login</a></p>
@@ -7121,7 +6745,7 @@ def _app(environ, start_response):
                 ("Content-Length", str(len(body))),
                 (
                     "Content-Disposition",
-                    'attachment; filename="wealthpipeline-finder.csv"',
+                    'attachment; filename="equity-signal-finder.csv"',
                 ),
                 ("Cache-Control", "no-store"),
             ],
@@ -7144,9 +6768,33 @@ def _app(environ, start_response):
         start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
         return [b"Not Found"]
 
+    company_cik_arg: Optional[str] = None
+    desk_company_qs: Optional[dict] = None
+    if pi == "/desk/company":
+        desk_company_qs = parse_qs(
+            environ.get("QUERY_STRING", ""), keep_blank_values=True
+        )
+        company_cik_arg = (desk_company_qs.get("cik") or [""])[0].strip()
+        if not company_cik_arg:
+            html_out = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/><title>Desk — CIK required</title></head>
+<body style="font-family:system-ui;background:#0d1117;color:#e8ecf0;padding:2rem"><h1>CIK required</h1>
+<p>Open the <a href="/" style="color:#58a6ff">lead desk</a> and click a company row.</p></body></html>"""
+            body = html_out.encode("utf-8")
+            start_response(
+                "200 OK",
+                [
+                    ("Content-Type", "text/html; charset=utf-8"),
+                    ("Content-Length", str(len(body))),
+                    ("Cache-Control", "no-store, no-cache, must-revalidate"),
+                    ("Pragma", "no-cache"),
+                ],
+            )
+            return [body]
+
     omit_audit = pi in ("/desk/company", "/finder", "/lead")
     profiles, profiles_all, leads, comp, stats = _load_page_data(
-        omit_audit_tables=omit_audit
+        omit_audit_tables=omit_audit,
+        company_cik=company_cik_arg,
     )
     rendered_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -7180,11 +6828,7 @@ def _app(environ, start_response):
         name_decoded = unquote(name_raw) if name_raw else ""
         norm = _norm_person_name(name_decoded)
         prof = _find_profile(profiles_all, cik, norm) if not stats.get("missing_db") else None
-        filings: list[dict] = []
         cr_dict: Optional[dict] = None
-        issuer_snap: Optional[dict] = None
-        important_llm: list[dict] = []
-        beneficial_individual_shareholders: list[dict] = []
         beneficial_stake_detail: Optional[dict] = None
         officer_beneficial_stake: Optional[dict] = None
         beneficial_filing_caveats = ""
@@ -7211,10 +6855,8 @@ def _app(environ, start_response):
                     )
                     if _hq_cs:
                         prof["issuer_hq_city_state"] = _hq_cs[:120]
-                filings = _filings_for_profile(conn, cik, norm)
                 cr_row = get_lead_client_research(conn, cik, norm)
                 cr_dict = row_to_client_research_dict(cr_row)
-                issuer_snap = get_issuer_snapshot_dict(conn, cik)
                 bo_only = bool(prof.get("has_s1_beneficial_owner")) and not bool(
                     prof.get("has_s1_officer")
                 )
@@ -7231,12 +6873,6 @@ def _app(environ, start_response):
                         )
                     except sqlite3.Error:
                         beneficial_filing_caveats = ""
-                    try:
-                        important_llm = _latest_important_people_from_s1_llm_pack(
-                            conn, (cik or "").strip()
-                        )
-                    except sqlite3.Error:
-                        important_llm = []
                 else:
                     try:
                         officer_beneficial_stake = beneficial_stake_row_matching_officer_profile(
@@ -7244,78 +6880,65 @@ def _app(environ, start_response):
                         )
                     except sqlite3.Error:
                         officer_beneficial_stake = None
-                    try:
-                        important_llm = _latest_important_people_from_s1_llm_pack(
-                            conn, (cik or "").strip()
-                        )
-                    except sqlite3.Error:
-                        important_llm = []
                 try:
                     lead_recency = lead_issuer_recency_bundle(
                         conn, (cik or "").strip()
                     )
                 except sqlite3.Error:
                     lead_recency = {}
-                try:
-                    beneficial_individual_shareholders = [
-                        dict(r)
-                        for r in list_beneficial_owner_outreach_targets_for_cik(
-                            conn, (cik or "").strip(), limit=25
-                        )
-                    ]
-                except sqlite3.Error:
-                    beneficial_individual_shareholders = []
+        ref_q = (qs.get("ref") or [""])[0].strip()
+        sb_q = (qs.get("sb") or qs.get("sales_bundle") or [""])[0]
+        prof_cik_w = str(prof.get("cik") or "").strip() if prof else ""
+        co_back = lead_company_roster_back_href(
+            ref=ref_q,
+            sales_bundle_q=str(sb_q),
+            query_cik=(cik or "").strip(),
+            profile_cik=prof_cik_w or (cik or "").strip(),
+            roster_path="/desk/company",
+        )
         html_out = _page_lead(
             prof,
-            filings,
             query_cik=cik,
             query_name=name_decoded,
             stats=stats,
             rendered_at=rendered_at,
             client_research=cr_dict,
-            issuer_snapshot=issuer_snap,
-            important_people_llm=important_llm,
-            beneficial_individual_shareholders=beneficial_individual_shareholders,
             beneficial_stake_detail=beneficial_stake_detail,
             officer_beneficial_stake=officer_beneficial_stake,
             beneficial_filing_caveats=beneficial_filing_caveats,
             lead_recency=lead_recency,
             lead_page_msg=lead_page_msg,
+            lead_back_href="/",
+            lead_back_label="Lead desk",
+            lead_back_company_href=co_back,
         )
     elif pi == "/desk/company":
-        qs = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
-        cik_w = (qs.get("cik") or [""])[0].strip()
-        sb = normalize_sales_bundle_query((qs.get("sales_bundle") or ["premium"])[0])
-        if not cik_w:
-            html_out = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/><title>Desk — CIK required</title></head>
-<body style="font-family:system-ui;background:#0d1117;color:#e8ecf0;padding:2rem"><h1>CIK required</h1>
-<p>Open the <a href="/" style="color:#58a6ff">lead desk</a> and click a company row.</p></body></html>"""
-        else:
-            universe_cik = [
-                p for p in profiles if str(p.get("cik") or "").strip() == cik_w
-            ]
-            filtered_cik = [
-                p for p in profiles if str(p.get("cik") or "").strip() == cik_w
-            ]
-            filtered_cik.sort(key=_desk_sort_tuple, reverse=True)
-            filtered_cik = filter_profiles_sales_bundle(filtered_cik, sb)
-            co_name = ""
-            if filtered_cik:
-                co_name = (filtered_cik[0].get("company_name") or "").strip()
-            elif universe_cik:
-                co_name = (universe_cik[0].get("company_name") or "").strip()
-            html_out = _page_desk_company(
-                filtered_cik,
-                leads,
-                comp,
-                stats,
-                rendered_at,
-                cik=cik_w,
-                company_name=co_name,
-                nav_base_path="/",
-                sales_bundle=sb,
-                blur_preview=desk_company_preview_blur(),
-            )
+        assert desk_company_qs is not None and company_cik_arg is not None
+        cik_w = company_cik_arg
+        sb = normalize_sales_bundle_query(
+            (desk_company_qs.get("sales_bundle") or ["premium"])[0]
+        )
+        universe_cik = list(profiles)
+        filtered_cik = list(profiles)
+        filtered_cik.sort(key=_desk_sort_tuple, reverse=True)
+        filtered_cik = filter_profiles_sales_bundle(filtered_cik, sb)
+        co_name = ""
+        if filtered_cik:
+            co_name = (filtered_cik[0].get("company_name") or "").strip()
+        elif universe_cik:
+            co_name = (universe_cik[0].get("company_name") or "").strip()
+        html_out = _page_desk_company(
+            filtered_cik,
+            leads,
+            comp,
+            stats,
+            rendered_at,
+            cik=cik_w,
+            company_name=co_name,
+            nav_base_path="/",
+            sales_bundle=sb,
+            blur_preview=desk_company_preview_blur(),
+        )
     else:
         qs = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
         n_prem_co, n_eco_co = desk_sales_bundle_company_counts(profiles)
@@ -7385,9 +7008,9 @@ def run_localhost(
         print(f"Could not listen on {url} (port {p}): {e}", file=sys.stderr)
         print("Another copy may be running, or the port is in use.", file=sys.stderr)
         raise SystemExit(1) from e
-    print(f"WealthPipeline legacy desk (/, /lead, /finder, /desk/company): {url}")
+    print(f"Equity Signal legacy desk (/, /lead, /finder, /desk/company): {url}")
     print(
-        "Advisor app with /login is separate — use serve_advisor.py or Start WealthPipeline Dashboard.bat (port 8765).",
+        "Advisor app with /login is separate — use serve_advisor.py or Start Equity Signal Dashboard.bat (port 8765).",
         file=sys.stderr,
     )
     if _want_live_reload():

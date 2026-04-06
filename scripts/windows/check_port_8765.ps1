@@ -7,10 +7,10 @@ Write-Host "--- GET $base/healthz ---"
 try {
     $r = Invoke-WebRequest -Uri "$base/healthz" -UseBasicParsing -TimeoutSec 3
     Write-Host "Status:" $r.StatusCode
-    if ($r.RawContent -match "X-WealthPipeline-Server:\s*advisor") {
+    if ($r.RawContent -match "X-EquitySignal-Server:\s*advisor") {
         Write-Host "Looks like: FastAPI advisor (correct)"
     } else {
-        Write-Host "Missing X-WealthPipeline-Server: advisor — probably NOT the advisor app"
+        Write-Host "Missing X-EquitySignal-Server: advisor — probably NOT the advisor app"
     }
     Write-Host "Body:" $r.Content
 } catch {

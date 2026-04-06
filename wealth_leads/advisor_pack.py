@@ -660,7 +660,7 @@ def smtp_rcpt_probe(
     hosts = mx_hosts(dom)
     if not hosts:
         return "error", "no MX records"
-    mf = mail_from or "wealthpipeline-verify@invalid"
+    mf = mail_from or "equity-signal-verify@invalid"
     last_err = ""
     for host in hosts[:2]:
         try:

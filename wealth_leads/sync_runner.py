@@ -42,7 +42,7 @@ def start_sync_subprocess(*, force: bool = False) -> tuple[bool, str]:
     t = threading.Thread(
         target=_run_sync,
         kwargs={"force": force},
-        name="wealthpipeline-sec-sync",
+        name="equity-signal-sec-sync",
         daemon=True,
     )
     t.start()

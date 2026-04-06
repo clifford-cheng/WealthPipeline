@@ -6,7 +6,7 @@ from pathlib import Path
 # Use an email you actually read; some addresses (e.g. *@users.noreply.github.com)
 # have triggered HTTP 403 from sec.gov in testing.
 DEFAULT_USER_AGENT = (
-    "WealthLeadsMVP/0.1 (personal research; contact: you@example.com)"
+    "EquitySignal/0.1 (SEC research; contact: you@example.com)"
 )
 
 SEC_ORIGIN = "https://www.sec.gov"
@@ -481,3 +481,12 @@ def anthropic_s1_model() -> str:
         "claude-3-5-haiku-20241022",
     ).strip()
     return m or "claude-3-5-haiku-20241022"
+
+
+def advisor_ui_product_name() -> str:
+    """
+    Short product name in advisor-facing HTML (nav, page titles).
+    Override with WEALTH_LEADS_UI_PRODUCT_NAME for a different display name.
+    """
+    v = (os.environ.get("WEALTH_LEADS_UI_PRODUCT_NAME") or "").strip()
+    return v if v else "Equity Signal"

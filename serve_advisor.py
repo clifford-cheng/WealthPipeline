@@ -1,7 +1,7 @@
 """
-Start the WealthPipeline advisor app (sign-in, My leads, Admin).
+Start the Equity Signal advisor app (sign-in, My leads, Admin).
 
-Double-click Start WealthPipeline Dashboard.bat, or run:
+Double-click Start Equity Signal Dashboard.bat, or run:
   py -3 serve_advisor.py
   python serve_advisor.py
 
@@ -58,7 +58,7 @@ def _maybe_open_login(host: str, port: int) -> None:
 def main() -> None:
     os.environ.setdefault(
         "WEALTH_LEADS_APP_SECRET",
-        "wealthpipeline-local-dev-only-change-me",
+        "equity-signal-local-dev-only-change-me",
     )
     os.environ.setdefault("WEALTH_LEADS_ALLOW_SIGNUP", "1")
     host = os.environ.get("WEALTH_LEADS_BIND_HOST", "127.0.0.1")
@@ -74,7 +74,7 @@ def main() -> None:
     )
     main_path = "/login" if require_app_auth() else "/pipeline"
     print(
-        f"WealthPipeline advisor: http://{host}:{port}{main_path}"
+        f"Equity Signal advisor: http://{host}:{port}{main_path}"
         + ("" if no_reload else "  (auto-reload on: save code → refresh browser)"),
         flush=True,
     )

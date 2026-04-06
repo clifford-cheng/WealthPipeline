@@ -48,7 +48,7 @@ def start_auto_sync_background() -> threading.Event | None:
 
     t = threading.Thread(
         target=loop,
-        name="wealthpipeline-auto-sec-sync",
+        name="equity-signal-auto-sec-sync",
         daemon=True,
     )
     t.start()

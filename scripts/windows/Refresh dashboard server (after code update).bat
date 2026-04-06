@@ -1,5 +1,5 @@
 @echo off
-title Restart WealthPipeline server
+title Restart Equity Signal server
 
 echo Stopping anything on port 8765, then starting the advisor app in the background...
 echo.
